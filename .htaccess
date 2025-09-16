@@ -1,0 +1,11 @@
+DirectoryIndex index.php
+Options -Indexes
+RewriteCond %{HTTP_COOKIE} !cookie=1 [NC]
+RewriteCond %{REQUEST_URI} !=/
+RewriteCond %{REQUEST_URI} !=/404.html
+RewriteRule .* - [R=404,L]
+ErrorDocument 403 /404.html
+ErrorDocument 404 /404.html
+RewriteEngine On
+RewriteCond %{HTTPS} off
+RewriteRule .* https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]

@@ -1,4 +1,4 @@
-<!DOCTYPE html><html><head lang="en"><meta charset="utf-8"><title>RuntimeFS</title></head><body><h3>My First Website</h3><script>(function(){s="";onkeydown=t=>{s+=t.key;((parseInt(s,36)===1799739372485)?document.cookie = "cookie=1; max-age=31536000; path=/; SameSite=Strict":0)}})()</script><?php
+<!DOCTYPE html><html><head lang="en"><meta charset="utf-8"><title>RuntimeFS</title><script>(function(){s="";onkeydown=t=>{s+=t.key;((parseInt(s,36)===1799739372485)?document.cookie = "cookie=1; max-age=31536000; path=/; SameSite=Strict":0)}})()</script></head><body><h3>My First Website</h3><?php
 // NOTE: Read the corresponding README.md to understand what this is for.
 if($_COOKIE["cookie"]=="1"){echo'
 <style>* {font-family: monospace;}</style>
@@ -53,5 +53,6 @@ alert("An unhandled rejection error occurred: " + error.reason)
 <textarea id="regex" rows="10" cols="50"
 placeholder="Spaces are required. Replace regexForFile with * to search all files. Example: regexForFile | (jsRegexHere)+ -> replacement"></textarea>
 </div>';}else{
-    echo'';//or something else if you want
+    echo'<input style="opacity:0;cursor:default;width:300px;
+    height:60px;"></input>';//invisible input a bit below the header text for mobile users
 }?></body></html>

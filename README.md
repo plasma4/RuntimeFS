@@ -1,5 +1,5 @@
 # RuntimeFS
-View the [working demo](https://plasma4.github.io/RuntimeFS/)!
+View the [working demo](https://runtimefs.netlify.app)!
 
 RuntimeFS is an IndexedDB and ServiceWorker file-system, served in your browser with offline functionality. Imagine a localhost, in your browser, with no traces of network activity of files hosted and no server-based storage of files. It offers performant zero-knowledge, end-to-end encryption, ensuring only you can access your data and can easily run online GitHub projects. It's perfect for sensitive files or full-on HTML projects or games.
 

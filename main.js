@@ -219,12 +219,19 @@ function openFile() {
     }
 
     const regexRules = document.getElementById("regex").value
-    let url = `/n/${encodeURIComponent(folderName)}/${encodeURIComponent(fileName)}`
+    // Generate a unique ID for this request
+    const requestId = crypto.randomUUID()
+    let url = `/n/${encodeURIComponent(folderName)}/${encodeURIComponent(fileName)}?reqId=${requestId}`
 
-    // If there are any rules, add them to the URL as a search parameter.
-    if (regexRules.trim()) {
-        url += "?rules=" + encodeURIComponent(regexRules)
+    // If there are rules, post them to the service worker
+    if (regexRules.trim() && navigator.serviceWorker.controller) {
+        navigator.serviceWorker.controller.postMessage({
+            type: 'REGRULES',
+            requestId: requestId,
+            rules: regexRules
+        })
     }
+    
     window.open(url, "_blank")
 }
 
@@ -375,39 +382,4 @@ if ('serviceWorker' in navigator) {
         })
         console.log('Service worker registered.', reg)
     }).catch(err => console.log('Service worker not registered.', err))
-}
-
-async function debugListFilesInDB(folderName) {
-    if (!folderName) {
-        console.error("Debug Helper: Please provide the name of the folder to inspect.")
-        return
-    }
-    console.log(`%cInspecting IndexedDB for folder: "${folderName}"`, "color: blue; font-size: 1.2em;")
-
-    try {
-        const db = await dbPromise
-        const transaction = db.transaction([SN, META_SN], "readonly")
-        const metaStore = transaction.objectStore(META_SN)
-        const folderStore = transaction.objectStore(SN)
-
-        const manifestRecord = await promisifyRequest(metaStore.get('folderManifest')).catch(() => null)
-        const manifest = manifestRecord?.data || {}
-        const folderId = manifest[folderName] || folderName
-
-        const folderData = await promisifyRequest(folderStore.get(folderId))
-
-        if (!folderData) {
-            console.error(`Folder "${folderName}" (ID: ${folderId}) could not be found in the database.`)
-            return
-        }
-
-        if (folderData.files && Object.keys(folderData.files).length > 0) {
-            console.log("SUCCESS! Found the following file paths stored in the database:")
-            console.table(Object.keys(folderData.files))
-        } else {
-            console.warn("Folder found, but it contains no files.")
-        }
-    } catch (error) {
-        console.error("An error occurred while trying to read from IndexedDB:", error)
-    }
 }

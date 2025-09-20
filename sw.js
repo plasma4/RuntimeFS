@@ -1,3 +1,14 @@
+const ruleStore = new Map()
+
+// Add a new event listener for messages from the client
+self.addEventListener('message', event => {
+    if (event.data && event.data.type === 'REGRULES') {
+        // Store the rules associated with the unique request ID
+        ruleStore.set(event.data.requestId, event.data.rules)
+        setTimeout(() => ruleStore.delete(event.data.requestId), 30000)
+    }
+})
+
 const DBN = "FileCacheDB"
 const SN = "Folders"
 const META_SN = "Metadata"
@@ -64,7 +75,11 @@ self.addEventListener("fetch", event => {
         // Second, check if it's a request for a virtual file.
         if (url.pathname.startsWith('/n/')) {
             const pathParts = url.pathname.split('/').slice(2)
-            const rules = url.searchParams.get('rules')
+            const requestId = url.searchParams.get('reqId')
+            const rules = ruleStore.get(requestId) || null
+
+            // Once used, the rule can be removed
+            if (requestId) ruleStore.delete(requestId)
             return generateResponseForVirtualFile(pathParts[0], pathParts.slice(1).join('/'), rules ? decodeURIComponent(rules) : null)
         }
 

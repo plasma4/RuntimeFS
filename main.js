@@ -99,7 +99,19 @@ async function uploadFolder() {
                     console.log(`${records.length} file system change(s) detected.`)
                     changes.push(...records)
                 })
-                observer.observe(dirHandle, { recursive: true })
+                try {
+                    observer.observe(dirHandle, { recursive: true })
+                } catch (e) {
+                    if (e.name === "NotSupportedError") {
+                        // Older browser/implementation perhaps?
+                        console.warn(e)
+                        observer.observe(dirHandle)
+                    } else {
+                        // Re-throw any other unexpected errors.
+                        throw e
+                    }
+                }
+
                 changes.length = 0
             } else {
                 throw e

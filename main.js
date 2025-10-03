@@ -103,9 +103,8 @@ async function uploadFolder() {
                     observer.observe(dirHandle, { recursive: true })
                 } catch (e) {
                     if (e.name === "NotSupportedError") {
-                        // Older browser/implementation perhaps?
+                        // Older browser/implementation perhaps? Can't observe then.
                         console.warn(e)
-                        observer.observe(dirHandle)
                     } else {
                         // Re-throw any other unexpected errors.
                         throw e
@@ -800,12 +799,11 @@ async function exportData() {
         const a = document.createElement("a")
         const dataURI = `data:text/plain,${encodeURIComponent(jsonString)}`
         a.href = dataURI
-        a.download = 'result'
+        a.download = "result.txt"
         a.click()
-        URL.revokeObjectURL(url)
         console.log("Export successful.")
-    } catch (error) {
-        console.error("Export failed:", error)
+    } catch (e) {
+        throw e
     } finally {
         setUiBusy(false)
     }

@@ -104,6 +104,7 @@ async function uploadFolder() {
                 } catch (e) {
                     if (e.name === "NotSupportedError") {
                         // Older browser/implementation perhaps? Can't observe then.
+                        console.error("Cannot observe directories for modifications.")
                         console.warn(e)
                     } else {
                         // Re-throw any other unexpected errors.
@@ -719,111 +720,161 @@ function base64ToBuffer(base64) {
     return bytes.buffer
 }
 
+/**
+ * Safely converts an ArrayBuffer to a Base64 string, processing in chunks
+ * to avoid "Maximum call stack size exceeded" errors with large files.
+ * @param {ArrayBuffer} buffer The ArrayBuffer to convert.
+ * @returns {string} The Base64 encoded string.
+ */
+function bufferToBase64Safe(buffer) {
+    let binary = ''
+    const bytes = new Uint8Array(buffer)
+    const len = bytes.byteLength
+    // We process the buffer in chunks to avoid passing too many arguments
+    // to String.fromCharCode() at once, which would crash the browser's JS engine.
+    const chunkSize = 8192 // 8KB chunks are a safe and performant size.
+
+    for (let i = 0; i < len; i += chunkSize) {
+        const chunk = bytes.subarray(i, i + chunkSize)
+        // String.fromCharCode.apply is a memory-safe way to convert a chunk
+        // of byte values into a string.
+        binary += String.fromCharCode.apply(null, chunk)
+    }
+    return btoa(binary)
+}
+
+/**
+ * Gathers all application data (IndexedDB, localStorage, cookies), optionally
+ * encrypts it, and presents a download link to the user.
+ */
 async function exportData() {
-    // Prompt the user for an optional password.
+    // This prompt remains as it's a useful feature for any kind of data export.
     const password = prompt("Enter an optional password to encrypt the export. Leave blank for a plaintext export.")
-    console.log("Starting data export...")
+    console.log("Starting general data export (excluding RuntimeFS data)...")
     setUiBusy(true)
 
     try {
         const dataToExport = {}
-        const db = await dbPromise
-        // Export IndexedDB data if the checkbox is checked.
-        if (document.getElementById("c3").checked) {
-            dataToExport.indexedDB = {}
-            const transaction = db.transaction(db.objectStoreNames, "readonly")
-            const promises = []
-            for (const storeName of db.objectStoreNames) {
-                const store = transaction.objectStore(storeName)
-                promises.push(promisifyRequest(store.getAll()).then(records => ({ storeName, records })))
-            }
-            const results = await Promise.all(promises)
-            for (const result of results) {
-                // Convert ArrayBuffers to Base64 strings for JSON compatibility.
-                result.records.forEach(record => {
-                    if (record.files) {
-                        for (const fileName in record.files) {
-                            if (record.files[fileName].buffer instanceof ArrayBuffer) {
-                                const buffer = record.files[fileName].buffer
-                                record.files[fileName].buffer = btoa(String.fromCharCode(...new Uint8Array(buffer)))
-                            }
-                        }
-                    }
-                })
-                dataToExport.indexedDB[result.storeName] = result.records
-            }
-        }
-        // Export localStorage data if the checkbox is checked.
+
         if (document.getElementById("c2").checked) {
             dataToExport.localStorage = {}
             for (let i = 0; i < localStorage.length; i++) {
                 const key = localStorage.key(i)
-                dataToExport.localStorage[key] = localStorage.getItem(key)
+                if (key !== "pk") {
+                    dataToExport.localStorage[key] = localStorage.getItem(key)
+                }
             }
         }
-        // Export cookies if the checkbox is checked.
+
+        if (document.getElementById("c3").checked) {
+            const allDbs = await indexedDB.databases()
+            for (const dbInfo of allDbs) {
+                const dbName = dbInfo.name
+                if (dbName === DBN) {
+                    console.log(`Skipping RuntimeFS database: '${dbName}'`)
+                    continue // Go to the next database in the list.
+                }
+
+                console.log(`Exporting from database: '${dbName}'`)
+
+                // Open a NEW connection specifically to this other database.
+                // We DO NOT use the global dbPromise here.
+                const db = await new Promise((resolve, reject) => {
+                    const request = indexedDB.open(dbName)
+                    request.onsuccess = () => resolve(request.result)
+                    request.onerror = () => reject(request.error)
+                })
+
+                // Prepare the JSON structure: dataToExport.indexedDB.UnityCache = {}
+                dataToExport.indexedDB[dbName] = {}
+                const transaction = db.transaction(db.objectStoreNames, "readonly")
+
+                // Now, loop through all the object stores within THIS database.
+                for (const storeName of db.objectStoreNames) {
+                    const store = transaction.objectStore(storeName)
+                    const records = await promisifyRequest(store.getAll())
+
+                    // The Base64 conversion is kept in case other DBs store binary data.
+                    records.forEach(record => {
+                        // This is a simple check; a more robust exporter might
+                        // need to recursively scan objects for ArrayBuffers.
+                        if (record && record.buffer instanceof ArrayBuffer) {
+                            record.buffer = bufferToBase64Safe(record.buffer)
+                        }
+                    })
+
+                    // Store the records under the correct database and store name.
+                    dataToExport.indexedDB[dbName][storeName] = records
+                }
+                // It's good practice to close the connection when we're done.
+                db.close()
+            }
+        }
+
         if (document.getElementById("c1").checked) {
             dataToExport.cookies = document.cookie
         }
 
         let finalObjectToExport
-        // If the user provided a password, encrypt the data.
         if (password) {
             const salt = crypto.getRandomValues(new Uint8Array(16))
             const iv = crypto.getRandomValues(new Uint8Array(12))
             const key = await deriveKeyFromPassword(password, salt)
-
-            // Convert the data object to a string, then to a buffer for encryption.
             const dataString = JSON.stringify(dataToExport)
             const dataBuffer = new TextEncoder().encode(dataString)
-
             const encryptedBuffer = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, key, dataBuffer)
 
-            // Create a wrapper object that identifies this as an encrypted export.
             finalObjectToExport = {
                 type: "FS-EE",
-                s: bufferToBase64(salt),
-                iv: bufferToBase64(iv),
-                p: bufferToBase64(new Uint8Array(encryptedBuffer)) // The encrypted data
+                s: bufferToBase64Safe(salt.buffer),
+                iv: bufferToBase64Safe(iv.buffer),
+                p: bufferToBase64Safe(encryptedBuffer)
             }
         } else {
-            // If no password, create a standard plaintext wrapper object.
             finalObjectToExport = {
                 type: "FS-PE",
-                p: dataToExport // The unencrypted data
+                p: dataToExport
             }
         }
 
-        // Trigger a download of the exported data as a JSON file.
-        const jsonString = JSON.stringify(finalObjectToExport, null)
-        const a = document.createElement("a")
-        const dataURI = `data:text/plain,${encodeURIComponent(jsonString)}`
-        a.href = dataURI
-        a.download = "result.txt"
-        a.click()
-        console.log("Export successful.")
-    } catch (e) {
-        throw e
+        const jsonString = JSON.stringify(finalObjectToExport)
+        const importExportContainer = document.querySelector("#c3").parentElement
+        createAndDisplayDownloadLink(jsonString, importExportContainer)
+
+        console.log("General data export prepared. Awaiting user download.")
+
+    } catch (error) {
+        console.error("General export failed:", error)
+        alert("An error occurred during export: " + error.message)
     } finally {
         setUiBusy(false)
     }
 }
 
-// Imports application data from a JSON file.
+/**
+ * Imports application data from a user-selected JSON file,
+ * handling both plaintext and encrypted exports.
+ */
 async function importData() {
+    // The file picker logic remains the same.
     try {
         const input = document.createElement("input")
         input.type = "file"
+        input.accept = ".json, .txt"
         input.onchange = async (event) => {
             setUiBusy(true)
             const file = event.target.files[0]
-            if (!file) return
+            if (!file) {
+                setUiBusy(false)
+                return
+            }
+
             try {
+                // The decryption logic also remains the same.
                 const content = await file.text()
                 const wrapper = JSON.parse(content)
-                let data // This will hold the actual data to be imported.
+                let data
 
-                // Check the type to see if we need to decrypt.
                 if (wrapper.type === "FS-EE") {
                     const password = prompt("This file is encrypted. Please enter the password:")
                     if (!password) {
@@ -840,60 +891,112 @@ async function importData() {
                     const decryptedBuffer = await crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, key, payload)
                     const decryptedString = new TextDecoder().decode(decryptedBuffer)
                     data = JSON.parse(decryptedString)
-
                 } else if (wrapper.type === "FS-PE") {
-                    // It's a plaintext file, just get the payload.
                     data = wrapper.p
                 } else {
-                    // This allows for backward compatibility with old exports.
-                    console.log("Assuming legacy export format.")
                     data = wrapper
                 }
 
+                // Restore localStorage, filtering out the RuntimeFS private key
                 if (data.localStorage) {
                     for (const key in data.localStorage) {
+                        if (key === "pk") {
+                            console.warn("Skipping import of 'pk' from localStorage to protect existing key.")
+                            continue // Move to the next key
+                        }
                         localStorage.setItem(key, data.localStorage[key])
                     }
                 }
+
                 if (data.indexedDB) {
-                    const db = await dbPromise
-                    const transaction = db.transaction(Object.keys(data.indexedDB), "readwrite")
-                    for (const storeName in data.indexedDB) {
-                        const store = transaction.objectStore(storeName)
-                        store.clear()
-                        for (const record of data.indexedDB[storeName]) {
-                            if (record.files) {
-                                for (const fileName in record.files) {
-                                    const fileData = record.files[fileName]
-                                    // The buffer is already base64, so we need to convert it back.
-                                    if (typeof fileData.buffer === "string") {
-                                        fileData.buffer = base64ToBuffer(fileData.buffer)
-                                    }
-                                }
-                            }
-                            store.put(record)
+                    for (const dbName in data.indexedDB) {
+                        // Explicitly refuse to import into the RuntimeFS database.
+                        if (dbName === DBN) {
+                            console.warn(`Skipping import of data for '${DBN}' to protect RuntimeFS folders.`)
+                            continue // Go to the next database in the file.
                         }
+
+                        console.log(`Importing data into database: '${dbName}'`)
+
+                        // Open a connection to the target database.
+                        const db = await new Promise((resolve, reject) => {
+                            const request = indexedDB.open(dbName)
+                            request.onsuccess = () => resolve(request.result)
+                            request.onerror = () => reject(request.error)
+                        })
+
+                        const storeNames = Object.keys(data.indexedDB[dbName])
+                        const transaction = db.transaction(storeNames, "readwrite")
+
+                        // Restore each store within this database.
+                        for (const storeName of storeNames) {
+                            const store = transaction.objectStore(storeName)
+                            store.clear() // Clear existing data before importing.
+                            const records = data.indexedDB[dbName][storeName]
+                            for (const record of records) {
+                                // Convert Base64 back to buffer if needed.
+                                if (record && typeof record.buffer === "string") {
+                                    record.buffer = base64ToBuffer(record.buffer)
+                                }
+                                store.put(record)
+                            }
+                        }
+                        db.close()
                     }
-                    await promisifyTransaction(transaction)
                 }
-                alert("Import successful! Refreshing folder list.")
+
+                alert("General data import successful!")
                 await listFolders()
             } catch (error) {
                 console.error("Import failed:", error)
-                // A common error here is a bad password during decryption.
+                // A common error is a bad password during decryption, which throws a DOMException.
                 if (error instanceof DOMException && error.name === "OperationError") {
                     alert("Import failed. The password may be incorrect.")
                 } else {
                     alert("An error occurred during import: " + error.message)
                 }
             } finally {
+                // Always re-enable the UI after the process is finished.
                 setUiBusy(false)
             }
         }
         input.click()
     } catch (error) {
-        console.error("Import failed:", error)
+        // This outer catch handles errors in creating the input element itself.
+        console.error("Failed to initialize import:", error)
     }
+}
+
+function createAndDisplayDownloadLink(jsonString, parentElement) {
+    // Clean up any old links that might still be there from a previous export.
+    const oldLink = document.getElementById("download-link")
+    if (oldLink) {
+        oldLink.remove()
+    }
+
+    // Create a Data URI, which embeds the file content directly in the URL.
+    const dataURI = `data:text/plain;charset=utf-8,${encodeURIComponent(jsonString)}`
+
+    const a = document.createElement("a")
+    a.id = "download-link" // Give it an ID for easy removal later.
+    a.href = dataURI
+    a.download = "result.txt" // The default filename for the user.
+    a.textContent = "Click here to download export!"
+
+    // Add some basic styling to make it visible and user-friendly.
+    a.style.display = "block"
+    a.style.marginTop = "10px"
+    a.style.padding = "8px"
+    a.style.border = "1px solid #15e264"
+    a.style.borderRadius = "5px"
+    a.style.textAlign = "center"
+
+    // When the user clicks the link, remove it from the page to keep the UI clean.
+    a.onclick = () => {
+        setTimeout(() => a.remove(), 200) // Small delay to ensure download has time to start.
+    }
+
+    parentElement.appendChild(a)
 }
 
 // Derives a cryptographic key from a password using PBKDF2.

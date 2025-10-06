@@ -6,6 +6,10 @@ if($_COOKIE["cookie"]=="1"){echo'
 font-family: monospace;
 }
 
+a {
+color: #bbb;
+}
+
 html {
 background-color: black;
 color: white;

@@ -10,6 +10,10 @@ a {
 color: #bbb;
 }
 
+hr {
+border: 1px solid white;
+}
+
 html {
 background-color: black;
 color: white;
@@ -96,6 +100,7 @@ alert("An unhandled rejection error occurred: " + error.reason)
 <input type="text" id="folderName" placeholder="Enter a name...">
 <button onclick="uploadFolder()">Upload Folder</button>
 <button onclick="syncFiles()">Sync</button>
+<input type="file" id="folderUploadFallbackInput" webkitdirectory directory style="display: none">
 <hr>
 <label for="openFolderName">Folder to Open:</label>
 <input type="text" id="openFolderName" placeholder="Enter a valid folder...">
@@ -126,7 +131,7 @@ alert("An unhandled rejection error occurred: " + error.reason)
 <legend>
 <h2>Data Management</h2>
 </legend>
-<div style="display: flex; gap: 20px; align-items: flex-start;">
+<div style="display: flex; gap: 20px; align-items: flex-start">
 <div>
 <strong>Existing Folders:</strong>
 <ul id="folderList"></ul>
@@ -150,9 +155,9 @@ alert("An unhandled rejection error occurred: " + error.reason)
 
 <fieldset>
 <legend>
-<h2>Regex Search & Replace</h2>
+<h2>Advanced</h2>
 </legend>
-Spaces around the operator are required. The * character matches all files.
+Regex replacement: spaces around the operator are required. The * character matches all files.
 <ul>
 <li><code>file.js | regexHere -> replacement</code> (Global Regex)</li>
 <li><code>file.js $ plain text -> replacement</code> (Global Plain Text)</li>
@@ -160,6 +165,15 @@ Spaces around the operator are required. The * character matches all files.
 <li><code>file.js $$ single plain text -> replacement</code> (First Match Plain Text)</li>
 </ul>
 <textarea id="regex" rows="8" cols="60" placeholder="Enter rules here..."></textarea>
+<br>
+Custom headers: override the default headers for network requests.
+<ul>
+<li><code># Either select all filers or specific types</code></li>
+<li><code>* -> X-Frame-Options: DENY</code></li>
+<li><code>*.html -> Content-Security-Policy: default-src \'self\'; worker-src \'self\' blob:;</code></li>
+</ul>
+<textarea id="headers" rows="8" cols="60"
+placeholder="Enter headers here..."></textarea>
 </fieldset>';}else{
     echo'<input style="opacity:0;cursor:default;width:300px;
     height:60px;"></input>';//invisible input a bit below the header text for mobile users

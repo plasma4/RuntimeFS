@@ -20,8 +20,10 @@ function promisifyTransaction(transaction) {
     })
 }
 
+var currentlyBusy = false
 function setUiBusy(isBusy) {
-    Array.from(document.getElementsByTagName("button")).forEach(button => button.disabled = isBusy)
+    currentlyBusy = isBusy
+    Array.from(document.getElementsByTagName("button")).forEach(button => button.disabled = currentlyBusy)
 }
 
 // Request persistent storage to prevent the browser from clearing data automatically.
@@ -65,6 +67,7 @@ document.getElementById("generateBtn").addEventListener("click", async () => {
 let folderName, dirHandle, observer
 // An array to keep track of file system changes for syncing.
 let changes = []
+let observerProblem = false
 
 async function uploadFolder() {
     const folderNameInput = document.getElementById("folderName")
@@ -74,8 +77,14 @@ async function uploadFolder() {
         return
     }
 
+    var resetUI = true
     setUiBusy(true)
     try {
+        if (!window.showDirectoryPicker) {
+            folderUploadFallbackInput.click()
+            resetUI = false
+            return
+        }
         const localDirHandle = await window.showDirectoryPicker({ mode: "read" })
         dirHandle = localDirHandle
         folderName = name
@@ -94,14 +103,15 @@ async function uploadFolder() {
                     observer.disconnect()
                 }
 
-                // Create and start the new observer to watch the local folder for changes.
-                observer = new FileSystemObserver((records) => {
-                    console.log(`${records.length} file system change(s) detected.`)
-                    changes.push(...records)
-                })
                 try {
+                    // Create and start the new observer to watch the local folder for changes.
+                    observer = new FileSystemObserver((records) => {
+                        console.log(`${records.length} file system change(s) detected.`)
+                        changes.push(...records)
+                    })
                     observer.observe(dirHandle, { recursive: true })
                 } catch (e) {
+                    observerProblem = true
                     if (e.name === "NotSupportedError") {
                         // Older browser/implementation perhaps? Can't observe then.
                         console.error("Cannot observe directories for modifications.")
@@ -140,8 +150,88 @@ async function uploadFolder() {
             alert("An error occurred during upload: " + err.message)
         }
     } finally {
+        if (resetUI) setUiBusy(false)
+    }
+}
+
+async function uploadFolderFallback(event) {
+    setUiBusy(true)
+    const name = document.getElementById("folderName").value.trim()
+    const input = event.target
+
+    if (input.files.length === 0) {
+        setUiBusy(false)
+        return
+    }
+
+    try {
+        const files = {}
+        // Use Promise.all to read all files in parallel for better performance.
+        await Promise.all(Array.from(input.files).map(async (file) => {
+            // webkitRelativePath provides the full path within the selected folder.
+            const path = file.webkitRelativePath
+            const buffer = await file.arrayBuffer()
+            files[path] = { buffer, type: getMimeType(path) || file.type }
+        }))
+
+        await processAndStoreFolder(name, files)
+    } catch (err) {
+        console.error("Fallback upload error:", err)
+        alert("An error occurred during fallback upload: " + err.message)
+    } finally {
+        // Reset the input value to allow uploading the same folder again.
+        input.value = ""
         setUiBusy(false)
     }
+}
+
+function getFilesFromEntryRecursively(dirEntry) {
+    return new Promise((resolve, reject) => {
+        const files = {}
+        let entriesPending = 0
+        let allEntriesRead = false
+
+        const reader = dirEntry.createReader()
+
+        const readEntries = () => {
+            reader.readEntries(async (entries) => {
+                if (entries.length === 0) {
+                    // If no more entries are returned, we might be done.
+                    if (entriesPending === 0) {
+                        allEntriesRead = true
+                        resolve(files)
+                    }
+                    return
+                }
+
+                entriesPending += entries.length
+
+                for (const entry of entries) {
+                    if (entry.isFile) {
+                        entry.file(async (file) => {
+                            const buffer = await file.arrayBuffer()
+                            files[entry.fullPath.substring(1)] = { buffer, type: getMimeType(entry.name) || file.type }
+                            entriesPending--
+                            if (allEntriesRead && entriesPending === 0) resolve(files)
+                        }, (err) => reject(err))
+                    } else if (entry.isDirectory) {
+                        try {
+                            const subFiles = await getFilesFromEntryRecursively(entry)
+                            Object.assign(files, subFiles)
+                        } catch (err) {
+                            reject(err)
+                        } finally {
+                            entriesPending--
+                            if (allEntriesRead && entriesPending === 0) resolve(files)
+                        }
+                    }
+                }
+                // readEntries is recursive because the API might not return all entries in one go.
+                readEntries()
+            }, (err) => reject(err))
+        }
+        readEntries()
+    })
 }
 
 async function decryptAndLoadFolder(dirHandle, manifestHandle) {
@@ -359,25 +449,27 @@ async function openFile(overrideFolderName) {
     }
 }
 
-// Constructs the URL for a virtual file and opens it in a new tab.
 function openUrl(folderName, fileName, decryptionRequestId) {
     const regexRules = document.getElementById("regex").value.trim()
-    // Add a cache-busting parameter to the URL.
+    // Get the custom headers from the new textarea.
+    const customHeaders = document.getElementById("headers").value.trim()
+
     const cacheBust = `v=${Date.now()}`
     let url = `/n/${encodeURIComponent(folderName)}/${encodeURIComponent(fileName)}?${cacheBust}`
 
-    // Use the decryption ID if it exists, otherwise create a new one only if regex rules are present.
-    const finalRequestId = decryptionRequestId || (regexRules ? crypto.randomUUID() : null)
+    // A request ID is needed if there are regex rules OR custom headers.
+    const finalRequestId = decryptionRequestId || ((regexRules || customHeaders) ? crypto.randomUUID() : null)
 
     if (finalRequestId) {
         url += `&reqId=${finalRequestId}`
 
-        // If regex rules are present, send them to the service worker.
-        if (regexRules && navigator.serviceWorker.controller) {
+        // If there's a request ID, send the context to the service worker.
+        if (navigator.serviceWorker.controller) {
             navigator.serviceWorker.controller.postMessage({
-                type: "REGRULES",
+                type: "CUSTOMRULES",
                 requestId: finalRequestId,
-                rules: regexRules
+                rules: regexRules,     // Send regex rules
+                headers: customHeaders // Send custom headers
             })
         }
     }
@@ -387,6 +479,7 @@ function openUrl(folderName, fileName, decryptionRequestId) {
 
 // Button 1: Sync Only
 async function syncFiles() {
+    if (observerProblem) return alert("Observers aren't supported for your browser currently.")
     if (!folderName || !dirHandle) return alert("Upload a folder first.")
     if (changes.length === 0) return alert("No changes to sync.")
 
@@ -405,7 +498,6 @@ async function syncFiles() {
     }
 }
 
-// Button 2: Sync & Open
 async function syncAndOpenFile() {
     if (!folderName || !dirHandle) return alert("Upload a folder first.")
 
@@ -428,14 +520,13 @@ async function syncAndOpenFile() {
 }
 
 async function performSyncToDb() {
-    // 1. If there are no changes, do nothing.
     if (changes.length === 0) {
         return 0
     }
 
     console.log(`Processing ${changes.length} changes for "${folderName}"...`)
 
-    // 2. Convert the raw 'changes' array into a structured list of updates.
+    // Convert array into a structured list of updates
     const updates = []
     for (const change of changes) {
         const type = change.type
@@ -469,10 +560,9 @@ async function performSyncToDb() {
             }
         }
     }
-    // 3. Clear the global changes array now that they've been processed.
+    // Clear the global changes array now that they've been processed.
     changes.length = 0
 
-    // 4. Start the database transaction.
     const db = await dbPromise
     const transaction = db.transaction([SN], "readwrite")
     const folderStore = transaction.objectStore(SN)
@@ -482,7 +572,7 @@ async function performSyncToDb() {
         throw new Error(`Cannot sync: Folder "${folderName}" not found in DB.`)
     }
 
-    // 5. Apply the structured updates to the folder object in memory.
+    // Update memory and write folder to DB
     for (const update of updates) {
         if (update.type === "update") {
             folderData.files[update.path] = update.data
@@ -491,29 +581,59 @@ async function performSyncToDb() {
         }
     }
 
-    // 6. Write the modified folder object back to the database.
     folderStore.put(folderData)
     await promisifyTransaction(transaction)
     console.log("DB Update complete.")
-
-    // 7. Return the number of changes that were processed.
     return updates.length
 }
 
 // Fetches all folder names from IndexedDB and displays them in the UI.
 async function listFolders() {
-    const db = await dbPromise
-    const transaction = db.transaction(db.objectStoreNames, "readonly")
-    const folderStore = transaction.objectStore(SN)
-    const allFolders = await promisifyRequest(folderStore.getAll())
-    const folderList = document.getElementById("folderList")
-    folderList.innerHTML = "" // Clear the current list.
-    allFolders.sort((a, b) => a.id.localeCompare(b.id)).forEach(folder => {
-        const li = document.createElement("li")
-        // Add a visual indicator for encrypted folders.
-        li.textContent = folder.encryptionType === "pdf" ? `[Locked] ${folder.id}` : folder.id
-        folderList.appendChild(li)
-    })
+    try {
+        const db = await dbPromise
+        const transaction = db.transaction(SN, "readonly")
+        const store = transaction.objectStore(SN)
+
+        // Use a cursor to iterate over records efficiently.
+        // This avoids loading the massive 'files' object for each folder into memory.
+        const folderInfo = await new Promise((resolve, reject) => {
+            const results = []
+            const cursorRequest = store.openCursor()
+
+            cursorRequest.onerror = (event) => reject(event.target.error)
+
+            cursorRequest.onsuccess = (event) => {
+                const cursor = event.target.result
+                if (cursor) {
+                    const { id, encryptionType } = cursor.value
+                    results.push({ id, encryptionType })
+                    cursor.continue() // Move to the next record.
+                } else {
+                    resolve(results)
+                }
+            }
+        })
+
+        const folderList = document.getElementById("folderList")
+        folderList.innerHTML = "" // Clear the current list.
+
+        // Sort the results alphabetically by ID.
+        folderInfo.sort((a, b) => a.id.localeCompare(b.id))
+
+        // Render the list to the DOM.
+        folderInfo.forEach(folder => {
+            const li = document.createElement("li")
+            // Add a visual indicator for encrypted folders.
+            li.textContent = folder.encryptionType === "pdf" ? `[Locked] ${folder.id}` : folder.id
+            folderList.appendChild(li)
+        })
+
+    } catch (error) {
+        console.error("Failed to list folders:", error)
+        // Optionally, display an error to the user in the UI.
+        const folderList = document.getElementById("folderList")
+        folderList.innerHTML = "<li>Error loading folders.</li>"
+    }
 }
 
 // Deletes a folder from IndexedDB.
@@ -727,7 +847,7 @@ function base64ToBuffer(base64) {
  * @returns {string} The Base64 encoded string.
  */
 function bufferToBase64Safe(buffer) {
-    let binary = ''
+    let binary = ""
     const bytes = new Uint8Array(buffer)
     const len = bytes.byteLength
     // We process the buffer in chunks to avoid passing too many arguments
@@ -741,6 +861,103 @@ function bufferToBase64Safe(buffer) {
         binary += String.fromCharCode.apply(null, chunk)
     }
     return btoa(binary)
+}
+
+/**
+ * A special marker object we'll use to identify Base64 strings during import.
+ * This prevents us from accidentally trying to decode a legitimate string that just
+ * happens to be valid Base64.
+ */
+const BASE64_MARKER = '__IS_BASE64__'
+
+/**
+ * Recursively scans an object or array and converts any ArrayBuffer instances
+ * into a special Base64 marker object for safe JSON serialization.
+ * @param {*} data The data (object, array, etc.) to scan.
+ * @returns {*} A deep copy of the data with ArrayBuffers converted.
+ */
+function convertArrayBuffersToBase64(data) {
+    if (!data) return data
+    if (data instanceof ArrayBuffer) {
+        return {
+            [BASE64_MARKER]: true,
+            data: bufferToBase64Safe(data)
+        }
+    }
+    if (Array.isArray(data)) {
+        return data.map(item => convertArrayBuffersToBase64(item))
+    }
+    if (typeof data === 'object') {
+        const newObj = {}
+        for (const key in data) {
+            newObj[key] = convertArrayBuffersToBase64(data[key])
+        }
+        return newObj
+    }
+    return data
+}
+
+/**
+ * Recursively scans an object or array and converts any special Base64
+ * marker objects back into ArrayBuffer instances.
+ * @param {*} data The data to scan.
+ * @returns {*} A deep copy of the data with Base64 converted back to ArrayBuffers.
+ */
+function convertBase64ToArrayBuffers(data) {
+    if (!data) {
+        return data
+    }
+    if (Array.isArray(data)) {
+        return data.map(item => convertBase64ToArrayBuffers(item))
+    }
+    // IMPORTANT: Check for null because typeof null is 'object'
+    if (typeof data === 'object' && data !== null) {
+        // Check if this object is our special marker. This is the base case for the recursion.
+        if (data[BASE64_MARKER] === true && typeof data.data === 'string') {
+            return base64ToBuffer(data.data)
+        }
+
+        // If it's a regular object, recurse into its properties.
+        const newObj = {}
+        for (const key in data) {
+            // Check for own properties to be safe
+            if (Object.prototype.hasOwnProperty.call(data, key)) {
+                newObj[key] = convertBase64ToArrayBuffers(data[key])
+            }
+        }
+        return newObj
+    }
+    // Return primitives (string, number, etc.) as-is.
+    return data
+}
+
+async function processAndStoreFolder(name, files) {
+    if (!name) {
+        alert("Please enter a name for the folder.")
+        setUiBusy(false)
+        return
+    }
+
+    console.log(`Processing ${Object.keys(files).length} files for folder "${name}"...`)
+
+    const db = await dbPromise
+    const transaction = db.transaction([SN], "readwrite")
+    const folderStore = transaction.objectStore(SN)
+    const folderObject = { id: name, files: files }
+
+    // Use put() instead of delete/put for simplicity. It works for both create and update.
+    folderStore.put(folderObject)
+    await promisifyTransaction(transaction)
+
+    // Invalidate the Service Worker cache.
+    if (navigator.serviceWorker.controller) {
+        navigator.serviceWorker.controller.postMessage({ type: "INVALIDATE_CACHE", folderName: name })
+    }
+
+    console.log(`Folder "${name}" stored successfully.`)
+    document.getElementById("folderName").value = ""
+    document.getElementById("openFolderName").value = name
+    await listFolders()
 }
 
 /**
@@ -767,47 +984,89 @@ async function exportData() {
         }
 
         if (document.getElementById("c3").checked) {
+            dataToExport.indexedDB = {}
             const allDbs = await indexedDB.databases()
+
             for (const dbInfo of allDbs) {
                 const dbName = dbInfo.name
-                if (dbName === DBN) {
-                    console.log(`Skipping RuntimeFS database: '${dbName}'`)
-                    continue // Go to the next database in the list.
-                }
 
-                console.log(`Exporting from database: '${dbName}'`)
+                // if (dbName === DBN) {
+                //     console.log(`Skipping RuntimeFS database: '${dbName}'`)
+                //     continue
+                // }
 
-                // Open a NEW connection specifically to this other database.
-                // We DO NOT use the global dbPromise here.
-                const db = await new Promise((resolve, reject) => {
-                    const request = indexedDB.open(dbName)
-                    request.onsuccess = () => resolve(request.result)
-                    request.onerror = () => reject(request.error)
-                })
-
-                // Prepare the JSON structure: dataToExport.indexedDB.UnityCache = {}
-                dataToExport.indexedDB[dbName] = {}
-                const transaction = db.transaction(db.objectStoreNames, "readonly")
-
-                // Now, loop through all the object stores within THIS database.
-                for (const storeName of db.objectStoreNames) {
-                    const store = transaction.objectStore(storeName)
-                    const records = await promisifyRequest(store.getAll())
-
-                    // The Base64 conversion is kept in case other DBs store binary data.
-                    records.forEach(record => {
-                        // This is a simple check; a more robust exporter might
-                        // need to recursively scan objects for ArrayBuffers.
-                        if (record && record.buffer instanceof ArrayBuffer) {
-                            record.buffer = bufferToBase64Safe(record.buffer)
-                        }
+                try {
+                    // console.log(`Attempting to export from database: '${dbName}'`)
+                    const db = await new Promise((resolve, reject) => {
+                        const request = indexedDB.open(dbName)
+                        request.onsuccess = () => resolve(request.result)
+                        request.onerror = (e) => reject(`Could not open database: ${dbName}. Error: ${e.target.error}`)
                     })
 
-                    // Store the records under the correct database and store name.
-                    dataToExport.indexedDB[dbName][storeName] = records
+                    if (!db || !db.objectStoreNames || db.objectStoreNames.length === 0) {
+                        console.warn(`'${dbName}' is empty or its object stores could not be read. Skipping.`)
+                        db.close()
+                        continue
+                    }
+
+                    dataToExport.indexedDB[dbName] = {
+                        version: db.version,
+                        schema: {},
+                        data: {}
+                    }
+
+                    dataToExport.indexedDB[dbName] = {}
+                    const storeNames = Array.from(db.objectStoreNames)
+                    if (storeNames.length === 0) {
+                        console.warn(`'${dbName}' is empty. Skipping.`)
+                        db.close()
+                        continue // Go to the next database
+                    }
+
+                    dataToExport.indexedDB[dbName] = {
+                        version: db.version,
+                        schema: {},
+                        data: {}
+                    }
+
+                    const transaction = db.transaction(storeNames, "readonly")
+
+                    for (const storeName of storeNames) {
+                        const store = transaction.objectStore(storeName)
+                        dataToExport.indexedDB[dbName].schema[storeName] = {
+                            keyPath: store.keyPath,
+                            autoIncrement: store.autoIncrement
+                        }
+                        const records = await new Promise((resolve, reject) => {
+                            const transaction = db.transaction([storeName], "readonly")
+                            const store = transaction.objectStore(storeName)
+                            const allRecords = []
+
+                            const cursorRequest = store.openCursor()
+                            cursorRequest.onerror = (event) => reject(event.target.error)
+
+                            cursorRequest.onsuccess = (event) => {
+                                const cursor = event.target.result
+                                if (cursor) {
+                                    // For every record, save both its key and its value
+                                    allRecords.push({
+                                        key: cursor.key,
+                                        value: cursor.value
+                                    })
+                                    cursor.continue()
+                                } else {
+                                    // End of records
+                                    resolve(allRecords)
+                                }
+                            }
+                        })
+                        dataToExport.indexedDB[dbName].data[storeName] = convertArrayBuffersToBase64(records)
+                    }
+                    db.close()
+                    console.log(`Exported '${dbName}'.`)
+                } catch (error) {
+                    console.warn(`Could not export database '${dbName}'. Skipping.`, error)
                 }
-                // It's good practice to close the connection when we're done.
-                db.close()
             }
         }
 
@@ -838,7 +1097,7 @@ async function exportData() {
         }
 
         const jsonString = JSON.stringify(finalObjectToExport)
-        const importExportContainer = document.querySelector("#c3").parentElement
+        const importExportContainer = document.getElementById("c3").parentElement
         createAndDisplayDownloadLink(jsonString, importExportContainer)
 
         console.log("General data export prepared. Awaiting user download.")
@@ -856,114 +1115,139 @@ async function exportData() {
  * handling both plaintext and encrypted exports.
  */
 async function importData() {
-    // The file picker logic remains the same.
-    try {
-        const input = document.createElement("input")
-        input.type = "file"
-        input.accept = ".json, .txt"
-        input.onchange = async (event) => {
-            setUiBusy(true)
+    const input = document.createElement("input")
+    input.type = "file"
+    input.click()
+    setUiBusy(true)
+    input.oncancel = () => setUiBusy(false)
+    input.onchange = async (event) => {
+        try {
             const file = event.target.files[0]
             if (!file) {
                 setUiBusy(false)
                 return
             }
 
-            try {
-                // The decryption logic also remains the same.
-                const content = await file.text()
-                const wrapper = JSON.parse(content)
-                let data
+            const content = await file.text()
+            const wrapper = JSON.parse(content)
+            let data
 
-                if (wrapper.type === "FS-EE") {
-                    const password = prompt("This file is encrypted. Please enter the password:")
-                    if (!password) {
-                        alert("Password required to import this file.")
-                        setUiBusy(false)
-                        return
-                    }
-
-                    const salt = base64ToBuffer(wrapper.s)
-                    const iv = base64ToBuffer(wrapper.iv)
-                    const payload = base64ToBuffer(wrapper.p)
-                    const key = await deriveKeyFromPassword(password, salt)
-
-                    const decryptedBuffer = await crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, key, payload)
-                    const decryptedString = new TextDecoder().decode(decryptedBuffer)
-                    data = JSON.parse(decryptedString)
-                } else if (wrapper.type === "FS-PE") {
-                    data = wrapper.p
-                } else {
-                    data = wrapper
+            if (wrapper.type === "FS-EE") {
+                const password = prompt("This file is encrypted. Please enter the password:")
+                if (!password) {
+                    alert("Password required to import this file.")
+                    setUiBusy(false)
+                    return
                 }
 
-                // Restore localStorage, filtering out the RuntimeFS private key
-                if (data.localStorage) {
-                    for (const key in data.localStorage) {
-                        if (key === "pk") {
-                            console.warn("Skipping import of 'pk' from localStorage to protect existing key.")
-                            continue // Move to the next key
-                        }
-                        localStorage.setItem(key, data.localStorage[key])
+                const salt = base64ToBuffer(wrapper.s)
+                const iv = base64ToBuffer(wrapper.iv)
+                const payload = base64ToBuffer(wrapper.p)
+                const key = await deriveKeyFromPassword(password, salt)
+
+                const decryptedBuffer = await crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, key, payload)
+                const decryptedString = new TextDecoder().decode(decryptedBuffer)
+                data = JSON.parse(decryptedString)
+            } else if (wrapper.type === "FS-PE") {
+                data = wrapper.p
+            } else {
+                data = wrapper
+            }
+
+            if (data.localStorage) {
+                for (const key in data.localStorage) {
+                    if (key === "pk") {
+                        console.warn("Skipping import of 'pk' from localStorage to protect existing key.")
+                        continue // Move to the next key
                     }
+                    localStorage.setItem(key, data.localStorage[key])
                 }
+            }
 
-                if (data.indexedDB) {
-                    for (const dbName in data.indexedDB) {
-                        // Explicitly refuse to import into the RuntimeFS database.
-                        if (dbName === DBN) {
-                            console.warn(`Skipping import of data for '${DBN}' to protect RuntimeFS folders.`)
-                            continue // Go to the next database in the file.
-                        }
+            if (data.indexedDB) {
+                for (const dbName in data.indexedDB) {
+                    // Explicitly refuse to import into the RuntimeFS database.
+                    // if (dbName === DBN) {
+                    //     console.warn(`Skipping import of data for '${DBN}' to protect RuntimeFS folders.`)
+                    //     continue // Go to the next database in the file.
+                    // }
 
-                        console.log(`Importing data into database: '${dbName}'`)
+                    const dbData = data.indexedDB[dbName]
+                    const version = dbData.version
+                    const schema = dbData.schema
+                    const storesToImport = dbData.data
 
-                        // Open a connection to the target database.
-                        const db = await new Promise((resolve, reject) => {
-                            const request = indexedDB.open(dbName)
-                            request.onsuccess = () => resolve(request.result)
-                            request.onerror = () => reject(request.error)
-                        })
+                    // Open with version number
+                    const db = await new Promise((resolve, reject) => {
+                        const request = indexedDB.open(dbName, version)
+                        request.onerror = (e) => reject(`Could not open database: ${dbName}. Error: ${e.target.error}`)
 
-                        const storeNames = Object.keys(data.indexedDB[dbName])
-                        const transaction = db.transaction(storeNames, "readwrite")
-
-                        // Restore each store within this database.
-                        for (const storeName of storeNames) {
-                            const store = transaction.objectStore(storeName)
-                            store.clear() // Clear existing data before importing.
-                            const records = data.indexedDB[dbName][storeName]
-                            for (const record of records) {
-                                // Convert Base64 back to buffer if needed.
-                                if (record && typeof record.buffer === "string") {
-                                    record.buffer = base64ToBuffer(record.buffer)
+                        // This event handler BUILDS the database structure.
+                        request.onupgradeneeded = (event) => {
+                            const dbHandle = event.target.result
+                            for (const storeName in schema) {
+                                if (!dbHandle.objectStoreNames.contains(storeName)) {
+                                    const storeSchema = schema[storeName]
+                                    dbHandle.createObjectStore(storeName, {
+                                        keyPath: storeSchema.keyPath,
+                                        autoIncrement: storeSchema.autoIncrement
+                                    })
                                 }
-                                store.put(record)
                             }
                         }
-                        db.close()
-                    }
-                }
 
-                alert("General data import successful!")
-                await listFolders()
-            } catch (error) {
-                console.error("Import failed:", error)
-                // A common error is a bad password during decryption, which throws a DOMException.
-                if (error instanceof DOMException && error.name === "OperationError") {
-                    alert("Import failed. The password may be incorrect.")
-                } else {
-                    alert("An error occurred during import: " + error.message)
+                        // This event handler fires AFTER onupgradeneeded is finished.
+                        request.onsuccess = (event) => {
+                            resolve(event.target.result)
+                        }
+                    })
+
+                    // Now that the DB and stores are guaranteed to exist, we can populate them.
+                    const storeNames = Object.keys(storesToImport)
+                    if (storeNames.length > 0) {
+                        const transaction = db.transaction(storeNames, "readwrite")
+
+                        for (const storeName of storeNames) {
+                            const store = transaction.objectStore(storeName)
+                            store.clear()
+                            // Get the schema for THIS specific store, which you have in the `schema` variable
+                            const storeSchema = schema[storeName]
+                            const usesInLineKeys = storeSchema && storeSchema.keyPath
+
+                            const restoredRecords = convertBase64ToArrayBuffers(storesToImport[storeName])
+
+                            for (const recordObject of restoredRecords) {
+                                if (usesInLineKeys) {
+                                    // If the store uses in-line keys, just provide the value.
+                                    // IndexedDB will find the key itself using the keyPath.
+                                    store.put(recordObject.value)
+                                } else {
+                                    // If it's an out-of-line key store, provide both value and key.
+                                    store.put(recordObject.value, recordObject.key)
+                                }
+                            }
+                        }
+
+                        await promisifyTransaction(transaction)
+                    }
+
+                    db.close()
                 }
-            } finally {
-                // Always re-enable the UI after the process is finished.
-                setUiBusy(false)
             }
+            alert("General data import successful!")
+            await listFolders()
+        } catch (error) {
+            console.error("Import failed:", error)
+            // A common error is a bad password during decryption, which throws a DOMException.
+            if (error instanceof DOMException && error.name === "OperationError") {
+                alert("Import failed. The password may be incorrect.")
+            } else {
+                alert("An error occurred during import: " + error.message)
+            }
+        } finally {
+            // Always re-enable the UI after the process is finished.
+            setUiBusy(false)
         }
-        input.click()
-    } catch (error) {
-        // This outer catch handles errors in creating the input element itself.
-        console.error("Failed to initialize import:", error)
     }
 }
 
@@ -975,11 +1259,17 @@ function createAndDisplayDownloadLink(jsonString, parentElement) {
     }
 
     // Create a Data URI, which embeds the file content directly in the URL.
-    const dataURI = `data:text/plain;charset=utf-8,${encodeURIComponent(jsonString)}`
+    var url
+    if (jsonString.length > 1e7 && !confirm("JSON string size is large. Export as data: anyway?")) {
+        const blob = new Blob([jsonString], { type: 'text/plain;charset=utf-8' })
+        url = URL.createObjectURL(blob)
+    } else {
+        url = `data:text/plain;charset=utf-8,${encodeURIComponent(jsonString)}`
+    }
 
     const a = document.createElement("a")
     a.id = "download-link" // Give it an ID for easy removal later.
-    a.href = dataURI
+    a.href = url
     a.download = "result.txt" // The default filename for the user.
     a.textContent = "Click here to download export!"
 
@@ -1140,7 +1430,143 @@ async function encryptAndSaveFolderWithPassword() {
 }
 
 // Add keyboard shortcuts for common actions.
-document.getElementById("folderName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), uploadFolder()))
-document.getElementById("openFolderName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), openFile()))
-document.getElementById("fileName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), openFile()))
-document.getElementById("deleteFolderName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), deleteFolder()))
+document.getElementById("folderName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), currentlyBusy || uploadFolder()))
+document.getElementById("openFolderName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), currentlyBusy || openFile()))
+document.getElementById("fileName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), currentlyBusy || openFile()))
+document.getElementById("deleteFolderName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), currentlyBusy || deleteFolder()))
+document.getElementById("folderUploadFallbackInput").addEventListener("change", uploadFolderFallback)
+document.getElementById("folderUploadFallbackInput").addEventListener("cancel", () => setUiBusy(false))
+document.body.addEventListener("dragover", e => {
+    e.preventDefault()
+    document.body.style.backgroundColor = "#385b7e"
+})
+
+document.body.addEventListener("dragleave", () => {
+    document.body.style.backgroundColor = "" // Reset visual feedback
+})
+
+/** Promisifies the reader.readEntries() callback API. */
+function readAllEntries(directoryReader) {
+    return new Promise((resolve, reject) => {
+        let allEntries = []
+        const readMore = () => {
+            directoryReader.readEntries(
+                (entries) => {
+                    if (entries.length === 0) resolve(allEntries)
+                    else {
+                        allEntries = allEntries.concat(entries)
+                        readMore()
+                    }
+                },
+                (error) => reject(error)
+            )
+        }
+        readMore()
+    })
+}
+
+/**
+ * Promisifies the entry.file() callback API.
+ * @param {FileSystemFileEntry} fileEntry The file entry to convert.
+ * @returns {Promise<File>} A promise that resolves with the File object.
+ */
+function getFileFromEntry(fileEntry) {
+    return new Promise((resolve, reject) => {
+        fileEntry.file(
+            (file) => {
+                resolve(file)
+            },
+            (error) => {
+                reject(error)
+            }
+        )
+    })
+}
+
+/**
+ * Processes a list of dropped items, recursively reading all files from any directories.
+ * This modern async version avoids the race conditions of the old callback-based approach.
+ * @param {DataTransferItemList} dataTransferItemList The items from the 'drop' event.
+ * @returns {Promise<object>} A promise that resolves to the completed files object.
+ */
+async function getFilesFromDroppedItems(dataTransferItemList) {
+    const files = {}
+    const rootEntries = []
+
+    // First, convert all dropped items to FileSystemEntry objects.
+    for (let i = 0; i < dataTransferItemList.length; i++) {
+        rootEntries.push(dataTransferItemList[i].webkitGetAsEntry())
+    }
+
+    /**
+     * An inner recursive function to process each entry.
+     * It adds files directly to the 'files' object in the outer scope.
+     * @param {FileSystemEntry} entry The entry to process.
+     */
+    async function processEntry(entry) {
+        if (entry.isFile) {
+            const file = await getFileFromEntry(entry)
+            const buffer = await file.arrayBuffer()
+            // entry.fullPath includes the leading '/', which we remove.
+            const path = entry.fullPath.substring(1)
+            files[path] = { buffer, type: getMimeType(path) || file.type }
+        } else if (entry.isDirectory) {
+            const reader = entry.createReader()
+            // Use our promisified helper to get all sub-entries at once.
+            const entries = await readAllEntries(reader)
+            // Process all sub-entries in parallel for maximum efficiency.
+            await Promise.all(entries.map(processEntry))
+        }
+    }
+
+    // Start the process for all top-level dropped items in parallel.
+    await Promise.all(rootEntries.map(processEntry))
+
+    return files
+}
+
+document.body.addEventListener('drop', async e => {
+    e.preventDefault()
+    document.body.style.backgroundColor = ""
+    setUiBusy(true)
+
+    let defaultFolderName = ""
+    const items = e.dataTransfer.items
+    if (items && items.length > 0 && items[0].webkitGetAsEntry) {
+        // We only want to process if the first item is a directory.
+        const firstEntry = items[0].webkitGetAsEntry()
+        if (firstEntry.isDirectory) {
+            defaultFolderName = firstEntry.name
+        } else {
+            // If the user dropped a file, inform them and stop.
+            alert("Please drop a folder, not a file.")
+            return
+        }
+    } else {
+        alert("This browser does not support folder dropping.")
+        return
+    }
+
+    const name = prompt("Enter a name for the folder:", defaultFolderName)
+    if (name === null) {
+        return
+    }
+    setUiBusy(true)
+    try {
+        const files = await getFilesFromDroppedItems(items)
+
+        if (Object.keys(files).length === 0) {
+            alert("The dropped folder appears to be empty.")
+            return
+        }
+
+        // Use the name from the prompt to store the folder.
+        await processAndStoreFolder(name.trim(), files)
+
+    } catch (err) {
+        console.error("Drag-and-drop error:", err)
+        alert("An error occurred during drop: " + err.message)
+    } finally {
+        setUiBusy(false)
+    }
+});

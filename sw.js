@@ -1,312 +1,69 @@
-// A map to temporarily store regex rules sent from the main thread.
-// Rules are associated with a requestId to be applied to a specific fetch.
-// They are automatically deleted after 30 seconds to prevent memory leaks.
+// Temporary storage for regex rules, keyed by request ID.
+// Rules expire after 30 seconds to prevent memory leaks.
 const ruleStore = new Map()
-
-// A map to temporarily store decryption keys for password-protected folders.
-// The key is passed from the main thread just before the fetch request.
-// It's also cleared after 30 seconds.
+// Temporary storage for decryption keys, keyed by request ID.
+// Keys expire after 30 seconds.
 const decryptionKeyStore = new Map()
 
-// Listen for messages from the main application thread.
-self.addEventListener("message", e => {
-    if (e.data && e.data.type === "REGRULES") {
-        // Store regex rules for an upcoming request.
-        ruleStore.set(e.data.requestId, e.data.rules)
-        setTimeout(() => ruleStore.delete(e.data.requestId), 30000)
-    } else if (e.data && e.data.type === "INVALIDATE_CACHE") {
-        // When a folder is updated, the main thread asks to invalidate the in-memory cache.
-        const folderName = e.data.folderName
-        if (folderName) {
-            console.log(`Invalidating cache in ServiceWorker for: ${folderName}`)
-            folderCache.delete(folderName)
-            if (e.source) {
-                e.source.postMessage({ type: 'CACHE_INVALIDATED', folderName: folderName })
-            }
-        }
-    } else if (e.data && e.data.type === "DECRYPT_KEY") {
-        // Store a decryption key for an upcoming request for an encrypted file.
-        decryptionKeyStore.set(e.data.requestId, e.data.key)
-        setTimeout(() => decryptionKeyStore.delete(e.data.requestId), 30000)
-    } else if (e.data && e.data.type === 'SYNC_AND_OPEN') {
-        const { folderName, updates, fileToOpen } = e.data
+// IndexedDB configuration.
+const DBN = "FileCacheDB" // Database name for RuntimeFS.
+const SN = "Folders";      // Object store for folder data.
+const META_SN = "Metadata" // Object store for metadata (like folder manifest).
+const DB_VERSION = 1;      // Database version.
 
-        // Use event.waitUntil to keep the service worker alive while we do async work
-        e.waitUntil((async () => {
-            try {
-                // 1. Update IndexedDB
-                const db = await getDb()
-                const transaction = db.transaction([SN], "readwrite")
-                const store = transaction.objectStore(SN)
-                const folderData = await promisifyRequest(store.get(folderName))
-
-                if (folderData) {
-                    for (const update of updates) {
-                        if (update.type === "update") {
-                            folderData.files[update.path] = update.data
-                        } else if (update.type === "delete") {
-                            delete folderData.files[update.path]
-                        }
-                    }
-                    store.put(folderData)
-                }
-                await promisifyTransaction(transaction)
-                console.log(`Service Worker successfully synced ${updates.length} changes.`)
-
-                // 2. Invalidate the in-memory cache
-                folderCache.delete(folderName)
-                console.log(`Service Worker invalidated its own cache for: ${folderName}`)
-
-                // 3. Open the new window
-                const urlToOpen = `/n/${encodeURIComponent(folderName)}/${encodeURIComponent(fileToOpen)}?v=${Date.now()}`
-                await self.clients.openWindow(urlToOpen)
-
-            } catch (err) {
-                console.error("Error during SYNC_AND_OPEN operation in Service Worker:", err)
-            }
-        })())
-    }
-})
-
-// Constants for IndexedDB database and object stores.
-const DBN = "FileCacheDB"
-const SN = "Folders"
-const META_SN = "Metadata"
-const DB_VERSION = 1
-
-// Name for the cache used to store the application shell.
-const CACHE_NAME = "fc"
-// A list of core files that make up the application's shell.
+// Application shell caching configuration.
+const CACHE_NAME = "fc" // Name for the application shell cache.
+// Core files that make up the application's shell.
 const APP_SHELL_FILES = ["./", "./index.php", "./index.html", "./main.js"]
 
-// A promise that resolves with the IndexedDB database connection.
+// Promise for the IndexedDB connection.
 let dbPromise = null
-// An in-memory cache for folder data to reduce IndexedDB lookups.
+// In-memory cache for folder data to reduce IndexedDB lookups.
 const folderCache = new Map()
-// Manages in-flight promises to prevent concurrent DB requests for the same folder.
+// Tracks promises for ongoing folder data loads to prevent concurrent requests.
 const folderLoadingPromises = new Map()
 
-// Returns a promise that resolves with the database connection, creating it if necessary.
-function getDb() {
-    if (!dbPromise) {
-        dbPromise = new Promise((resolve, reject) => {
-            const request = indexedDB.open(DBN, DB_VERSION)
-            // This event is triggered when the database version changes.
-            request.onupgradeneeded = event => {
-                const db = event.target.result
-                // Create the object stores if they don't already exist.
-                if (!db.objectStoreNames.contains(SN)) db.createObjectStore(SN, { keyPath: "id" })
-                if (!db.objectStoreNames.contains(META_SN)) db.createObjectStore(META_SN, { keyPath: "id" })
-            }
-            request.onsuccess = event => resolve(event.target.result)
-            request.onerror = event => reject(event.target.error)
-        })
-    }
-    return dbPromise
-}
-
-// The 'install' event is fired when the service worker is first installed.
-self.addEventListener("install", event => {
-    // waitUntil() ensures that the service worker will not install until the code inside has successfully completed
-    event.waitUntil((async () => {
-        // Open the application shell cache.
-        const cache = await caches.open(CACHE_NAME)
-        // Fetch and cache all the application shell files.
-        const promises = APP_SHELL_FILES.map(async (url) => {
-            try {
-                const response = await fetch(url)
-                if (response.ok) {
-                    await cache.put(url, response)
-                } else {
-                    console.warn(`Skipping cache for ${url} - Status: ${response.status}`)
-                }
-            } catch (error) {
-                console.warn(`Skipping cache for ${url} - Fetch failed:`, error)
-            }
-        })
-        await Promise.all(promises)
-        // Force the waiting service worker to become the active service worker.
-        await self.skipWaiting()
-    })())
-})
-
-// The 'activate' event is fired when the service worker becomes active.
-self.addEventListener("activate", event => {
-    event.waitUntil(
-        getDb()
-            // Clean up old caches.
-            .then(() => caches.keys().then(keys => Promise.all(keys.map(k => k !== CACHE_NAME ? caches.delete(k) : null))))
-            // Take control of all open clients (pages) at once.
-            .then(() => self.clients.claim())
-    )
-})
-
-// The 'fetch' event is fired for every network request made by the page.
-self.addEventListener("fetch", event => {
-    const url = new URL(event.request.url)
-    // Ignore requests to other origins.
-    if (url.origin !== self.location.origin) return
-
-    // respondWith() hijacks the request and allows us to provide our own response.
-    event.respondWith((async () => {
-        // First, check if the request is for one of the core application files.
-        if (APP_SHELL_FILES.includes(url.pathname)) {
-            // If so, try to serve it from the cache, falling back to the network.
-            const cachedResponse = await caches.match(event.request)
-            return cachedResponse || fetch(event.request)
-        }
-
-        // Second, check if it's a request for a virtual file.
-        // Virtual files are served from IndexedDB and live under the "/n/" path.
-        if (url.pathname.startsWith("/n/")) {
-            const pathParts = url.pathname.split("/").slice(2)
-            const requestId = url.searchParams.get("reqId")
-            const rules = ruleStore.get(requestId) || null
-
-            // Once used, the rules can be removed.
-            if (requestId) ruleStore.delete(requestId)
-            // Generate a response from the file stored in IndexedDB.
-            return generateResponseForVirtualFile(pathParts[0], pathParts.slice(1).join("/"), rules)
-        }
-
-        // Third, handle root-relative asset requests from within a virtual folder.
-        // For example, if a virtual HTML file requests "/style.css".
-        const referer = event.request.referrer
-        if (referer) {
-            const refererUrl = new URL(referer)
-            // Check if the request is coming from one of our virtual files.
-            if (refererUrl.origin === self.location.origin && refererUrl.pathname.startsWith("/n/")) {
-                const pathParts = refererUrl.pathname.split("/").slice(2)
-                const rules = refererUrl.searchParams.get("rules")
-                // Serve the requested asset from the same virtual folder.
-                return generateResponseForVirtualFile(pathParts[0], url.pathname.substring(1), rules ? decodeURIComponent(rules) : null)
-            }
-        }
-
-        // For any other request, just fetch it from the network.
-        return fetch(event.request)
-    })())
-})
-
-// Retrieves folder data from the in-memory cache or IndexedDB.
-function getFolderData(folderName) {
-    // First, check the in-memory cache for the data.
-    if (folderCache.has(folderName)) {
-        return Promise.resolve(folderCache.get(folderName))
-    }
-
-    // Check if another request is already loading this folder. If so, wait for it to finish.
-    if (folderLoadingPromises.has(folderName)) {
-        return folderLoadingPromises.get(folderName)
-    }
-
-    // If not cached, create a new promise to fetch the data from IndexedDB.
-    const loadingPromise = (async () => {
-        try {
-            const db = await getDb()
-            // The transaction must include both object stores it intends to read from.
-            const transaction = db.transaction([SN, META_SN], "readonly")
-
-            // Look up the folder's ID in the manifest.
-            const manifest = (await promisifyRequest(transaction.objectStore(META_SN).get("folderManifest")))?.data || {}
-            const folderId = manifest[folderName] || folderName
-            // Retrieve the folder data using its ID.
-            const folderData = await promisifyRequest(transaction.objectStore(SN).get(folderId))
-
-            if (folderData) {
-                // Populate the in-memory cache for next time.
-                folderCache.set(folderName, folderData)
-            }
-            return folderData
-        } finally {
-            // Once the promise is complete, remove it from the in-flight map.
-            folderLoadingPromises.delete(folderName)
-        }
-    })()
-
-    // Store the promise in the map to handle concurrent requests.
-    folderLoadingPromises.set(folderName, loadingPromise)
-    return loadingPromise
-}
-
-// Generates an HTTP response for a requested virtual file.
-async function generateResponseForVirtualFile(folderName, requestedFilePath, rules) {
-    const decodedFolderName = decodeURIComponent(folderName)
-    let decodedFilePath = decodeURIComponent(requestedFilePath)
-
-    // Retrieve the request ID to get the correct decryption key, if any.
-    const urlParams = new URL(self.location.href).searchParams
-    const requestId = urlParams.get("reqId")
-    const decryptionKey = decryptionKeyStore.get(requestId)
-
-    // Once the key is retrieved, it can be deleted.
-    if (decryptionKey) decryptionKeyStore.delete(requestId)
-
-    const folderData = await getFolderData(decodedFolderName)
-    if (!folderData || !folderData.files) {
-        console.warn(`Folder not found: ${decodedFolderName}`)
-        return new Response("Folder not found: " + decodedFolderName, { status: 404 })
-    }
-
-    // If no specific file is requested, look for an index file.
-    if (!decodedFilePath) {
-        if (folderData.files["index.html"]) decodedFilePath = "index.html"
-        else if (folderData.files["index.php"]) decodedFilePath = "index.php"
-    }
-
-    let fileData = folderData.files[decodedFilePath]
-    let foundPath = decodedFilePath
-
-    // If the exact file path isn't found, try to find a file that ends with the requested path.
-    // This can help resolve requests for files in nested directories.
-    if (!fileData) {
-        const matchingPath = Object.keys(folderData.files).find(p => p.endsWith(decodedFilePath))
-        if (matchingPath) {
-            fileData = folderData.files[matchingPath]
-            foundPath = matchingPath
-        }
-    }
-
-    if (!fileData) {
-        console.warn(`File not found: ${decodedFilePath}`)
-        return new Response("File not found: " + decodedFilePath, { status: 404 })
-    }
-
-    // Start with the buffer from storage. This may be encrypted.
-    let fileBuffer = fileData.buffer
-
-    // If a decryption key was provided, attempt to decrypt the file buffer.
-    if (decryptionKey && decodedFilePath !== ".metadata") {
-        try {
-            // The first 12 bytes are the IV (Initialization Vector).
-            const iv = fileBuffer.slice(0, 12)
-            const encryptedData = fileBuffer.slice(12)
-            // Use the Web Crypto API to decrypt the data.
-            fileBuffer = await crypto.subtle.decrypt(
-                { name: "AES-GCM", iv: iv },
-                decryptionKey,
-                encryptedData
-            )
-        } catch (e) {
-            console.error("Decryption failed in Service Worker:", e)
-            return new Response("Decryption Failed. Bad password?", { status: 401 })
-        }
-    }
-
-    // Determine the MIME type of the file.
-    const contentType = getMimeType(foundPath) || fileData.type || "application/octet-stream"
-    // Apply any regex rules to the file content.
-    const modifiedBuffer = applyRegexRules(foundPath, fileBuffer, contentType, rules)
-    // Return the final file content as a Response object.
-    return new Response(modifiedBuffer, {
-        headers: {
-            "Content-Type": contentType,
-            "Cache-Control": "no-store" // Ensure the browser doesn't cache the virtual file.
-        }
+/**
+ * Promisifies an IndexedDB request.
+ * @param {IDBRequest} req The IndexedDB request.
+ * @returns {Promise<any>} A promise that resolves with the request result or rejects on error.
+ */
+function promisifyRequest(req) {
+    return new Promise((resolve, reject) => {
+        req.onsuccess = () => resolve(req.result)
+        req.onerror = () => reject(req.error)
     })
 }
 
-// A utility function to determine a file's MIME type based on its extension.
+/**
+ * Promisifies an IndexedDB transaction completion.
+ * @param {IDBTransaction} transaction The IndexedDB transaction.
+ * @returns {Promise<void>} A promise that resolves when the transaction completes or rejects on error/abort.
+ */
+function promisifyTransaction(transaction) {
+    return new Promise((resolve, reject) => {
+        transaction.oncomplete = () => resolve()
+        transaction.onerror = () => reject(transaction.error)
+        transaction.onabort = () => reject(transaction.error || new DOMException("Transaction aborted"))
+    })
+}
+
+/**
+ * Generates a SHA-1 hash of an ArrayBuffer. Used for creating ETags.
+ * @param {ArrayBuffer} buffer The buffer to hash.
+ * @returns {Promise<string>} A promise resolving with the hex-encoded hash.
+ */
+async function generateETag(buffer) {
+    const hashBuffer = await crypto.subtle.digest('SHA-1', buffer)
+    const hashArray = Array.from(new Uint8Array(hashBuffer))
+    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
+/**
+ * Determines the MIME type of a file based on its extension.
+ * @param {string} filePath The path to the file.
+ * @returns {string | undefined} The MIME type or undefined if not found.
+ */
 function getMimeType(filePath) {
     const ext = filePath.split(".").pop().toLowerCase()
     const mimeTypes = {
@@ -351,69 +108,429 @@ function getMimeType(filePath) {
     return mimeTypes[ext]
 }
 
-// A helper function to convert IndexedDB requests into Promises.
-function promisifyRequest(req) {
-    return new Promise((r, j) => {
-        req.onsuccess = () => r(req.result)
-        req.onerror = () => j(req.error)
-    })
-}
-
-// Escapes a string for use in a regular expression.
+/**
+ * Escapes special characters in a string for safe use in a regular expression.
+ * @param {string} string The string to escape.
+ * @returns {string} The escaped string.
+ */
 function escapeRegex(string) {
     return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
 
-// Applies search-and-replace rules to the content of a text-based file.
+/**
+ * Applies regex search and replace rules to file content if it's text-based.
+ * @param {string} filePath The path of the file being processed.
+ * @param {ArrayBuffer} fileBuffer The file's content.
+ * @param {string} fileType The file's MIME type.
+ * @param {string | null} regexRules The rules string.
+ * @returns {ArrayBuffer} The potentially modified file content.
+ */
 function applyRegexRules(filePath, fileBuffer, fileType, regexRules) {
-    // If there are no rules, or the file is not text-based, return the original buffer.
     if (!regexRules || !regexRules.trim()) return fileBuffer
+    // Only apply to text-based files.
     if (!/^(text|application\/(javascript|json|xml))/.test(fileType)) return fileBuffer
 
     try {
-        // Decode the file buffer into a string.
-        let content = new TextDecoder().decode(fileBuffer)
+        const content = new TextDecoder().decode(fileBuffer)
         const rules = regexRules.trim().split("\n")
+        let modifiedContent = content
 
-        // Iterate over each rule.
         for (const line of rules) {
-            // Split the rule into the match part and the replacement part.
             const [matchPart, replacePart] = line.split("->").map(s => s.trim())
             if (matchPart === undefined || replacePart === undefined) continue
 
-            // Parse the operator and search pattern from the match part.
             const operatorMatch = matchPart.match(/^(.*?)\s(\$|\$\$|\|\||\|)\s(.*?)$/)
             if (!operatorMatch) continue
 
             const [, fileMatch, operator, searchPattern] = operatorMatch
-            // Check if the rule applies to this file path.
             const fileRegex = new RegExp(fileMatch.trim() === "*" ? ".*" : fileMatch.trim())
+
             if (!fileRegex.test(filePath)) continue
 
             let searchRegex
-            // Create the appropriate RegExp object based on the operator.
             switch (operator) {
-                case "|": // Global Regex
-                    searchRegex = new RegExp(searchPattern, "g")
-                    break
-                case "$": // Global Plain Text
-                    searchRegex = new RegExp(escapeRegex(searchPattern), "g")
-                    break
-                case "||": // First Match Regex
-                    searchRegex = new RegExp(searchPattern)
-                    break
-                case "$$": // First Match Plain Text
-                    searchRegex = new RegExp(escapeRegex(searchPattern))
-                    break
+                case "|": searchRegex = new RegExp(searchPattern, "g"); break
+                case "$": searchRegex = new RegExp(escapeRegex(searchPattern), "g"); break
+                case "||": searchRegex = new RegExp(searchPattern); break
+                case "$$": searchRegex = new RegExp(escapeRegex(searchPattern)); break
             }
-            // Perform the replacement on the content.
-            content = content.replace(searchRegex, replacePart)
+            modifiedContent = modifiedContent.replace(searchRegex, replacePart)
         }
-        // Encode the modified content back into a buffer and return it.
-        return new TextEncoder().encode(content).buffer
+        return new TextEncoder().encode(modifiedContent).buffer
     } catch (e) {
-        console.error("Error applying regex rules:", e)
-        // If an error occurs, return the original buffer.
-        return fileBuffer
+        console.error(`Error applying regex rules to ${filePath}:`, e)
+        return fileBuffer // Return original buffer on error.
     }
+}
+
+/**
+ * Gets the IndexedDB connection promise, creating it if it doesn't exist.
+ * @returns {Promise<IDBDatabase>} A promise that resolves with the DB instance.
+ */
+function getDb() {
+    if (!dbPromise) {
+        dbPromise = new Promise((resolve, reject) => {
+            const request = indexedDB.open(DBN, DB_VERSION)
+            request.onupgradeneeded = event => {
+                const db = event.target.result
+                if (!db.objectStoreNames.contains(SN)) {
+                    db.createObjectStore(SN, { keyPath: "id" })
+                }
+                if (!db.objectStoreNames.contains(META_SN)) {
+                    db.createObjectStore(META_SN, { keyPath: "id" })
+                }
+            }
+            request.onsuccess = event => resolve(event.target.result)
+            request.onerror = event => reject(event.target.error)
+        })
+    }
+    return dbPromise
+}
+
+/**
+ * Retrieves folder data, using cache or fetching from IndexedDB.
+ * @param {string} folderName The name of the folder.
+ * @returns {Promise<object | undefined>} A promise resolving with folder data or undefined.
+ */
+function getFolderData(folderName) {
+    if (folderCache.has(folderName)) {
+        return Promise.resolve(folderCache.get(folderName))
+    }
+    if (folderLoadingPromises.has(folderName)) {
+        return folderLoadingPromises.get(folderName)
+    }
+
+    const loadingPromise = (async () => {
+        try {
+            const db = await getDb()
+            const transaction = db.transaction([SN, META_SN], "readonly")
+            // Get folder manifest to find actual folder ID if aliased.
+            const manifest = (await promisifyRequest(transaction.objectStore(META_SN).get("folderManifest")))?.data || {} // manifest not done yet
+            const folderId = manifest[folderName] || folderName
+            const folderData = await promisifyRequest(transaction.objectStore(SN).get(folderId))
+
+            if (folderData) {
+                folderCache.set(folderName, folderData) // Cache the data.
+            }
+            return folderData
+        } finally {
+            folderLoadingPromises.delete(folderName) // Clean up loading state.
+        }
+    })()
+
+    folderLoadingPromises.set(folderName, loadingPromise)
+    return loadingPromise
+}
+
+// Service worker installation. Caches the application shell.
+self.addEventListener("install", event => {
+    event.waitUntil((async () => {
+        const cache = await caches.open(CACHE_NAME)
+        const promises = APP_SHELL_FILES.map(async (url) => {
+            try {
+                const response = await fetch(url)
+                if (response.ok) {
+                    await cache.put(url, response)
+                } else {
+                    console.warn(`Skipping cache for ${url} - Status: ${response.status}`)
+                }
+            } catch (error) {
+                console.warn(`Skipping cache for ${url} - Fetch failed:`, error)
+            }
+        })
+        await Promise.all(promises)
+        await self.skipWaiting() // Activate immediately.
+    })())
+})
+
+// Service worker activation. Cleans up old caches and claims clients.
+self.addEventListener("activate", event => {
+    event.waitUntil(
+        getDb() // 1. Ensure DB is ready.
+            .then(() => caches.keys()) // 2. Get all cache keys.
+            .then(keys => Promise.all( // 3. Delete all old caches.
+                keys.map(k => k !== CACHE_NAME ? caches.delete(k) : null)
+            ))
+            .then(() => self.clients.claim()) // 4. Take control of all clients.
+    )
+})
+
+self.addEventListener("fetch", event => {
+    const url = new URL(event.request.url)
+    if (url.origin !== self.location.origin) return // Ignore cross-origin requests.
+
+    // Handle POST/PUT requests for saving data within virtual apps
+    if (event.request.method === 'POST' || event.request.method === 'PUT') {
+        if (url.pathname.startsWith("/n/")) {
+            event.respondWith((async () => {
+                try {
+                    const pathParts = url.pathname.split("/").slice(2)
+                    const folderName = decodeURIComponent(pathParts[0])
+                    const filePath = decodeURIComponent(pathParts.slice(1).join("/"))
+
+                    // Get the data from the request body.
+                    const newContent = await event.request.arrayBuffer()
+
+                    // Get the existing folder data from IndexedDB.
+                    const folderData = await getFolderData(folderName)
+
+                    if (folderData && folderData.files) {
+                        // Update the specific file's buffer and type.
+                        folderData.files[filePath] = {
+                            buffer: newContent,
+                            type: event.request.headers.get('content-type') || 'application/octet-stream'
+                        }
+
+                        // Write the entire updated folder object back to the database.
+                        const db = await getDb()
+                        const transaction = db.transaction([SN], "readwrite")
+                        const store = transaction.objectStore(SN)
+                        store.put(folderData)
+                        await promisifyTransaction(transaction)
+
+                        // Invalidate the in-memory cache to ensure the next GET sees the change.
+                        folderCache.delete(folderName)
+
+                        // Send a success response back to the virtual app.
+                        return new Response(JSON.stringify({ success: true, message: `Saved ${filePath}` }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+                    } else {
+                        return new Response(JSON.stringify({ success: false, message: "Folder not found" }), { status: 404, headers: { 'Content-Type': 'application/json' } })
+                    }
+                } catch (err) {
+                    console.error(`Failed to save file to virtual folder:`, err)
+                    return new Response(JSON.stringify({ success: false, message: err.message }), { status: 500, headers: { 'Content-Type': 'application/json' } })
+                }
+            })())
+            // Important: Stop further processing for POST/PUT requests.
+            return
+        }
+    }
+
+    // Handle GET requests for the app shell and virtual files
+    event.respondWith((async () => {
+        // First, handle requests for the application shell (cached).
+        if (APP_SHELL_FILES.includes(url.pathname)) {
+            const cachedResponse = await caches.match(event.request)
+            return cachedResponse || fetch(event.request)
+        }
+
+        // Second, handle requests for virtual files.
+        if (url.pathname.startsWith("/n/")) {
+            const pathParts = url.pathname.split("/").slice(2)
+            const folderName = pathParts[0]
+            const filePath = pathParts.slice(1).join("/")
+            const requestId = url.searchParams.get("reqId")
+
+            // Get the entire request data object (regex and headers) from the store.
+            const requestData = ruleStore.get(requestId) || {}
+            if (requestId) ruleStore.delete(requestId)
+
+            const response = await generateResponseForVirtualFile(folderName, filePath, requestData, event)
+
+            // SPA Fallback: If a navigation request fails, try serving index.html.
+            if (response.status === 404 && event.request.mode === 'navigate') {
+                console.log(`'${filePath}' not found. Attempting SPA fallback to index.html.`)
+                const fallbackResponse = await generateResponseForVirtualFile(folderName, 'index.html', requestData, event)
+                return fallbackResponse.status === 200 ? fallbackResponse : response
+            }
+
+            return response
+        }
+
+        // Third, handle asset requests originating from virtual pages.
+        const referer = event.request.referrer
+        if (referer) {
+            const refererUrl = new URL(referer)
+            if (refererUrl.origin === self.location.origin && refererUrl.pathname.startsWith("/n/")) {
+                const pathParts = refererUrl.pathname.split("/").slice(2)
+                // Asset requests from a page won't have custom rules, so we pass an empty object.
+                return generateResponseForVirtualFile(pathParts[0], url.pathname.substring(1), {}, event)
+            }
+        }
+
+        // For all other requests, fall through to the network.
+        return fetch(event.request)
+    })())
+})
+
+self.addEventListener("message", e => {
+    if (!e.data) return
+
+    // This message type now carries both regex rules and custom header rules.
+    if (e.data.type === "CUSTOMRULES") {
+        ruleStore.set(e.data.requestId, {
+            regex: e.data.rules,   // The regex rules string
+            headers: e.data.headers // The custom headers string
+        })
+        // Set a timeout to clean up the stored rules after 30 seconds.
+        setTimeout(() => ruleStore.delete(e.data.requestId), 30000)
+    }
+    // The rest of the message handlers remain the same.
+    else if (e.data.type === "INVALIDATE_CACHE") {
+        const folderName = e.data.folderName
+        if (folderName) {
+            console.log(`Invalidating cache in ServiceWorker for: ${folderName}`)
+            folderCache.delete(folderName)
+            if (e.source) {
+                e.source.postMessage({ type: 'CACHE_INVALIDATED', folderName: folderName })
+            }
+        }
+    } else if (e.data.type === "DECRYPT_KEY") {
+        decryptionKeyStore.set(e.data.requestId, e.data.key)
+        setTimeout(() => decryptionKeyStore.delete(e.data.requestId), 30000)
+    }
+})
+
+/**
+ * Generates an HTTP response for a requested virtual file. Handles decryption,
+ * custom rules, Range requests, MIME types, ETags, and security headers.
+ * @param {string} folderName The decoded name of the virtual folder.
+ * @param {string} requestedFilePath The decoded path of the requested file.
+ *- * @param {object} requestData An object containing { regex, headers } strings.
+ * @param {FetchEvent} event The original fetch event object.
+ * @returns {Promise<Response>} A promise resolving with the HTTP Response.
+ */
+async function generateResponseForVirtualFile(folderName, requestedFilePath, requestData, event) {
+    const rules = requestData ? requestData.regex : null
+    const customHeadersRules = requestData ? requestData.headers : ""
+    const parsedCustomHeaders = parseCustomHeaders(customHeadersRules) // You need the parseCustomHeaders helper for this
+
+    const decodedFolderName = decodeURIComponent(folderName)
+    let decodedFilePath = decodeURIComponent(requestedFilePath)
+
+    const requestId = new URL(event.request.url).searchParams.get("reqId")
+    const decryptionKey = requestId ? decryptionKeyStore.get(requestId) : null
+    if (decryptionKey) decryptionKeyStore.delete(requestId)
+
+    const folderData = await getFolderData(decodedFolderName)
+    if (!folderData || !folderData.files) {
+        console.warn(`Folder not found: ${decodedFolderName}`)
+        return new Response("Folder not found: " + decodedFolderName, { status: 404 })
+    }
+
+    let filePath = decodedFilePath
+    if (!filePath) {
+        if (folderData.files["index.html"]) filePath = "index.html"
+        else if (folderData.files["index.php"]) filePath = "index.php"
+    }
+
+    let fileData = folderData.files[filePath]
+    let foundPath = filePath
+
+    if (!fileData) {
+        const matchingPath = Object.keys(folderData.files).find(p => p.endsWith(decodedFilePath))
+        if (matchingPath) {
+            fileData = folderData.files[matchingPath]
+            foundPath = matchingPath
+        }
+    }
+
+    if (!fileData) {
+        console.warn(`File not found in folder ${decodedFolderName}: ${decodedFilePath}`)
+        return new Response("File not found: " + decodedFilePath, { status: 404 })
+    }
+
+    let fileBuffer = fileData.buffer
+
+    // Decrypt, apply regex rules
+    if (decryptionKey && foundPath !== ".metadata") {
+        try {
+            const iv = fileBuffer.slice(0, 12)
+            const encryptedData = fileBuffer.slice(12)
+            fileBuffer = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, decryptionKey, encryptedData)
+        } catch (e) {
+            console.error(`Decryption failed for ${foundPath}:`, e)
+            return new Response("Decryption Failed. Bad password?", { status: 401 })
+        }
+    }
+
+    const contentType = getMimeType(foundPath) || fileData.type || "application/octet-stream"
+    const modifiedBuffer = applyRegexRules(foundPath, fileBuffer, contentType, rules)
+    const totalSize = modifiedBuffer.byteLength
+
+    const headers = {
+        'Content-Type': contentType,
+        'Cache-Control': 'public, max-age=0, must-revalidate', // ETag-friendly caching policy
+        'Accept-Ranges': 'bytes',
+        'ETag': await generateETag(modifiedBuffer)
+    }
+
+    // Specific default headers based on file type
+    const extension = foundPath.split('.').pop().toLowerCase()
+    const fontExtensions = ['woff', 'woff2', 'ttf', 'otf', 'eot']
+    if (fontExtensions.includes(extension)) {
+        headers['Access-Control-Allow-Origin'] = '*'
+    }
+
+    // Custom header overrides
+    parsedCustomHeaders.forEach(rule => {
+        if (rule.regex.test(foundPath)) {
+            console.log(`Applying custom header to ${foundPath}: ${rule.header}`)
+            headers[rule.header] = rule.value
+        }
+    })
+
+    const ifNoneMatch = event.request.headers.get('if-none-match')
+    if (ifNoneMatch && ifNoneMatch === headers['ETag']) {
+        console.log(`ETag match for ${foundPath}. Serving 304 Not Modified.`)
+        return new Response(null, { status: 304, headers })
+    }
+
+    const rangeHeader = event.request.headers.get('range')
+    if (rangeHeader) {
+        const rangeMatch = rangeHeader.match(/bytes=(\d+)-(\d*)/)
+        if (rangeMatch) {
+            const start = Number(rangeMatch[1])
+            let end = rangeMatch[2] ? Number(rangeMatch[2]) : totalSize - 1
+
+            if (start < totalSize && start <= end) {
+                end = Math.min(end, totalSize - 1) // Clamp end to file size
+                const chunk = modifiedBuffer.slice(start, end + 1)
+                headers['Content-Length'] = chunk.byteLength
+                headers['Content-Range'] = `bytes ${start}-${end}/${totalSize}`
+
+                return new Response(chunk, { status: 206, statusText: 'Partial Content', headers })
+            }
+        }
+    }
+
+    headers['Content-Length'] = totalSize
+    return new Response(modifiedBuffer, { headers })
+}
+
+/**
+ * Parses a string of custom header rules into a structured array.
+ * @param {string} rulesString The raw string from the textarea.
+ * @returns {Array<object>} An array of rule objects.
+ */
+function parseCustomHeaders(rulesString) {
+    if (!rulesString || !rulesString.trim()) {
+        return []
+    }
+    const rules = []
+    rulesString.trim().split('\n').forEach(line => {
+        line = line.trim()
+        if (line.startsWith('#') || line === '') return
+
+        const parts = line.split('->')
+        if (parts.length < 2) return
+
+        const glob = parts[0].trim()
+        const headerPart = parts.slice(1).join('->').trim()
+
+        const headerMatch = headerPart.match(/^([^:]+):\s*(.*)$/)
+        if (!headerMatch) return
+
+        const [, headerName, headerValue] = headerMatch
+
+        // Convert file glob to a regex for matching.
+        const regex = new RegExp('^' + glob.replace(/\./g, '\\.').replace(/\*/g, '.*').replace(/\?/g, '.') + '$')
+
+        rules.push({
+            regex: regex,
+            header: headerName.trim(),
+            value: headerValue.trim()
+        })
+    })
+    return rules
 }

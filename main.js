@@ -67,7 +67,6 @@ document.getElementById("generateBtn").addEventListener("click", async () => {
 let folderName, dirHandle, observer
 // An array to keep track of file system changes for syncing.
 let changes = []
-let observerProblem = false
 
 async function uploadFolder() {
     const folderNameInput = document.getElementById("folderName")
@@ -111,7 +110,6 @@ async function uploadFolder() {
                     })
                     observer.observe(dirHandle, { recursive: true })
                 } catch (e) {
-                    observerProblem = true
                     if (e.name === "NotSupportedError") {
                         // Older browser/implementation perhaps? Can't observe then.
                         console.error("Cannot observe directories for modifications.")
@@ -479,15 +477,13 @@ function openUrl(folderName, fileName, decryptionRequestId) {
 
 // Button 1: Sync Only
 async function syncFiles() {
-    if (observerProblem) return alert("Observers aren't supported for your browser currently.")
     if (!folderName || !dirHandle) return alert("Upload a folder first.")
     if (changes.length === 0) return alert("No changes to sync.")
 
     setUiBusy(true)
     try {
-        // 1. Do the DB work
         const count = await performSyncToDb()
-        // 2. Tell SW to clear cache and WAIT for confirmation
+        // Tell the SW to clear cache and WAIT for confirmation
         await invalidateCacheAndWait(folderName)
         alert(`Synced ${count} changes.`)
     } catch (e) {
@@ -734,14 +730,14 @@ function invalidateCacheAndWait(folderName) {
         // Keep UI busy to prevent user leaving/closing tab
         setUiBusy(true)
 
-        // 1. Set a timeout so we don't hang forever
+        // Set a timeout so we don't hang forever
         const timeout = setTimeout(() => {
             controller.removeEventListener('message', messageListener)
             setUiBusy(false)
             reject(new Error("Service worker cache invalidation timed out."))
         }, 4000)
 
-        // 2. Define the listener for the reply
+        // Define listener for the reply
         const messageListener = (event) => {
             if (event.data.type === 'CACHE_INVALIDATED' && event.data.folderName === folderName) {
                 clearTimeout(timeout)
@@ -751,7 +747,7 @@ function invalidateCacheAndWait(folderName) {
             }
         }
 
-        // 3. Start listening and send the command
+        // Send command
         navigator.serviceWorker.addEventListener('message', messageListener)
         controller.postMessage({ type: "INVALIDATE_CACHE", folderName: folderName })
     })
@@ -967,7 +963,6 @@ async function processAndStoreFolder(name, files) {
 async function exportData() {
     // This prompt remains as it's a useful feature for any kind of data export.
     const password = prompt("Enter an optional password to encrypt the export. Leave blank for a plaintext export.")
-    console.log("Starting general data export (excluding RuntimeFS data)...")
     setUiBusy(true)
 
     try {
@@ -1272,8 +1267,6 @@ function createAndDisplayDownloadLink(jsonString, parentElement) {
     a.href = url
     a.download = "result.txt" // The default filename for the user.
     a.textContent = "Click here to download export!"
-
-    // Add some basic styling to make it visible and user-friendly.
     a.style.display = "block"
     a.style.marginTop = "10px"
     a.style.padding = "8px"

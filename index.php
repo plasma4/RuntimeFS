@@ -85,8 +85,13 @@ alert("An uncaught error occurred: " + message + "\r\nStack trace: " + error.sta
 return false
 }
 
-window.onunhandledrejection = function (error) {
-alert("An unhandled rejection error occurred: " + error.reason)
+window.onunhandledrejection = function (event) {
+const reason = event.reason
+if (reason && reason.name === "NotSupportedError") {
+console.warn("Caught and ignored a FileSystemObserver NotSupportedError. This is expected in some browsers.")
+return
+}
+alert("An unhandled rejection error occurred: " + reason)
 }
 </script>
 <script src="main.js" defer></script>

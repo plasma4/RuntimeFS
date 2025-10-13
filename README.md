@@ -47,6 +47,7 @@ In this case, you can only access the website if the `cookie` cookie equals `1`.
 You can try to make the code less obvious if you want but ultimately **no system is truly impenetrable** so it depends on how far you want to go.
 
 ### TODO
+- Optimization with IndexedDB storage
 - Basic editing of the local file system
 - Console log and JS execution panel (for some cases where Inspect is disabled)
 - `.zip` export option/ability to export data larger than 2GB

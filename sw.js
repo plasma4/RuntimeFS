@@ -228,7 +228,7 @@ self.addEventListener("install", event => {
         const cache = await caches.open(CACHE_NAME)
         const promises = APP_SHELL_FILES.map(async (url) => {
             try {
-                const response = await fetch(url)
+                const response = await fetch(url, { cache: "no-store" })
                 if (response.ok) {
                     await cache.put(url, response)
                 } else {
@@ -260,7 +260,7 @@ self.addEventListener("fetch", event => {
     if (url.origin !== self.location.origin) return // Ignore cross-origin requests.
 
     // Handle POST/PUT requests for saving data within virtual apps
-    if (event.request.method === 'POST' || event.request.method === 'PUT') {
+    if (event.request.method === "POST" || event.request.method === "PUT") {
         if (url.pathname.startsWith("/n/")) {
             event.respondWith((async () => {
                 try {
@@ -278,7 +278,7 @@ self.addEventListener("fetch", event => {
                         // Update the specific file's buffer and type.
                         folderData.files[filePath] = {
                             buffer: newContent,
-                            type: event.request.headers.get('content-type') || 'application/octet-stream'
+                            type: event.request.headers.get("content-type") || "application/octet-stream"
                         }
 
                         // Write the entire updated folder object back to the database.
@@ -292,13 +292,13 @@ self.addEventListener("fetch", event => {
                         folderCache.delete(folderName)
 
                         // Send a success response back to the virtual app.
-                        return new Response(JSON.stringify({ success: true, message: `Saved ${filePath}` }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+                        return new Response(JSON.stringify({ success: true, message: `Saved ${filePath}` }), { status: 200, headers: { "Content-Type": "application/json" } })
                     } else {
-                        return new Response(JSON.stringify({ success: false, message: "Folder not found" }), { status: 404, headers: { 'Content-Type': 'application/json' } })
+                        return new Response(JSON.stringify({ success: false, message: "Folder not found" }), { status: 404, headers: { "Content-Type": "application/json" } })
                     }
                 } catch (err) {
                     console.error(`Failed to save file to virtual folder:`, err)
-                    return new Response(JSON.stringify({ success: false, message: err.message }), { status: 500, headers: { 'Content-Type': 'application/json' } })
+                    return new Response(JSON.stringify({ success: false, message: err.message }), { status: 500, headers: { "Content-Type": "application/json" } })
                 }
             })())
             // Important: Stop further processing for POST/PUT requests.
@@ -328,9 +328,9 @@ self.addEventListener("fetch", event => {
             const response = await generateResponseForVirtualFile(folderName, filePath, requestData, event)
 
             // SPA Fallback: If a navigation request fails, try serving index.html.
-            if (response.status === 404 && event.request.mode === 'navigate') {
+            if (response.status === 404 && event.request.mode === "navigate") {
                 console.log(`'${filePath}' not found. Attempting SPA fallback to index.html.`)
-                const fallbackResponse = await generateResponseForVirtualFile(folderName, 'index.html', requestData, event)
+                const fallbackResponse = await generateResponseForVirtualFile(folderName, "index.html", requestData, event)
                 return fallbackResponse.status === 200 ? fallbackResponse : response
             }
 
@@ -372,7 +372,7 @@ self.addEventListener("message", e => {
             console.log(`Invalidating cache in ServiceWorker for: ${folderName}`)
             folderCache.delete(folderName)
             if (e.source) {
-                e.source.postMessage({ type: 'CACHE_INVALIDATED', folderName: folderName })
+                e.source.postMessage({ type: "CACHE_INVALIDATED", folderName: folderName })
             }
         }
     } else if (e.data.type === "DECRYPT_KEY") {
@@ -449,17 +449,17 @@ async function generateResponseForVirtualFile(folderName, requestedFilePath, req
     const totalSize = modifiedBuffer.byteLength
 
     const headers = {
-        'Content-Type': contentType,
-        'Cache-Control': 'public, max-age=0, must-revalidate', // ETag-friendly caching policy
-        'Accept-Ranges': 'bytes',
-        'ETag': await generateETag(modifiedBuffer)
+        "Content-Type": contentType,
+        "Cache-Control": "public, max-age=0, must-revalidate", // ETag-friendly caching policy
+        "Accept-Ranges": "bytes",
+        "ETag": await generateETag(modifiedBuffer)
     }
 
     // Specific default headers based on file type
-    const extension = foundPath.split('.').pop().toLowerCase()
-    const fontExtensions = ['woff', 'woff2', 'ttf', 'otf', 'eot']
+    const extension = foundPath.split(".").pop().toLowerCase()
+    const fontExtensions = ["woff", "woff2", "ttf", "otf", "eot"]
     if (fontExtensions.includes(extension)) {
-        headers['Access-Control-Allow-Origin'] = '*'
+        headers["Access-Control-Allow-Origin"] = "*"
     }
 
     // Custom header overrides
@@ -470,13 +470,13 @@ async function generateResponseForVirtualFile(folderName, requestedFilePath, req
         }
     })
 
-    const ifNoneMatch = event.request.headers.get('if-none-match')
-    if (ifNoneMatch && ifNoneMatch === headers['ETag']) {
+    const ifNoneMatch = event.request.headers.get("if-none-match")
+    if (ifNoneMatch && ifNoneMatch === headers["ETag"]) {
         console.log(`ETag match for ${foundPath}. Serving 304 Not Modified.`)
         return new Response(null, { status: 304, headers })
     }
 
-    const rangeHeader = event.request.headers.get('range')
+    const rangeHeader = event.request.headers.get("range")
     if (rangeHeader) {
         const rangeMatch = rangeHeader.match(/bytes=(\d+)-(\d*)/)
         if (rangeMatch) {
@@ -486,15 +486,15 @@ async function generateResponseForVirtualFile(folderName, requestedFilePath, req
             if (start < totalSize && start <= end) {
                 end = Math.min(end, totalSize - 1) // Clamp end to file size
                 const chunk = modifiedBuffer.slice(start, end + 1)
-                headers['Content-Length'] = chunk.byteLength
-                headers['Content-Range'] = `bytes ${start}-${end}/${totalSize}`
+                headers["Content-Length"] = chunk.byteLength
+                headers["Content-Range"] = `bytes ${start}-${end}/${totalSize}`
 
-                return new Response(chunk, { status: 206, statusText: 'Partial Content', headers })
+                return new Response(chunk, { status: 206, statusText: "Partial Content", headers })
             }
         }
     }
 
-    headers['Content-Length'] = totalSize
+    headers["Content-Length"] = totalSize
     return new Response(modifiedBuffer, { headers })
 }
 
@@ -508,15 +508,15 @@ function parseCustomHeaders(rulesString) {
         return []
     }
     const rules = []
-    rulesString.trim().split('\n').forEach(line => {
+    rulesString.trim().split("\n").forEach(line => {
         line = line.trim()
-        if (line.startsWith('#') || line === '') return
+        if (line.startsWith("#") || line === "") return
 
-        const parts = line.split('->')
+        const parts = line.split("->")
         if (parts.length < 2) return
 
         const glob = parts[0].trim()
-        const headerPart = parts.slice(1).join('->').trim()
+        const headerPart = parts.slice(1).join("->").trim()
 
         const headerMatch = headerPart.match(/^([^:]+):\s*(.*)$/)
         if (!headerMatch) return
@@ -524,7 +524,7 @@ function parseCustomHeaders(rulesString) {
         const [, headerName, headerValue] = headerMatch
 
         // Convert file glob to a regex for matching.
-        const regex = new RegExp('^' + glob.replace(/\./g, '\\.').replace(/\*/g, '.*').replace(/\?/g, '.') + '$')
+        const regex = new RegExp("^" + glob.replace(/\./g, "\\.").replace(/\*/g, ".*").replace(/\?/g, ".") + "$")
 
         rules.push({
             regex: regex,

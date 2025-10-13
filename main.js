@@ -96,7 +96,7 @@ async function uploadFolder() {
             files = await decryptAndLoadFolder(localDirHandle, manifestHandle)
         } catch (e) {
             // If not found, treat as a plaintext folder
-            if (e.name === 'NotFoundError') {
+            if (e.name === "NotFoundError") {
                 files = await getFilesRecursively(localDirHandle)
                 if (observer) {
                     observer.disconnect()
@@ -531,7 +531,7 @@ async function performSyncToDb() {
             case "modified": {
                 const path = change.relativePathComponents.join("/")
                 const fileHandle = await getHandleFromPath(dirHandle, path)
-                if (fileHandle && fileHandle.kind === 'file') {
+                if (fileHandle && fileHandle.kind === "file") {
                     const file = await fileHandle.getFile()
                     updates.push({ type: "update", path: path, data: { buffer: await file.arrayBuffer(), type: getMimeType(path) || file.type } })
                 }
@@ -545,10 +545,10 @@ async function performSyncToDb() {
             case "moved": {
                 const oldPath = change.relativePathMovedFrom.join("/")
                 const newPath = change.relativePathComponents.join("/")
-                // A 'move' is treated as deleting the old file and creating/updating the new one.
+                // A "move" is treated as deleting the old file and creating/updating the new one.
                 updates.push({ type: "delete", path: oldPath })
                 const fileHandle = await getHandleFromPath(dirHandle, newPath)
-                if (fileHandle && fileHandle.kind === 'file') {
+                if (fileHandle && fileHandle.kind === "file") {
                     const file = await fileHandle.getFile()
                     updates.push({ type: "update", path: newPath, data: { buffer: await file.arrayBuffer(), type: getMimeType(newPath) || file.type } })
                 }
@@ -732,23 +732,23 @@ function invalidateCacheAndWait(folderName) {
 
         // Set a timeout so we don't hang forever
         const timeout = setTimeout(() => {
-            controller.removeEventListener('message', messageListener)
+            controller.removeEventListener("message", messageListener)
             setUiBusy(false)
             reject(new Error("Service worker cache invalidation timed out."))
         }, 4000)
 
         // Define listener for the reply
         const messageListener = (event) => {
-            if (event.data.type === 'CACHE_INVALIDATED' && event.data.folderName === folderName) {
+            if (event.data.type === "CACHE_INVALIDATED" && event.data.folderName === folderName) {
                 clearTimeout(timeout)
-                controller.removeEventListener('message', messageListener)
+                controller.removeEventListener("message", messageListener)
                 console.log("Confimation received: Cache invalidated.")
                 resolve()
             }
         }
 
         // Send command
-        navigator.serviceWorker.addEventListener('message', messageListener)
+        navigator.serviceWorker.addEventListener("message", messageListener)
         controller.postMessage({ type: "INVALIDATE_CACHE", folderName: folderName })
     })
 }
@@ -864,7 +864,7 @@ function bufferToBase64Safe(buffer) {
  * This prevents us from accidentally trying to decode a legitimate string that just
  * happens to be valid Base64.
  */
-const BASE64_MARKER = '__IS_BASE64__'
+const BASE64_MARKER = "__IS_BASE64__"
 
 /**
  * Recursively scans an object or array and converts any ArrayBuffer instances
@@ -883,7 +883,7 @@ function convertArrayBuffersToBase64(data) {
     if (Array.isArray(data)) {
         return data.map(item => convertArrayBuffersToBase64(item))
     }
-    if (typeof data === 'object') {
+    if (typeof data === "object") {
         const newObj = {}
         for (const key in data) {
             newObj[key] = convertArrayBuffersToBase64(data[key])
@@ -907,9 +907,9 @@ function convertBase64ToArrayBuffers(data) {
         return data.map(item => convertBase64ToArrayBuffers(item))
     }
     // IMPORTANT: Check for null because typeof null is 'object'
-    if (typeof data === 'object' && data !== null) {
+    if (typeof data === "object" && data !== null) {
         // Check if this object is our special marker. This is the base case for the recursion.
-        if (data[BASE64_MARKER] === true && typeof data.data === 'string') {
+        if (data[BASE64_MARKER] === true && typeof data.data === "string") {
             return base64ToBuffer(data.data)
         }
 
@@ -1256,7 +1256,7 @@ function createAndDisplayDownloadLink(jsonString, parentElement) {
     // Create a Data URI, which embeds the file content directly in the URL.
     var url
     if (jsonString.length > 1e7 && !confirm("JSON string size is large. Export as data: anyway?")) {
-        const blob = new Blob([jsonString], { type: 'text/plain;charset=utf-8' })
+        const blob = new Blob([jsonString], { type: "text/plain;charset=utf-8" })
         url = URL.createObjectURL(blob)
     } else {
         url = `data:text/plain;charset=utf-8,${encodeURIComponent(jsonString)}`
@@ -1518,7 +1518,7 @@ async function getFilesFromDroppedItems(dataTransferItemList) {
     return files
 }
 
-document.body.addEventListener('drop', async e => {
+document.body.addEventListener("drop", async e => {
     e.preventDefault()
     document.body.style.backgroundColor = ""
     setUiBusy(true)

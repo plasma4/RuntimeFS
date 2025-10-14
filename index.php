@@ -94,6 +94,7 @@ return
 alert("An unhandled rejection error occurred: " + reason)
 }
 </script>
+<script src="cbor-x.js" defer></script>
 <script src="main.js" defer></script>
 <h1>RuntimeFS</h1>
 
@@ -151,9 +152,10 @@ alert("An unhandled rejection error occurred: " + reason)
 <button onclick="importData()">Import Data...</button>
 <hr>
 <button onclick="exportData()">Export Data...</button><br>
-<input type="checkbox" id="c1" name="cookies"><label for="c1">Cookies</label><br>
-<input type="checkbox" id="c2" name="localStorage" checked><label for="c2">localStorage</label><br>
-<input type="checkbox" id="c3" name="indexedDB" checked><label for="c3">IndexedDB</label><br>
+<input type="checkbox" id="c1"><label for="c1">Cookies</label><br>
+<input type="checkbox" id="c2" checked><label for="c2">localStorage</label><br>
+<input type="checkbox" id="c3" checked><label for="c3">IndexedDB</label><br>
+<input type="checkbox" id="c4" checked><label for="c4">RuntimeFS</label><br>
 </div>
 </div>
 </fieldset>

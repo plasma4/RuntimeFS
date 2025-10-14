@@ -4,7 +4,7 @@ View the [working demo](https://runtimefs.netlify.app)!
 RuntimeFS is an IndexedDB and ServiceWorker file-system, served in your browser with offline functionality. Imagine a localhost, in your browser, with no traces of network activity of files hosted and no server-based storage of files. It offers performant zero-knowledge, end-to-end encryption, ensuring only you can access your data and can easily run online GitHub projects. It's perfect for sensitive files or full-on HTML projects or games.
 
 After initial page load, RuntimeFS no longer needs internet connection to function. You can host this project with a hosting site, and can even use `.php` or custom HTTP headers if you want (for example, getting `SharedArrayBuffer`). In order to update, you may need to hard reload on the main page. (Caching may also be inconsistent at times as browsers are really picky sadly.)
-**This tool is Chromium-browser only for now, as it uses the File System API. If this tool gets popular I might add alternative support for other browsers like Firefox! :)**
+**This tool is Chromium-focused for now, as it uses the File System API, but has a fallback for other browsers. Opening the tool in Incognito might fail due to memory limitations (with a `QuotaExceededError`).**
 
 If you are hosting this, it is suggested that you minify the JavaScript files first with a tool like https://jscompress.com/.
 
@@ -15,7 +15,11 @@ This tool is meant to be a of a best of most worlds. If you were to try to open 
 The Upload Folder button will automatically detect `manifest.enc` to determine the type of encryption used (if any), and requires a folder name to add. Then, you can access pages from that folder by inputting the folder name and clicking on the Open button in the Opening and Decrypting section. If you updated something within a folder and want to reopen the tab you can press the Sync/Sync and Open buttons; you can export locally stored data with an optional password too.
 
 ## How do I encrypt files properly? The UI is confusing.
-While the files stored in IndexedDB are **not** encrypted in your device, you can encrypt folders while in transit with key generation, which uses AES and RSA to store the key locally. If you are trying to get files from device A to RuntimeFS on device B then you can "Generate Key and Copy Public" on device B, send the public key to device A, then "Use Public Key" on device A to encrypt the information. Then, send the encrypted folder to device B (perhaps by zipping it), and use Encrypted Upload and select the encrypted folder. With this technique, the unencrypted files can only be accessed from device B by JavaScript, which is quite useful!
+While the files stored in IndexedDB are **not** encrypted in your device, you can encrypt folders while in transit with key generation, which uses AES and RSA to store the key locally.
+
+**SIMPLE:** Upload folders to device A, then use Export Data... and encrypt with a password. Then send that file over and decrypt it on device B.
+
+**ADVANCED:** If you are trying to get files from device A to RuntimeFS on device B, then you can "Generate Key and Copy Public" on device B, send the public key to device A, then "Use Public Key" on device A to encrypt the information. (On device B, a private key will be stored locally, and you can get rid of it by regenerating a new key.) Then, send the encrypted folder to device B (perhaps by zipping it), and use Encrypted Upload and select the encrypted folder. With this technique, the unencrypted files can only be accessed from device B by JavaScript, which is quite useful!
 
 A simpler method is to simply use a password (although potentially less secure). You can only use a password for local data currently.
 
@@ -44,7 +48,9 @@ RewriteRule .* https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
 In this case, you can only access the website if the `cookie` cookie equals `1`. Then, you can use the `index.php` file, or modify it as needed.
 (Note: it might be fairly obvious what the JS code does initially to anyone that sees the source code. Additionally, browsers have different limits for how long cookies stay before expiring, so deleting the JS after your initial access could be a bad idea, depending on your situation.) For the `index.php` example you must type `mysecret` into the website when it is focused, with no incorrect key strokes or special keys.
 
-You can try to make the code less obvious if you want but ultimately **no system is truly impenetrable** so it depends on how far you want to go.
+You can try to make the code less obvious if you want but ultimately **no system is truly impenetrable** so it depends on how far you are willing to go!
+
+You may also want to replace export with a `data:` URI or add a prompt to do that; this is a precautionary measure because a browser's download history stores where you downloaded a file from, which may be bypassed with a data URI. However, exporting with a data URI reveals the contents within the file to the download history instead, which might not be desirable, and is much, much slower.
 
 ### TODO
 - Optimization with IndexedDB storage

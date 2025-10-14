@@ -1,8 +1,9 @@
 // Constants for IndexedDB database names and version.
 const DBN = "FileCacheDB"
-const SN = "Folders"
+const FOLDERS_SN = "Folders"
+const FILES_SN = "Files" // New object store for individual files
 const META_SN = "Metadata"
-const DB_VERSION = 1
+const DB_VERSION = 2 // Bump the version to trigger the schema upgrade
 
 // Helper function to wrap IndexedDB requests in a Promise
 function promisifyRequest(request) {
@@ -35,26 +36,45 @@ navigator.storage.persist().then(persistent => {
     }
 })
 
-// A promise that resolves with the IndexedDB database connection.
-const dbPromise = new Promise((resolve, reject) => {
-    const request = indexedDB.open(DBN, DB_VERSION)
-    // This event is triggered if the database version is new or the database doesn't exist.
-    request.onupgradeneeded = function (event) {
-        const db = event.target.result
-        // Create the necessary object stores if they don't already exist.
-        if (!db.objectStoreNames.contains(SN)) {
-            db.createObjectStore(SN, { keyPath: "id" })
-        }
-        if (!db.objectStoreNames.contains(META_SN)) {
-            db.createObjectStore(META_SN, { keyPath: "id" })
-        }
+let dbPromise = null
+function getDb() {
+    if (!dbPromise) {
+        // console.log("SW: No DB connection promise, creating a new one.")
+        dbPromise = new Promise((resolve, reject) => {
+            const request = indexedDB.open(DBN, DB_VERSION)
+            request.onupgradeneeded = e => {
+                const dbInstance = e.target.result
+                if (!dbInstance.objectStoreNames.contains(FOLDERS_SN)) {
+                    dbInstance.createObjectStore(FOLDERS_SN, { keyPath: "id" })
+                }
+                if (!dbInstance.objectStoreNames.contains(FILES_SN)) {
+                    const fileStore = dbInstance.createObjectStore(FILES_SN, { autoIncrement: true })
+                    fileStore.createIndex("folder", ["folderName", "path"], { unique: true })
+                }
+                if (!dbInstance.objectStoreNames.contains(META_SN)) {
+                    dbInstance.createObjectStore(META_SN, { keyPath: "id" })
+                }
+            }
+            request.onsuccess = e => {
+                db = e.target.result // Assign to the global 'db' variable
+                db.onversionchange = () => {
+                    console.warn("SW: Database version change detected, closing connection.")
+                    if (db) {
+                        db.close()
+                    }
+                    db = null
+                    dbPromise = null
+                }
+                resolve(db)
+            }
+            request.onerror = e => reject(e.target.errorCode)
+        })
     }
-    request.onsuccess = (event) => resolve(event.target.result)
-    request.onerror = (event) => reject(event.target.errorCode)
-})
+    return dbPromise
+}
 
-// Once the database is ready, populate the list of existing folders.
-dbPromise.then(() => listFolders())
+// Immediately initialize the DB on load
+getDb().then(() => listFolders())
 
 // Add a click listener to the "Generate New Key Pair" button.
 document.getElementById("generateBtn").addEventListener("click", async () => {
@@ -80,10 +100,11 @@ async function uploadFolder() {
     setUiBusy(true)
     try {
         if (!window.showDirectoryPicker) {
-            folderUploadFallbackInput.click()
+            document.getElementById("folderUploadFallbackInput").click()
             resetUI = false
             return
         }
+
         const localDirHandle = await window.showDirectoryPicker({ mode: "read" })
         dirHandle = localDirHandle
         folderName = name
@@ -115,7 +136,6 @@ async function uploadFolder() {
                         console.error("Cannot observe directories for modifications.")
                         console.warn(e)
                     } else {
-                        // Re-throw any other unexpected errors.
                         throw e
                     }
                 }
@@ -125,15 +145,8 @@ async function uploadFolder() {
                 throw e
             }
         }
-
-        const db = await dbPromise
-        const transaction = db.transaction([SN], "readwrite")
-        const folderStore = transaction.objectStore(SN)
-        const folderObject = { id: name, files: files }
-        folderStore.delete(name)
-        folderStore.put(folderObject)
-
-        await promisifyTransaction(transaction)
+        // New function to handle the updated database schema
+        await processAndStoreFolder(name, files)
 
         if (navigator.serviceWorker.controller) {
             navigator.serviceWorker.controller.postMessage({ type: "INVALIDATE_CACHE", folderName: name })
@@ -404,8 +417,8 @@ async function openFile(overrideFolderName) {
         return
     }
 
-    const db = await dbPromise
-    const folderData = await db.transaction(SN).objectStore(SN).get(folderName)
+    const db = await getDb()
+    const folderData = await db.transaction(FOLDERS_SN).objectStore(FOLDERS_SN).get(folderName)
 
     if (!folderData) {
         alert(`Folder "${folderName}" not found.`)
@@ -521,103 +534,84 @@ async function performSyncToDb() {
     }
 
     console.log(`Processing ${changes.length} changes for "${folderName}"...`)
+    const db = await getDb()
+    const transaction = db.transaction([FILES_SN], "readwrite")
+    const fileStore = transaction.objectStore(FILES_SN)
+    const folderIndex = fileStore.index("folder")
+    let updateCount = 0
 
-    // Convert array into a structured list of updates
-    const updates = []
     for (const change of changes) {
-        const type = change.type
-        switch (type) {
+        const path = change.relativePathComponents.join("/")
+        switch (change.type) {
             case "created":
             case "modified": {
-                const path = change.relativePathComponents.join("/")
                 const fileHandle = await getHandleFromPath(dirHandle, path)
-                if (fileHandle && fileHandle.kind === "file") {
+                if (fileHandle?.kind === "file") {
                     const file = await fileHandle.getFile()
-                    updates.push({ type: "update", path: path, data: { buffer: await file.arrayBuffer(), type: getMimeType(path) || file.type } })
+                    const fileContent = {
+                        buffer: await file.arrayBuffer(),
+                        type: getMimeType(path) || file.type
+                    }
+                    const existing = await promisifyRequest(folderIndex.get([folderName, path]))
+                    if (existing) {
+                        fileStore.put({ ...existing, content: fileContent })
+                    } else {
+                        fileStore.put({ folderName, path, content: fileContent })
+                    }
+                    updateCount++
                 }
                 break
             }
             case "deleted": {
-                const path = change.relativePathComponents.join("/")
-                updates.push({ type: "delete", path: path })
+                const key = await promisifyRequest(folderIndex.getKey([folderName, path]))
+                if (key) {
+                    fileStore.delete(key)
+                    updateCount++
+                }
                 break
             }
             case "moved": {
                 const oldPath = change.relativePathMovedFrom.join("/")
                 const newPath = change.relativePathComponents.join("/")
-                // A "move" is treated as deleting the old file and creating/updating the new one.
-                updates.push({ type: "delete", path: oldPath })
-                const fileHandle = await getHandleFromPath(dirHandle, newPath)
-                if (fileHandle && fileHandle.kind === "file") {
-                    const file = await fileHandle.getFile()
-                    updates.push({ type: "update", path: newPath, data: { buffer: await file.arrayBuffer(), type: getMimeType(newPath) || file.type } })
+
+                const oldKey = await promisifyRequest(folderIndex.getKey([folderName, oldPath]))
+                if (oldKey) {
+                    fileStore.delete(oldKey)
                 }
+                const fileHandle = await getHandleFromPath(dirHandle, newPath)
+                if (fileHandle?.kind === "file") {
+                    const file = await fileHandle.getFile()
+                    const content = { buffer: await file.arrayBuffer(), type: getMimeType(newPath) || file.type }
+                    fileStore.put({ folderName, path: newPath, content })
+                }
+                updateCount++
                 break
             }
         }
     }
-    // Clear the global changes array now that they've been processed.
+
     changes.length = 0
-
-    const db = await dbPromise
-    const transaction = db.transaction([SN], "readwrite")
-    const folderStore = transaction.objectStore(SN)
-    const folderData = await promisifyRequest(folderStore.get(folderName))
-
-    if (!folderData) {
-        throw new Error(`Cannot sync: Folder "${folderName}" not found in DB.`)
-    }
-
-    // Update memory and write folder to DB
-    for (const update of updates) {
-        if (update.type === "update") {
-            folderData.files[update.path] = update.data
-        } else if (update.type === "delete") {
-            delete folderData.files[update.path]
-        }
-    }
-
-    folderStore.put(folderData)
     await promisifyTransaction(transaction)
     console.log("DB Update complete.")
-    return updates.length
+    return updateCount
 }
 
 // Fetches all folder names from IndexedDB and displays them in the UI.
 async function listFolders() {
     try {
-        const db = await dbPromise
-        const transaction = db.transaction(SN, "readonly")
-        const store = transaction.objectStore(SN)
-
-        // Use a cursor to iterate over records efficiently.
-        // This avoids loading the massive 'files' object for each folder into memory.
-        const folderInfo = await new Promise((resolve, reject) => {
-            const results = []
-            const cursorRequest = store.openCursor()
-
-            cursorRequest.onerror = (event) => reject(event.target.error)
-
-            cursorRequest.onsuccess = (event) => {
-                const cursor = event.target.result
-                if (cursor) {
-                    const { id, encryptionType } = cursor.value
-                    results.push({ id, encryptionType })
-                    cursor.continue() // Move to the next record.
-                } else {
-                    resolve(results)
-                }
-            }
-        })
+        const db = await getDb()
+        const transaction = db.transaction(FOLDERS_SN, "readonly")
+        const store = transaction.objectStore(FOLDERS_SN)
+        const allFolders = await promisifyRequest(store.getAll())
 
         const folderList = document.getElementById("folderList")
         folderList.innerHTML = "" // Clear the current list.
 
         // Sort the results alphabetically by ID.
-        folderInfo.sort((a, b) => a.id.localeCompare(b.id))
+        allFolders.sort((a, b) => a.id.localeCompare(b.id))
 
         // Render the list to the DOM.
-        folderInfo.forEach(folder => {
+        allFolders.forEach(folder => {
             const li = document.createElement("li")
             // Add a visual indicator for encrypted folders.
             li.textContent = folder.encryptionType === "pdf" ? `[Locked] ${folder.id}` : folder.id
@@ -642,11 +636,34 @@ async function deleteFolder() {
     if (!confirm(`Are you sure you want to remove the folder "${folderName}"?`)) return
     setUiBusy(true)
     try {
-        const db = await dbPromise
-        const transaction = db.transaction([SN, META_SN], "readwrite")
-        const folderStore = transaction.objectStore(SN)
+        const db = await getDb()
+        const transaction = db.transaction([FOLDERS_SN, FILES_SN], "readwrite")
+        const folderStore = transaction.objectStore(FOLDERS_SN)
+        const fileStore = transaction.objectStore(FILES_SN)
+        const fileIndex = fileStore.index("folder")
+
+        // Delete the folder metadata entry and files
         await promisifyRequest(folderStore.delete(folderName))
-        console.log(`Folder "${folderName}" deleted successfully.`)
+
+        const keyRange = IDBKeyRange.bound([folderName, ""], [folderName, "\uffff"])
+        let cursorReq = fileIndex.openCursor(keyRange)
+
+        await new Promise((resolve, reject) => {
+            cursorReq.onsuccess = () => {
+                const cursor = cursorReq.result
+                if (cursor) {
+                    cursor.delete()
+                    cursor.continue()
+                } else {
+                    resolve()
+                }
+            }
+            cursorReq.onerror = () => reject(cursorReq.error)
+        })
+
+        await promisifyTransaction(transaction)
+
+        console.log(`Folder "${folderName}" and its files deleted successfully.`)
         document.getElementById("deleteFolderName").value = ""
         // Refresh the folder list in the UI.
         await listFolders()
@@ -656,6 +673,7 @@ async function deleteFolder() {
         setUiBusy(false)
     }
 }
+
 
 // Generates an RSA key pair for public key encryption.
 async function generateAndStoreKeyPair() {
@@ -670,7 +688,7 @@ async function generateAndStoreKeyPair() {
 // Copies the public key to the clipboard in Base64 format.
 async function c(publicKey) {
     const exported = await window.crypto.subtle.exportKey("spki", publicKey)
-    const base64PublicKey = btoa(String.fromCharCode(...new Uint8Array(exported)))
+    const base64PublicKey = bufferToBase64Safe(exported)
     navigator.clipboard.writeText(base64PublicKey)
 }
 
@@ -711,6 +729,7 @@ async function decryptBufferWithPrivateKey(privateKey, encryptedBuffer) {
     const encryptedFileBuffer = encryptedBuffer.slice(256 + 12)
     // 2. Decrypt the AES key with the private RSA key.
     const decryptedAesKeyBuffer = await window.crypto.subtle.decrypt({ name: "RSA-OAEP" }, privateKey, encryptedAesKey)
+
     // 3. Import the decrypted AES key.
     const aesKey = await window.crypto.subtle.importKey("raw", decryptedAesKeyBuffer, { name: "AES-GCM" }, true, ["decrypt"])
     // 4. Decrypt the file data with the AES key.
@@ -738,8 +757,8 @@ function invalidateCacheAndWait(folderName) {
         }, 4000)
 
         // Define listener for the reply
-        const messageListener = (event) => {
-            if (event.data.type === "CACHE_INVALIDATED" && event.data.folderName === folderName) {
+        const messageListener = e => {
+            if (e.data.type === "CACHE_INVALIDATED" && e.data.folderName === folderName) {
                 clearTimeout(timeout)
                 controller.removeEventListener("message", messageListener)
                 console.log("Confimation received: Cache invalidated.")
@@ -753,7 +772,11 @@ function invalidateCacheAndWait(folderName) {
     })
 }
 
-// A utility function to determine a file's MIME type based on its extension.
+/**
+ * Determines the MIME type of a file based on its extension.
+ * @param {string} filePath The path to the file.
+ * @returns {string | undefined} The MIME type or undefined if not found.
+ */
 function getMimeType(filePath) {
     const ext = filePath.split(".").pop().toLowerCase()
     const mimeTypes = {
@@ -859,75 +882,8 @@ function bufferToBase64Safe(buffer) {
     return btoa(binary)
 }
 
-/**
- * A special marker object we'll use to identify Base64 strings during import.
- * This prevents us from accidentally trying to decode a legitimate string that just
- * happens to be valid Base64.
- */
-const BASE64_MARKER = "__IS_BASE64__"
-
-/**
- * Recursively scans an object or array and converts any ArrayBuffer instances
- * into a special Base64 marker object for safe JSON serialization.
- * @param {*} data The data (object, array, etc.) to scan.
- * @returns {*} A deep copy of the data with ArrayBuffers converted.
- */
-function convertArrayBuffersToBase64(data) {
-    if (!data) return data
-    if (data instanceof ArrayBuffer) {
-        return {
-            [BASE64_MARKER]: true,
-            data: bufferToBase64Safe(data)
-        }
-    }
-    if (Array.isArray(data)) {
-        return data.map(item => convertArrayBuffersToBase64(item))
-    }
-    if (typeof data === "object") {
-        const newObj = {}
-        for (const key in data) {
-            newObj[key] = convertArrayBuffersToBase64(data[key])
-        }
-        return newObj
-    }
-    return data
-}
-
-/**
- * Recursively scans an object or array and converts any special Base64
- * marker objects back into ArrayBuffer instances.
- * @param {*} data The data to scan.
- * @returns {*} A deep copy of the data with Base64 converted back to ArrayBuffers.
- */
-function convertBase64ToArrayBuffers(data) {
-    if (!data) {
-        return data
-    }
-    if (Array.isArray(data)) {
-        return data.map(item => convertBase64ToArrayBuffers(item))
-    }
-    // IMPORTANT: Check for null because typeof null is 'object'
-    if (typeof data === "object" && data !== null) {
-        // Check if this object is our special marker. This is the base case for the recursion.
-        if (data[BASE64_MARKER] === true && typeof data.data === "string") {
-            return base64ToBuffer(data.data)
-        }
-
-        // If it's a regular object, recurse into its properties.
-        const newObj = {}
-        for (const key in data) {
-            // Check for own properties to be safe
-            if (Object.prototype.hasOwnProperty.call(data, key)) {
-                newObj[key] = convertBase64ToArrayBuffers(data[key])
-            }
-        }
-        return newObj
-    }
-    // Return primitives (string, number, etc.) as-is.
-    return data
-}
-
-async function processAndStoreFolder(name, files) {
+// This logic is now greatly simplified by the new DB schema
+async function processAndStoreFolder(name, files, encryptionType = null) {
     if (!name) {
         alert("Please enter a name for the folder.")
         setUiBusy(false)
@@ -936,13 +892,49 @@ async function processAndStoreFolder(name, files) {
 
     console.log(`Processing ${Object.keys(files).length} files for folder "${name}"...`)
 
-    const db = await dbPromise
-    const transaction = db.transaction([SN], "readwrite")
-    const folderStore = transaction.objectStore(SN)
-    const folderObject = { id: name, files: files }
+    const db = await getDb()
+    // Use a single transaction for efficiency
+    const transaction = db.transaction([FOLDERS_SN, FILES_SN], "readwrite")
+    const folderStore = transaction.objectStore(FOLDERS_SN)
+    const fileStore = transaction.objectStore(FILES_SN)
+    const fileIndex = fileStore.index("folder")
 
-    // Use put() instead of delete/put for simplicity. It works for both create and update.
-    folderStore.put(folderObject)
+    // Clear any existing files for this folder first
+    let cursorReq = fileIndex.openCursor(IDBKeyRange.only([name]))
+    await new Promise((resolve, reject) => {
+        cursorReq.onsuccess = () => {
+            const cursor = cursorReq.result
+            if (cursor) {
+                cursor.delete()
+                cursor.continue()
+            } else {
+                resolve()
+            }
+        }
+        cursorReq.onerror = () => reject(cursorReq.error)
+    })
+
+    // Add the folder metadata
+    const folderObject = { id: name, lastModified: new Date() }
+    if (encryptionType) {
+        folderObject.encryptionType = encryptionType
+    }
+    await promisifyRequest(folderStore.put(folderObject))
+
+    // Add each file individually
+    for (const path in files) {
+        const fileData = files[path]
+        const fileRecord = {
+            folderName: name,
+            path: path,
+            content: {
+                buffer: fileData.buffer,
+                type: fileData.type
+            }
+        }
+        await promisifyRequest(fileStore.put(fileRecord))
+    }
+
     await promisifyTransaction(transaction)
 
     // Invalidate the Service Worker cache.
@@ -961,15 +953,18 @@ async function processAndStoreFolder(name, files) {
  * encrypts it, and presents a download link to the user.
  */
 async function exportData() {
-    // This prompt remains as it's a useful feature for any kind of data export.
-    const password = prompt("Enter an optional password to encrypt the export. Leave blank for a plaintext export.")
+    const password = prompt("Enter an optional password to encrypt the export; leave blank for a plaintext export:")
+    const skipRuntimeFS = !document.getElementById("c4").checked
     setUiBusy(true)
 
     try {
-        const dataToExport = {}
+        const dataToExport = {
+            localStorage: {},
+            indexedDB: {},
+            cookies: ""
+        }
 
         if (document.getElementById("c2").checked) {
-            dataToExport.localStorage = {}
             for (let i = 0; i < localStorage.length; i++) {
                 const key = localStorage.key(i)
                 if (key !== "pk") {
@@ -978,294 +973,321 @@ async function exportData() {
             }
         }
 
-        if (document.getElementById("c3").checked) {
-            dataToExport.indexedDB = {}
-            const allDbs = await indexedDB.databases()
+        if (document.getElementById("c1").checked) {
+            dataToExport.cookies = document.cookie
+        }
 
+        if (document.getElementById("c3").checked) {
+            const allDbs = await indexedDB.databases()
             for (const dbInfo of allDbs) {
                 const dbName = dbInfo.name
-
-                // if (dbName === DBN) {
-                //     console.log(`Skipping RuntimeFS database: '${dbName}'`)
-                //     continue
-                // }
+                if (skipRuntimeFS && dbName === DBN) continue
 
                 try {
-                    // console.log(`Attempting to export from database: '${dbName}'`)
                     const db = await new Promise((resolve, reject) => {
                         const request = indexedDB.open(dbName)
                         request.onsuccess = () => resolve(request.result)
-                        request.onerror = (e) => reject(`Could not open database: ${dbName}. Error: ${e.target.error}`)
+                        request.onerror = e => reject(new Error(`Could not open db: ${dbName}`))
                     })
 
-                    if (!db || !db.objectStoreNames || db.objectStoreNames.length === 0) {
-                        console.warn(`'${dbName}' is empty or its object stores could not be read. Skipping.`)
-                        db.close()
-                        continue
-                    }
+                    const transaction = db.transaction(db.objectStoreNames, "readonly")
+                    const dbExport = { version: db.version, stores: {} }
 
-                    dataToExport.indexedDB[dbName] = {
-                        version: db.version,
-                        schema: {},
-                        data: {}
-                    }
-
-                    dataToExport.indexedDB[dbName] = {}
-                    const storeNames = Array.from(db.objectStoreNames)
-                    if (storeNames.length === 0) {
-                        console.warn(`'${dbName}' is empty. Skipping.`)
-                        db.close()
-                        continue // Go to the next database
-                    }
-
-                    dataToExport.indexedDB[dbName] = {
-                        version: db.version,
-                        schema: {},
-                        data: {}
-                    }
-
-                    const transaction = db.transaction(storeNames, "readonly")
-
-                    for (const storeName of storeNames) {
+                    for (const storeName of db.objectStoreNames) {
                         const store = transaction.objectStore(storeName)
-                        dataToExport.indexedDB[dbName].schema[storeName] = {
-                            keyPath: store.keyPath,
-                            autoIncrement: store.autoIncrement
-                        }
+                        const indexes = Array.from(store.indexNames).map(name => {
+                            const index = store.index(name)
+                            return { name: index.name, keyPath: index.keyPath, unique: index.unique, multiEntry: index.multiEntry }
+                        })
+
+                        // --- PERFORMANCE FIX: Use a cursor to avoid loading everything into memory ---
                         const records = await new Promise((resolve, reject) => {
-                            const transaction = db.transaction([storeName], "readonly")
-                            const store = transaction.objectStore(storeName)
+                            const cursorReq = store.openCursor()
                             const allRecords = []
-
-                            const cursorRequest = store.openCursor()
-                            cursorRequest.onerror = (event) => reject(event.target.error)
-
-                            cursorRequest.onsuccess = (event) => {
-                                const cursor = event.target.result
+                            cursorReq.onerror = e => reject(e.target.error)
+                            cursorReq.onsuccess = e => {
+                                const cursor = e.target.result
                                 if (cursor) {
-                                    // For every record, save both its key and its value
-                                    allRecords.push({
-                                        key: cursor.key,
-                                        value: cursor.value
-                                    })
+                                    allRecords.push({ key: cursor.key, value: cursor.value })
                                     cursor.continue()
                                 } else {
-                                    // End of records
                                     resolve(allRecords)
                                 }
                             }
                         })
-                        dataToExport.indexedDB[dbName].data[storeName] = convertArrayBuffersToBase64(records)
+                        // --- END FIX ---
+
+                        dbExport.stores[storeName] = {
+                            schema: { keyPath: store.keyPath, autoIncrement: store.autoIncrement, indexes },
+                            data: records
+                        }
                     }
+                    dataToExport.indexedDB[dbName] = dbExport
                     db.close()
-                    console.log(`Exported '${dbName}'.`)
                 } catch (error) {
                     console.warn(`Could not export database '${dbName}'. Skipping.`, error)
                 }
             }
         }
 
-        if (document.getElementById("c1").checked) {
-            dataToExport.cookies = document.cookie
-        }
+        // console.log(dataToExport)
+        const encoded = CBOR.encode(dataToExport)
+        let finalBuffer = password ? CBOR.encode(await encryptPayload(encoded, password)) : encoded
 
-        let finalObjectToExport
-        if (password) {
-            const salt = crypto.getRandomValues(new Uint8Array(16))
-            const iv = crypto.getRandomValues(new Uint8Array(12))
-            const key = await deriveKeyFromPassword(password, salt)
-            const dataString = JSON.stringify(dataToExport)
-            const dataBuffer = new TextEncoder().encode(dataString)
-            const encryptedBuffer = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, key, dataBuffer)
-
-            finalObjectToExport = {
-                type: "FS-EE",
-                s: bufferToBase64Safe(salt.buffer),
-                iv: bufferToBase64Safe(iv.buffer),
-                p: bufferToBase64Safe(encryptedBuffer)
-            }
-        } else {
-            finalObjectToExport = {
-                type: "FS-PE",
-                p: dataToExport
-            }
-        }
-
-        const jsonString = JSON.stringify(finalObjectToExport)
-        const importExportContainer = document.getElementById("c3").parentElement
-        createAndDisplayDownloadLink(jsonString, importExportContainer)
-
-        console.log("General data export prepared. Awaiting user download.")
+        createAndDisplayDownloadLink(finalBuffer, document.getElementById("c3").parentElement, "result.cbor")
+        console.log("Data export prepared.")
 
     } catch (error) {
-        console.error("General export failed:", error)
+        console.error("Export failed:", error)
         alert("An error occurred during export: " + error.message)
     } finally {
         setUiBusy(false)
     }
 }
 
+const ARRAY_BUFFER_TYPE_TAG = "__FSISBUFFER__"
+
 /**
- * Imports application data from a user-selected JSON file,
- * handling both plaintext and encrypted exports.
+ * Recursively scans an object and wraps ArrayBuffer instances in a
+ * special marker object for safe CBOR serialization.
+ * @param {*} data The data to scan.
+ * @returns {*} A deep copy of the data with ArrayBuffers tagged.
+ */
+function convertArrayBuffersToTags(data) {
+    if (!data) return data
+    if (data instanceof ArrayBuffer) {
+        return {
+            [ARRAY_BUFFER_TYPE_TAG]: true,
+            // We must convert to a Uint8Array for CBOR to handle it correctly
+            data: new Uint8Array(data)
+        }
+    }
+    if (Array.isArray(data)) {
+        return data.map(item => convertArrayBuffersToTags(item))
+    }
+    if (typeof data === "object" && data.constructor === Object) {
+        const newObj = {}
+        for (const key in data) {
+            newObj[key] = convertArrayBuffersToTags(data[key])
+        }
+        return newObj
+    }
+    return data
+}
+
+/**
+ * Recursively scans an object and converts any tagged objects
+ * back into pure ArrayBuffer instances.
+ * @param {*} data The data (post-CBOR-decode) to scan.
+ * @returns {*} A deep copy of the data with ArrayBuffers restored.
+ */
+function convertTagsToArrayBuffers(data) {
+    if (!data) return data
+    if (Array.isArray(data)) {
+        return data.map(item => convertTagsToArrayBuffers(item))
+    }
+    if (typeof data === "object" && data !== null && data.constructor === Object) {
+        if (data[ARRAY_BUFFER_TYPE_TAG] === true && data.data instanceof Uint8Array) {
+            // This is our tagged object, convert the Uint8Array's underlying buffer back to a pure ArrayBuffer
+            return data.data.buffer
+        }
+        const newObj = {}
+        for (const key in data) {
+            newObj[key] = convertTagsToArrayBuffers(data[key])
+        }
+        return newObj
+    }
+    return data
+}
+
+// Helper for encryption to keep the main function cleaner
+async function encryptPayload(payload, password) {
+    const salt = crypto.getRandomValues(new Uint8Array(16))
+    const iv = crypto.getRandomValues(new Uint8Array(12))
+    const key = await deriveKeyFromPassword(password, salt)
+    const encryptedBuffer = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, payload)
+    return { type: "FS-EE", s: salt, iv: iv, p: new Uint8Array(encryptedBuffer) }
+}
+
+async function closeDb() {
+    if (!dbPromise) {
+        return // Already closed or never opened
+    }
+    try {
+        const db = await dbPromise
+        db.close()
+        dbPromise = null
+        console.log("Main: DB connection closed.")
+    } catch (error) {
+        console.error("Main: Error closing DB connection:", error)
+        dbPromise = null // Reset promise even on error
+    }
+}
+
+function requestSwDbClose() {
+    return new Promise((resolve, reject) => {
+        const controller = navigator.serviceWorker.controller
+        if (!controller) {
+            console.warn("No SW controller, skipping SW DB close request.")
+            return resolve()
+        }
+
+        const timeout = setTimeout(() => {
+            reject(new Error("Service worker DB close request timed out."))
+        }, 2000)
+
+        const messageListener = e => {
+            if (e.data.type === "DB_CLOSED") {
+                clearTimeout(timeout)
+                navigator.serviceWorker.removeEventListener("message", messageListener)
+                console.log("Main: Received confirmation of SW DB close.")
+                resolve()
+            }
+        }
+
+        navigator.serviceWorker.addEventListener("message", messageListener)
+        console.log("Main: Requesting SW to close DB connection.")
+        controller.postMessage({ type: "CLOSE_DB" })
+    })
+}
+
+/**
+ * Imports application data from a user-selected file,
+ * handling both plaintext and encrypted CBOR exports.
  */
 async function importData() {
     const input = document.createElement("input")
     input.type = "file"
     input.click()
     setUiBusy(true)
+
     input.oncancel = () => setUiBusy(false)
-    input.onchange = async (event) => {
+
+    input.onchange = async e => {
         try {
-            const file = event.target.files[0]
-            if (!file) {
-                setUiBusy(false)
-                return
-            }
+            const file = e.target.files[0]
+            if (!file) return setUiBusy(false)
 
-            const content = await file.text()
-            const wrapper = JSON.parse(content)
-            let data
+            // --- START: The Fix ---
+            // 1. Close our own connection first.
+            await closeDb()
+            // 2. Ask the service worker to close its connection and wait for it.
+            await requestSwDbClose()
+            // Now, no connections should be open, and deletion will be fast.
+            // --- END: The Fix ---
 
-            if (wrapper.type === "FS-EE") {
+            const buffer = await file.arrayBuffer()
+            let data = CBOR.decode(new Uint8Array(buffer))
+
+            if (data.type === "FS-EE") {
                 const password = prompt("This file is encrypted. Please enter the password:")
-                if (!password) {
-                    alert("Password required to import this file.")
-                    setUiBusy(false)
-                    return
-                }
-
-                const salt = base64ToBuffer(wrapper.s)
-                const iv = base64ToBuffer(wrapper.iv)
-                const payload = base64ToBuffer(wrapper.p)
-                const key = await deriveKeyFromPassword(password, salt)
-
-                const decryptedBuffer = await crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, key, payload)
-                const decryptedString = new TextDecoder().decode(decryptedBuffer)
-                data = JSON.parse(decryptedString)
-            } else if (wrapper.type === "FS-PE") {
-                data = wrapper.p
+                if (!password) return setUiBusy(false)
+                const key = await deriveKeyFromPassword(password, data.s)
+                const decryptedPayload = await crypto.subtle.decrypt({ name: "AES-GCM", iv: data.iv }, key, data.p)
+                data = convertTagsToArrayBuffers(CBOR.decode(new Uint8Array(decryptedPayload)))
             } else {
-                data = wrapper
+                data = convertTagsToArrayBuffers(data)
             }
 
             if (data.localStorage) {
-                for (const key in data.localStorage) {
-                    if (key === "pk") {
-                        console.warn("Skipping import of 'pk' from localStorage to protect existing key.")
-                        continue // Move to the next key
-                    }
-                    localStorage.setItem(key, data.localStorage[key])
-                }
+                Object.keys(data.localStorage).forEach(key => {
+                    if (key !== "pk") localStorage.setItem(key, data.localStorage[key])
+                })
             }
 
             if (data.indexedDB) {
                 for (const dbName in data.indexedDB) {
-                    // Explicitly refuse to import into the RuntimeFS database.
-                    // if (dbName === DBN) {
-                    //     console.warn(`Skipping import of data for '${DBN}' to protect RuntimeFS folders.`)
-                    //     continue // Go to the next database in the file.
-                    // }
-
                     const dbData = data.indexedDB[dbName]
-                    const version = dbData.version
-                    const schema = dbData.schema
-                    const storesToImport = dbData.data
 
-                    // Open with version number
-                    const db = await new Promise((resolve, reject) => {
-                        const request = indexedDB.open(dbName, version)
-                        request.onerror = (e) => reject(`Could not open database: ${dbName}. Error: ${e.target.error}`)
-
-                        // This event handler BUILDS the database structure.
-                        request.onupgradeneeded = (event) => {
-                            const dbHandle = event.target.result
-                            for (const storeName in schema) {
-                                if (!dbHandle.objectStoreNames.contains(storeName)) {
-                                    const storeSchema = schema[storeName]
-                                    dbHandle.createObjectStore(storeName, {
-                                        keyPath: storeSchema.keyPath,
-                                        autoIncrement: storeSchema.autoIncrement
-                                    })
-                                }
-                            }
+                    await new Promise((resolve, reject) => {
+                        console.log(`Attempting to delete database: ${dbName}`)
+                        const deleteRequest = indexedDB.deleteDatabase(dbName)
+                        deleteRequest.onerror = e => reject(`Failed to delete database: ${e.target.error}`)
+                        deleteRequest.onsuccess = () => {
+                            console.log(`Database ${dbName} deleted successfully.`)
+                            resolve()
                         }
-
-                        // This event handler fires AFTER onupgradeneeded is finished.
-                        request.onsuccess = (event) => {
-                            resolve(event.target.result)
+                        deleteRequest.onblocked = e => {
+                            // This should no longer happen, but we keep it for safety.
+                            console.error("Database delete was blocked despite precautions.", e)
+                            alert("Import failed: A database is still locked. Please close all other tabs for this site and try again.")
+                            reject(new Error("Database delete blocked"))
                         }
                     })
 
-                    // Now that the DB and stores are guaranteed to exist, we can populate them.
-                    const storeNames = Object.keys(storesToImport)
-                    if (storeNames.length > 0) {
-                        const transaction = db.transaction(storeNames, "readwrite")
-
-                        for (const storeName of storeNames) {
-                            const store = transaction.objectStore(storeName)
-                            store.clear()
-                            // Get the schema for THIS specific store, which you have in the `schema` variable
-                            const storeSchema = schema[storeName]
-                            const usesInLineKeys = storeSchema && storeSchema.keyPath
-
-                            const restoredRecords = convertBase64ToArrayBuffers(storesToImport[storeName])
-
-                            for (const recordObject of restoredRecords) {
-                                if (usesInLineKeys) {
-                                    // If the store uses in-line keys, just provide the value.
-                                    // IndexedDB will find the key itself using the keyPath.
-                                    store.put(recordObject.value)
-                                } else {
-                                    // If it's an out-of-line key store, provide both value and key.
-                                    store.put(recordObject.value, recordObject.key)
-                                }
+                    // The rest of the function proceeds as before...
+                    const db = await new Promise((resolve, reject) => {
+                        const request = indexedDB.open(dbName, dbData.version)
+                        request.onerror = e => reject(`Could not open database: ${dbName}. Error: ${e.target.error}`)
+                        request.onupgradeneeded = e => {
+                            const dbHandle = e.target.result
+                            for (const storeName in dbData.stores) {
+                                const { schema } = dbData.stores[storeName]
+                                const storeHandle = dbHandle.createObjectStore(storeName, { keyPath: schema.keyPath, autoIncrement: schema.autoIncrement })
+                                schema.indexes?.forEach(idx => {
+                                    storeHandle.createIndex(idx.name, idx.keyPath, { unique: idx.unique, multiEntry: idx.multiEntry })
+                                })
                             }
                         }
+                        request.onsuccess = e => resolve(e.target.result)
+                    })
 
-                        await promisifyTransaction(transaction)
+                    const storeNames = Object.keys(dbData.stores)
+                    if (storeNames.length > 0) {
+                        const BATCH_SIZE = 2000
+                        for (const storeName of storeNames) {
+                            const storeInfo = dbData.stores[storeName]
+                            let records = storeInfo.data
+                            const usesInlineKeys = storeInfo.schema.keyPath != null
+
+                            while (records.length > 0) {
+                                const batch = records.splice(0, BATCH_SIZE)
+                                const batchTransaction = db.transaction(storeName, "readwrite")
+                                const store = batchTransaction.objectStore(storeName)
+                                for (const record of batch) {
+                                    if (usesInlineKeys) store.put(record.value)
+                                    else store.put(record.value, record.key)
+                                }
+                                await promisifyTransaction(batchTransaction)
+                            }
+                        }
                     }
-
                     db.close()
                 }
             }
+
+            data = null
             alert("General data import successful!")
-            await listFolders()
+            await listFolders() // This will re-trigger getDb() and re-establish the connection
         } catch (error) {
             console.error("Import failed:", error)
-            // A common error is a bad password during decryption, which throws a DOMException.
-            if (error instanceof DOMException && error.name === "OperationError") {
-                alert("Import failed. The password may be incorrect.")
-            } else {
-                alert("An error occurred during import: " + error.message)
-            }
+            const message = (error instanceof DOMException && error.name === "OperationError")
+                ? "Import failed. The password may be incorrect."
+                : `An error occurred during import: ${error.message}`
+            alert(message)
         } finally {
-            // Always re-enable the UI after the process is finished.
             setUiBusy(false)
         }
     }
 }
 
-function createAndDisplayDownloadLink(jsonString, parentElement) {
-    // Clean up any old links that might still be there from a previous export.
+function createAndDisplayDownloadLink(buffer, parentElement, filename) {
+    // Clean up any old links
     const oldLink = document.getElementById("download-link")
     if (oldLink) {
         oldLink.remove()
     }
 
-    // Create a Data URI, which embeds the file content directly in the URL.
     var url
-    if (jsonString.length > 1e7 && !confirm("JSON string size is large. Export as data: anyway?")) {
-        const blob = new Blob([jsonString], { type: "text/plain;charset=utf-8" })
-        url = URL.createObjectURL(blob)
-    } else {
-        url = `data:text/plain;charset=utf-8,${encodeURIComponent(jsonString)}`
-    }
+    // if (confirm("Export as blob: instead of data:?")) {
+    const blob = new Blob([buffer], { type: "application/octet-stream" })
+    url = URL.createObjectURL(blob)
+    // }
 
     const a = document.createElement("a")
-    a.id = "download-link" // Give it an ID for easy removal later.
+    a.id = "download-link"
     a.href = url
-    a.download = "result.txt" // The default filename for the user.
+    a.download = filename
     a.textContent = "Click here to download export!"
     a.style.display = "block"
     a.style.marginTop = "10px"
@@ -1274,9 +1296,12 @@ function createAndDisplayDownloadLink(jsonString, parentElement) {
     a.style.borderRadius = "5px"
     a.style.textAlign = "center"
 
-    // When the user clicks the link, remove it from the page to keep the UI clean.
+    // Revoke the object URL after click to free memory
     a.onclick = () => {
-        setTimeout(() => a.remove(), 200) // Small delay to ensure download has time to start.
+        setTimeout(() => {
+            URL.revokeObjectURL(url)
+            a.remove()
+        }, 200)
     }
 
     parentElement.appendChild(a)
@@ -1322,13 +1347,9 @@ async function uploadAndEncryptWithPassword() {
         }
         // Store the salt in a metadata file.
         files[".metadata"] = { buffer: salt.buffer, type: "application/octet-stream" }
-        const db = await dbPromise
-        const transaction = db.transaction([SN], "readwrite")
-        const folderStore = transaction.objectStore(SN)
-        // Add the 'encryptionType' property to the folder object.
-        const folderObject = { id: name, files: files, encryptionType: "pdf" }
-        folderStore.put(folderObject)
-        await promisifyTransaction(transaction)
+
+        await processAndStoreFolder(name, files, "pdf")
+
         console.log(`Folder "${name}" encrypted and stored successfully.`)
         folderNameInput.value = ""
         passwordInput.value = ""
@@ -1521,7 +1542,6 @@ async function getFilesFromDroppedItems(dataTransferItemList) {
 document.body.addEventListener("drop", async e => {
     e.preventDefault()
     document.body.style.backgroundColor = ""
-    setUiBusy(true)
 
     let defaultFolderName = ""
     const items = e.dataTransfer.items
@@ -1540,7 +1560,7 @@ document.body.addEventListener("drop", async e => {
         return
     }
 
-    const name = prompt("Enter a name for the folder:", defaultFolderName)
+    const name = prompt("Please enter a name for the folder:", defaultFolderName)
     if (name === null) {
         return
     }
@@ -1562,4 +1582,4 @@ document.body.addEventListener("drop", async e => {
     } finally {
         setUiBusy(false)
     }
-});
+})

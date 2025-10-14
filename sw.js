@@ -6,10 +6,11 @@ const ruleStore = new Map()
 const decryptionKeyStore = new Map()
 
 // IndexedDB configuration.
-const DBN = "FileCacheDB" // Database name for RuntimeFS.
-const SN = "Folders";      // Object store for folder data.
-const META_SN = "Metadata" // Object store for metadata (like folder manifest).
-const DB_VERSION = 1;      // Database version.
+const DBN = "FileCacheDB"
+const FOLDERS_SN = "Folders"
+const FILES_SN = "Files"
+const META_SN = "Metadata"
+const DB_VERSION = 2 // Ensure this matches main.js
 
 // Application shell caching configuration.
 const CACHE_NAME = "fc" // Name for the application shell cache.
@@ -54,9 +55,9 @@ function promisifyTransaction(transaction) {
  * @returns {Promise<string>} A promise resolving with the hex-encoded hash.
  */
 async function generateETag(buffer) {
-    const hashBuffer = await crypto.subtle.digest('SHA-1', buffer)
+    const hashBuffer = await crypto.subtle.digest("SHA-1", buffer)
     const hashArray = Array.from(new Uint8Array(hashBuffer))
-    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
+    return hashArray.map(b => b.toString(16).padStart(2, "0")).join("")
 }
 
 /**
@@ -169,19 +170,32 @@ function applyRegexRules(filePath, fileBuffer, fileType, regexRules) {
  */
 function getDb() {
     if (!dbPromise) {
+        // console.log("No DB connection promise found, creating a new one.")
         dbPromise = new Promise((resolve, reject) => {
             const request = indexedDB.open(DBN, DB_VERSION)
-            request.onupgradeneeded = event => {
-                const db = event.target.result
-                if (!db.objectStoreNames.contains(SN)) {
-                    db.createObjectStore(SN, { keyPath: "id" })
+            request.onupgradeneeded = function (e) {
+                const db = e.target.result
+                if (!db.objectStoreNames.contains(FOLDERS_SN)) {
+                    db.createObjectStore(FOLDERS_SN, { keyPath: "id" })
+                }
+                if (!db.objectStoreNames.contains(FILES_SN)) {
+                    const fileStore = db.createObjectStore(FILES_SN, { autoIncrement: true })
+                    fileStore.createIndex("folder", ["folderName", "path"], { unique: true })
                 }
                 if (!db.objectStoreNames.contains(META_SN)) {
                     db.createObjectStore(META_SN, { keyPath: "id" })
                 }
             }
-            request.onsuccess = event => resolve(event.target.result)
-            request.onerror = event => reject(event.target.error)
+            request.onsuccess = e => {
+                const db = e.target.result
+                db.onversionchange = () => {
+                    console.warn("Database version change requested, closing connection.")
+                    db.close()
+                    dbPromise = null // Ensure the connection is reopened next time.
+                }
+                resolve(db)
+            }
+            request.onerror = e => reject(e.target.errorCode)
         })
     }
     return dbPromise
@@ -203,14 +217,34 @@ function getFolderData(folderName) {
     const loadingPromise = (async () => {
         try {
             const db = await getDb()
-            const transaction = db.transaction([SN, META_SN], "readonly")
-            // Get folder manifest to find actual folder ID if aliased.
-            const manifest = (await promisifyRequest(transaction.objectStore(META_SN).get("folderManifest")))?.data || {} // manifest not done yet
-            const folderId = manifest[folderName] || folderName
-            const folderData = await promisifyRequest(transaction.objectStore(SN).get(folderId))
+            const transaction = db.transaction([FOLDERS_SN, FILES_SN], "readonly")
+            const folderStore = transaction.objectStore(FOLDERS_SN)
+            const fileStore = transaction.objectStore(FILES_SN)
+            const fileIndex = fileStore.index("folder")
+
+            // 1. Get the folder metadata
+            const folderMetadata = await promisifyRequest(folderStore.get(folderName))
+            if (!folderMetadata) {
+                // Folder doesn't exist at all
+                return undefined
+            }
+
+            // 2. Get all files associated with this folder
+            const fileRange = IDBKeyRange.bound([folderName, ""], [folderName, "\uffff"])
+            const filesArray = await promisifyRequest(fileIndex.getAll(fileRange))
+
+            // 3. Reconstruct the folder object format that the rest of the code expects
+            const folderData = {
+                ...folderMetadata, // id, encryptionType, etc.
+                files: {}
+            }
+
+            for (const fileRecord of filesArray) {
+                folderData.files[fileRecord.path] = fileRecord.content
+            }
 
             if (folderData) {
-                folderCache.set(folderName, folderData) // Cache the data.
+                folderCache.set(folderName, folderData) // Cache the reconstructed data.
             }
             return folderData
         } finally {
@@ -223,8 +257,8 @@ function getFolderData(folderName) {
 }
 
 // Service worker installation. Caches the application shell.
-self.addEventListener("install", event => {
-    event.waitUntil((async () => {
+self.addEventListener("install", e => {
+    e.waitUntil((async () => {
         const cache = await caches.open(CACHE_NAME)
         const promises = APP_SHELL_FILES.map(async (url) => {
             try {
@@ -244,8 +278,8 @@ self.addEventListener("install", event => {
 })
 
 // Service worker activation. Cleans up old caches and claims clients.
-self.addEventListener("activate", event => {
-    event.waitUntil(
+self.addEventListener("activate", e => {
+    e.waitUntil(
         getDb() // 1. Ensure DB is ready.
             .then(() => caches.keys()) // 2. Get all cache keys.
             .then(keys => Promise.all( // 3. Delete all old caches.
@@ -255,63 +289,66 @@ self.addEventListener("activate", event => {
     )
 })
 
-self.addEventListener("fetch", event => {
-    const url = new URL(event.request.url)
+self.addEventListener("fetch", e => {
+    const url = new URL(e.request.url)
     if (url.origin !== self.location.origin) return // Ignore cross-origin requests.
 
     // Handle POST/PUT requests for saving data within virtual apps
-    if (event.request.method === "POST" || event.request.method === "PUT") {
+    if (e.request.method === "POST" || e.request.method === "PUT") {
         if (url.pathname.startsWith("/n/")) {
-            event.respondWith((async () => {
+            e.respondWith((async () => {
                 try {
                     const pathParts = url.pathname.split("/").slice(2)
                     const folderName = decodeURIComponent(pathParts[0])
                     const filePath = decodeURIComponent(pathParts.slice(1).join("/"))
+                    const newContent = await e.request.arrayBuffer()
 
-                    // Get the data from the request body.
-                    const newContent = await event.request.arrayBuffer()
+                    const db = await getDb()
+                    const transaction = db.transaction([FILES_SN], "readwrite")
+                    const fileStore = transaction.objectStore(FILES_SN)
+                    const index = fileStore.index("folder")
 
-                    // Get the existing folder data from IndexedDB.
-                    const folderData = await getFolderData(folderName)
+                    // Find the primary key of the file to update it
+                    const fileRecord = await promisifyRequest(index.get([folderName, filePath]))
 
-                    if (folderData && folderData.files) {
-                        // Update the specific file's buffer and type.
-                        folderData.files[filePath] = {
-                            buffer: newContent,
-                            type: event.request.headers.get("content-type") || "application/octet-stream"
-                        }
-
-                        // Write the entire updated folder object back to the database.
-                        const db = await getDb()
-                        const transaction = db.transaction([SN], "readwrite")
-                        const store = transaction.objectStore(SN)
-                        store.put(folderData)
-                        await promisifyTransaction(transaction)
-
-                        // Invalidate the in-memory cache to ensure the next GET sees the change.
-                        folderCache.delete(folderName)
-
-                        // Send a success response back to the virtual app.
-                        return new Response(JSON.stringify({ success: true, message: `Saved ${filePath}` }), { status: 200, headers: { "Content-Type": "application/json" } })
+                    if (fileRecord) {
+                        // Update the existing file record
+                        fileRecord.content.buffer = newContent
+                        fileRecord.content.type = e.request.headers.get("content-type") || "application/octet-stream"
+                        await promisifyRequest(fileStore.put(fileRecord))
                     } else {
-                        return new Response(JSON.stringify({ success: false, message: "Folder not found" }), { status: 404, headers: { "Content-Type": "application/json" } })
+                        // Or create a new file record if it doesn't exist
+                        await promisifyRequest(fileStore.add({
+                            folderName: folderName,
+                            path: filePath,
+                            content: {
+                                buffer: newContent,
+                                type: e.request.headers.get("content-type") || "application/octet-stream"
+                            }
+                        }))
                     }
+
+                    await promisifyTransaction(transaction)
+
+                    // Invalidate the in-memory cache
+                    folderCache.delete(folderName)
+
+                    return new Response(JSON.stringify({ success: true, message: `Saved ${filePath}` }), { status: 200, headers: { "Content-Type": "application/json" } })
                 } catch (err) {
                     console.error(`Failed to save file to virtual folder:`, err)
                     return new Response(JSON.stringify({ success: false, message: err.message }), { status: 500, headers: { "Content-Type": "application/json" } })
                 }
             })())
-            // Important: Stop further processing for POST/PUT requests.
             return
         }
     }
 
     // Handle GET requests for the app shell and virtual files
-    event.respondWith((async () => {
+    e.respondWith((async () => {
         // First, handle requests for the application shell (cached).
         if (APP_SHELL_FILES.includes(url.pathname)) {
-            const cachedResponse = await caches.match(event.request)
-            return cachedResponse || fetch(event.request)
+            const cachedResponse = await caches.match(e.request)
+            return cachedResponse || fetch(e.request)
         }
 
         // Second, handle requests for virtual files.
@@ -325,12 +362,12 @@ self.addEventListener("fetch", event => {
             const requestData = ruleStore.get(requestId) || {}
             if (requestId) ruleStore.delete(requestId)
 
-            const response = await generateResponseForVirtualFile(folderName, filePath, requestData, event)
+            const response = await generateResponseForVirtualFile(folderName, filePath, requestData, e)
 
             // SPA Fallback: If a navigation request fails, try serving index.html.
-            if (response.status === 404 && event.request.mode === "navigate") {
+            if (response.status === 404 && e.request.mode === "navigate") {
                 console.log(`'${filePath}' not found. Attempting SPA fallback to index.html.`)
-                const fallbackResponse = await generateResponseForVirtualFile(folderName, "index.html", requestData, event)
+                const fallbackResponse = await generateResponseForVirtualFile(folderName, "index.html", requestData, e)
                 return fallbackResponse.status === 200 ? fallbackResponse : response
             }
 
@@ -338,46 +375,62 @@ self.addEventListener("fetch", event => {
         }
 
         // Third, handle asset requests originating from virtual pages.
-        const referer = event.request.referrer
+        const referer = e.request.referrer
         if (referer) {
             const refererUrl = new URL(referer)
             if (refererUrl.origin === self.location.origin && refererUrl.pathname.startsWith("/n/")) {
                 const pathParts = refererUrl.pathname.split("/").slice(2)
                 // Asset requests from a page won't have custom rules, so we pass an empty object.
-                return generateResponseForVirtualFile(pathParts[0], url.pathname.substring(1), {}, event)
+                return generateResponseForVirtualFile(pathParts[0], url.pathname.substring(1), {}, e)
             }
         }
 
         // For all other requests, fall through to the network.
-        return fetch(event.request)
+        return fetch(e.request)
     })())
 })
 
 self.addEventListener("message", e => {
     if (!e.data) return
 
-    // This message type now carries both regex rules and custom header rules.
-    if (e.data.type === "CUSTOMRULES") {
-        ruleStore.set(e.data.requestId, {
-            regex: e.data.rules,   // The regex rules string
-            headers: e.data.headers // The custom headers string
-        })
-        // Set a timeout to clean up the stored rules after 30 seconds.
-        setTimeout(() => ruleStore.delete(e.data.requestId), 30000)
-    }
-    // The rest of the message handlers remain the same.
-    else if (e.data.type === "INVALIDATE_CACHE") {
-        const folderName = e.data.folderName
-        if (folderName) {
-            console.log(`Invalidating cache in ServiceWorker for: ${folderName}`)
-            folderCache.delete(folderName)
-            if (e.source) {
-                e.source.postMessage({ type: "CACHE_INVALIDATED", folderName: folderName })
+    switch (e.data.type) {
+        case "CUSTOMRULES":
+            ruleStore.set(e.data.requestId, {
+                regex: e.data.rules,
+                headers: e.data.headers
+            })
+            setTimeout(() => ruleStore.delete(e.data.requestId), 30000)
+            break
+
+        case "INVALIDATE_CACHE":
+            const folderName = e.data.folderName
+            if (folderName) {
+                console.log(`SW: Invalidating cache for: ${folderName}`)
+                folderCache.delete(folderName)
+                if (e.source) {
+                    e.source.postMessage({ type: "CACHE_INVALIDATED", folderName: folderName })
+                }
             }
-        }
-    } else if (e.data.type === "DECRYPT_KEY") {
-        decryptionKeyStore.set(e.data.requestId, e.data.key)
-        setTimeout(() => decryptionKeyStore.delete(e.data.requestId), 30000)
+            break
+
+        case "DECRYPT_KEY":
+            decryptionKeyStore.set(e.data.requestId, e.data.key)
+            setTimeout(() => decryptionKeyStore.delete(e.data.requestId), 30000)
+            break
+
+        // NEW: Handle request from main thread to close the DB
+        case "CLOSE_DB":
+            console.log("SW: Received request to close DB connection.")
+            if (db) {
+                db.close()
+                db = null
+                dbPromise = null
+                console.log("SW: DB connection closed.")
+            }
+            if (e.source) {
+                e.source.postMessage({ type: "DB_CLOSED" })
+            }
+            break
     }
 })
 
@@ -417,17 +470,38 @@ async function generateResponseForVirtualFile(folderName, requestedFilePath, req
     let fileData = folderData.files[filePath]
     let foundPath = filePath
 
-    if (!fileData) {
-        const matchingPath = Object.keys(folderData.files).find(p => p.endsWith(decodedFilePath))
-        if (matchingPath) {
-            fileData = folderData.files[matchingPath]
-            foundPath = matchingPath
+    if (!fileData && event.request.referrer) {
+        const refererUrl = new URL(event.request.referrer)
+        const basePath = refererUrl.pathname.substring(0, refererUrl.pathname.lastIndexOf("/"))
+
+        const pathParts = (basePath + "/" + filePath).split("/")
+        const resolvedParts = []
+        for (const part of pathParts) {
+            if (part === "." || part === "") continue
+            if (part === "..") {
+                resolvedParts.pop()
+            } else {
+                resolvedParts.push(part)
+            }
+        }
+        // Re-join and remove the leading "/n/folderName" part
+        const resolvedPath = resolvedParts.slice(3).join("/")
+        if (folderData.files[resolvedPath]) {
+            fileData = folderData.files[resolvedPath]
+            foundPath = resolvedPath
         }
     }
 
+
     if (!fileData) {
-        console.warn(`File not found in folder ${decodedFolderName}: ${decodedFilePath}`)
-        return new Response("File not found: " + decodedFilePath, { status: 404 })
+        // Only use the SPA fallback as a last resort for navigation requests.
+        if (event.request.mode === "navigate" && folderData.files["index.html"]) {
+            console.log(`'${filePath}' not found. Attempting SPA fallback to index.html.`)
+            fileData = folderData.files["index.html"]
+            foundPath = "index.html"
+        } else {
+            return new Response("File not found: " + decodedFilePath, { status: 404 })
+        }
     }
 
     let fileBuffer = fileData.buffer
@@ -524,7 +598,7 @@ function parseCustomHeaders(rulesString) {
         const [, headerName, headerValue] = headerMatch
 
         // Convert file glob to a regex for matching.
-        const regex = new RegExp("^" + glob.replace(/\./g, "\\.").replace(/\*/g, ".*").replace(/\?/g, ".") + "$")
+        const regex = new RegExp("^" + glob.replace(/\./g, "\.").replace(/\*/g, ".*").replace(/\?/g, ".") + "$")
 
         rules.push({
             regex: regex,

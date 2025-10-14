@@ -39,7 +39,7 @@ navigator.storage.persist().then(persistent => {
 let dbPromise = null
 function getDb() {
     if (!dbPromise) {
-        // console.log("SW: No DB connection promise, creating a new one.")
+        // console.log("No DB connection promise, creating a new one.")
         dbPromise = new Promise((resolve, reject) => {
             const request = indexedDB.open(DBN, DB_VERSION)
             request.onupgradeneeded = e => {
@@ -58,7 +58,7 @@ function getDb() {
             request.onsuccess = e => {
                 db = e.target.result // Assign to the global 'db' variable
                 db.onversionchange = () => {
-                    console.warn("SW: Database version change detected, closing connection.")
+                    console.warn("Database version change detected, closing connection.")
                     if (db) {
                         db.close()
                     }
@@ -622,7 +622,7 @@ async function listFolders() {
         console.error("Failed to list folders:", error)
         // Optionally, display an error to the user in the UI.
         const folderList = document.getElementById("folderList")
-        folderList.innerHTML = "<li>Error loading folders.</li>"
+        folderList.innerHTML = "<li>Error loading folders ):</li>"
     }
 }
 
@@ -845,7 +845,7 @@ async function getHandleFromPath(rootDirHandle, path) {
 
 // A helper function to convert an ArrayBuffer to a Base64 string.
 function bufferToBase64(buffer) {
-    return btoa(String.fromCharCode(...new Uint8Array(buffer)))
+    return btoa(new TextDecoder("latin1").decode(new Uint8Array(buffer)))
 }
 
 // A helper function to convert a Base64 string to an ArrayBuffer.
@@ -990,47 +990,50 @@ async function exportData() {
                         request.onerror = e => reject(new Error(`Could not open db: ${dbName}`))
                     })
 
-                    const transaction = db.transaction(db.objectStoreNames, "readonly")
                     const dbExport = { version: db.version, stores: {} }
 
-                    for (const storeName of db.objectStoreNames) {
-                        const store = transaction.objectStore(storeName)
-                        const indexes = Array.from(store.indexNames).map(name => {
-                            const index = store.index(name)
-                            return { name: index.name, keyPath: index.keyPath, unique: index.unique, multiEntry: index.multiEntry }
-                        })
+                    // This is the key change: if the database has no object stores,
+                    // we record its existence and version, but don't try to
+                    // create a transaction, which would cause an error.
+                    if (db.objectStoreNames.length > 0) {
+                        const transaction = db.transaction(db.objectStoreNames, "readonly")
+                        for (const storeName of db.objectStoreNames) {
+                            const store = transaction.objectStore(storeName)
+                            const indexes = Array.from(store.indexNames).map(name => {
+                                const index = store.index(name)
+                                return { name: index.name, keyPath: index.keyPath, unique: index.unique, multiEntry: index.multiEntry }
+                            })
 
-                        // --- PERFORMANCE FIX: Use a cursor to avoid loading everything into memory ---
-                        const records = await new Promise((resolve, reject) => {
-                            const cursorReq = store.openCursor()
-                            const allRecords = []
-                            cursorReq.onerror = e => reject(e.target.error)
-                            cursorReq.onsuccess = e => {
-                                const cursor = e.target.result
-                                if (cursor) {
-                                    allRecords.push({ key: cursor.key, value: cursor.value })
-                                    cursor.continue()
-                                } else {
-                                    resolve(allRecords)
+                            const records = await new Promise((resolve, reject) => {
+                                const cursorReq = store.openCursor()
+                                const allRecords = []
+                                cursorReq.onerror = e => reject(e.target.error)
+                                cursorReq.onsuccess = e => {
+                                    const cursor = e.target.result
+                                    if (cursor) {
+                                        allRecords.push({ key: cursor.key, value: cursor.value })
+                                        cursor.continue()
+                                    } else {
+                                        resolve(allRecords)
+                                    }
                                 }
-                            }
-                        })
-                        // --- END FIX ---
+                            })
 
-                        dbExport.stores[storeName] = {
-                            schema: { keyPath: store.keyPath, autoIncrement: store.autoIncrement, indexes },
-                            data: records
+                            dbExport.stores[storeName] = {
+                                schema: { keyPath: store.keyPath, autoIncrement: store.autoIncrement, indexes },
+                                data: records
+                            }
                         }
                     }
+
                     dataToExport.indexedDB[dbName] = dbExport
                     db.close()
                 } catch (error) {
-                    console.warn(`Could not export database '${dbName}'. Skipping.`, error)
+                    console.warn(`Could not export database '${dbName}'. Skipping. Reason: ${error.name} - ${error.message}`)
                 }
             }
         }
 
-        // console.log(dataToExport)
         const encoded = CBOR.encode(dataToExport)
         let finalBuffer = password ? CBOR.encode(await encryptPayload(encoded, password)) : encoded
 
@@ -1039,65 +1042,10 @@ async function exportData() {
 
     } catch (error) {
         console.error("Export failed:", error)
-        alert("An error occurred during export: " + error.message)
+        alert("An error occurred during export: " + (error.message || error.name))
     } finally {
         setUiBusy(false)
     }
-}
-
-const ARRAY_BUFFER_TYPE_TAG = "__FSISBUFFER__"
-
-/**
- * Recursively scans an object and wraps ArrayBuffer instances in a
- * special marker object for safe CBOR serialization.
- * @param {*} data The data to scan.
- * @returns {*} A deep copy of the data with ArrayBuffers tagged.
- */
-function convertArrayBuffersToTags(data) {
-    if (!data) return data
-    if (data instanceof ArrayBuffer) {
-        return {
-            [ARRAY_BUFFER_TYPE_TAG]: true,
-            // We must convert to a Uint8Array for CBOR to handle it correctly
-            data: new Uint8Array(data)
-        }
-    }
-    if (Array.isArray(data)) {
-        return data.map(item => convertArrayBuffersToTags(item))
-    }
-    if (typeof data === "object" && data.constructor === Object) {
-        const newObj = {}
-        for (const key in data) {
-            newObj[key] = convertArrayBuffersToTags(data[key])
-        }
-        return newObj
-    }
-    return data
-}
-
-/**
- * Recursively scans an object and converts any tagged objects
- * back into pure ArrayBuffer instances.
- * @param {*} data The data (post-CBOR-decode) to scan.
- * @returns {*} A deep copy of the data with ArrayBuffers restored.
- */
-function convertTagsToArrayBuffers(data) {
-    if (!data) return data
-    if (Array.isArray(data)) {
-        return data.map(item => convertTagsToArrayBuffers(item))
-    }
-    if (typeof data === "object" && data !== null && data.constructor === Object) {
-        if (data[ARRAY_BUFFER_TYPE_TAG] === true && data.data instanceof Uint8Array) {
-            // This is our tagged object, convert the Uint8Array's underlying buffer back to a pure ArrayBuffer
-            return data.data.buffer
-        }
-        const newObj = {}
-        for (const key in data) {
-            newObj[key] = convertTagsToArrayBuffers(data[key])
-        }
-        return newObj
-    }
-    return data
 }
 
 // Helper for encryption to keep the main function cleaner
@@ -1109,52 +1057,6 @@ async function encryptPayload(payload, password) {
     return { type: "FS-EE", s: salt, iv: iv, p: new Uint8Array(encryptedBuffer) }
 }
 
-async function closeDb() {
-    if (!dbPromise) {
-        return // Already closed or never opened
-    }
-    try {
-        const db = await dbPromise
-        db.close()
-        dbPromise = null
-        console.log("Main: DB connection closed.")
-    } catch (error) {
-        console.error("Main: Error closing DB connection:", error)
-        dbPromise = null // Reset promise even on error
-    }
-}
-
-function requestSwDbClose() {
-    return new Promise((resolve, reject) => {
-        const controller = navigator.serviceWorker.controller
-        if (!controller) {
-            console.warn("No SW controller, skipping SW DB close request.")
-            return resolve()
-        }
-
-        const timeout = setTimeout(() => {
-            reject(new Error("Service worker DB close request timed out."))
-        }, 2000)
-
-        const messageListener = e => {
-            if (e.data.type === "DB_CLOSED") {
-                clearTimeout(timeout)
-                navigator.serviceWorker.removeEventListener("message", messageListener)
-                console.log("Main: Received confirmation of SW DB close.")
-                resolve()
-            }
-        }
-
-        navigator.serviceWorker.addEventListener("message", messageListener)
-        console.log("Main: Requesting SW to close DB connection.")
-        controller.postMessage({ type: "CLOSE_DB" })
-    })
-}
-
-/**
- * Imports application data from a user-selected file,
- * handling both plaintext and encrypted CBOR exports.
- */
 async function importData() {
     const input = document.createElement("input")
     input.type = "file"
@@ -1164,30 +1066,54 @@ async function importData() {
     input.oncancel = () => setUiBusy(false)
 
     input.onchange = async e => {
+        let data = null // Hoist data to be accessible in the finally block
         try {
             const file = e.target.files[0]
-            if (!file) return setUiBusy(false)
+            if (!file) {
+                setUiBusy(false)
+                return
+            }
 
-            // --- START: The Fix ---
-            // 1. Close our own connection first.
-            await closeDb()
-            // 2. Ask the service worker to close its connection and wait for it.
-            await requestSwDbClose()
-            // Now, no connections should be open, and deletion will be fast.
-            // --- END: The Fix ---
+            if (navigator.storage && navigator.storage.estimate) {
+                const estimate = await navigator.storage.estimate()
+                const availableSpace = estimate.quota - estimate.usage
+                console.log(`Available storage: ${(availableSpace / 1024 / 1024).toFixed(2)} MB`)
+                console.log(`Import file size: ${(file.size / 1024 / 1024).toFixed(2)} MB`)
+
+                if (file.size > availableSpace) {
+                    throw new Error(`Import failed: The file size (${(file.size / 1024 / 1024).toFixed(2)} MB) is larger than the available browser storage (${(availableSpace / 1024 / 1024).toFixed(2)} MB). Please free up space and try again.`)
+                }
+            }
 
             const buffer = await file.arrayBuffer()
-            let data = CBOR.decode(new Uint8Array(buffer))
+            const decodedItems = CBOR.decodeMultiple(new Uint8Array(buffer))
+
+            if (!decodedItems || decodedItems.length === 0) {
+                throw new Error("Import file is empty or not a valid CBOR file.")
+            }
+
+            data = decodedItems[0]
 
             if (data.type === "FS-EE") {
                 const password = prompt("This file is encrypted. Please enter the password:")
-                if (!password) return setUiBusy(false)
+                if (!password) {
+                    setUiBusy(false)
+                    return
+                }
                 const key = await deriveKeyFromPassword(password, data.s)
-                const decryptedPayload = await crypto.subtle.decrypt({ name: "AES-GCM", iv: data.iv }, key, data.p)
-                data = convertTagsToArrayBuffers(CBOR.decode(new Uint8Array(decryptedPayload)))
-            } else {
-                data = convertTagsToArrayBuffers(data)
+                let decryptedPayload
+                try {
+                    decryptedPayload = await crypto.subtle.decrypt({ name: "AES-GCM", iv: data.iv }, key, data.p)
+                } catch (err) {
+                    throw new Error("Decryption failed. The password may be incorrect.")
+                }
+                const innerItems = CBOR.decodeMultiple(new Uint8Array(decryptedPayload))
+                if (!innerItems || innerItems.length === 0) {
+                    throw new Error("Decrypted payload is empty or invalid.")
+                }
+                data = innerItems[0]
             }
+            data = normalizeToArrayBuffers(data)
 
             if (data.localStorage) {
                 Object.keys(data.localStorage).forEach(key => {
@@ -1198,77 +1124,174 @@ async function importData() {
             if (data.indexedDB) {
                 for (const dbName in data.indexedDB) {
                     const dbData = data.indexedDB[dbName]
-
-                    await new Promise((resolve, reject) => {
-                        console.log(`Attempting to delete database: ${dbName}`)
-                        const deleteRequest = indexedDB.deleteDatabase(dbName)
-                        deleteRequest.onerror = e => reject(`Failed to delete database: ${e.target.error}`)
-                        deleteRequest.onsuccess = () => {
-                            console.log(`Database ${dbName} deleted successfully.`)
-                            resolve()
-                        }
-                        deleteRequest.onblocked = e => {
-                            // This should no longer happen, but we keep it for safety.
-                            console.error("Database delete was blocked despite precautions.", e)
-                            alert("Import failed: A database is still locked. Please close all other tabs for this site and try again.")
-                            reject(new Error("Database delete blocked"))
-                        }
-                    })
-
-                    // The rest of the function proceeds as before...
-                    const db = await new Promise((resolve, reject) => {
-                        const request = indexedDB.open(dbName, dbData.version)
-                        request.onerror = e => reject(`Could not open database: ${dbName}. Error: ${e.target.error}`)
-                        request.onupgradeneeded = e => {
-                            const dbHandle = e.target.result
-                            for (const storeName in dbData.stores) {
-                                const { schema } = dbData.stores[storeName]
-                                const storeHandle = dbHandle.createObjectStore(storeName, { keyPath: schema.keyPath, autoIncrement: schema.autoIncrement })
-                                schema.indexes?.forEach(idx => {
-                                    storeHandle.createIndex(idx.name, idx.keyPath, { unique: idx.unique, multiEntry: idx.multiEntry })
-                                })
-                            }
-                        }
-                        request.onsuccess = e => resolve(e.target.result)
-                    })
-
-                    const storeNames = Object.keys(dbData.stores)
-                    if (storeNames.length > 0) {
-                        const BATCH_SIZE = 2000
-                        for (const storeName of storeNames) {
-                            const storeInfo = dbData.stores[storeName]
-                            let records = storeInfo.data
-                            const usesInlineKeys = storeInfo.schema.keyPath != null
-
-                            while (records.length > 0) {
-                                const batch = records.splice(0, BATCH_SIZE)
-                                const batchTransaction = db.transaction(storeName, "readwrite")
-                                const store = batchTransaction.objectStore(storeName)
-                                for (const record of batch) {
-                                    if (usesInlineKeys) store.put(record.value)
-                                    else store.put(record.value, record.key)
-                                }
-                                await promisifyTransaction(batchTransaction)
-                            }
-                        }
+                    if (Object.keys(dbData.stores).length === 0) {
+                        await createEmptyDatabase(dbName, dbData.version)
+                        continue // Move to the next database in the loop
                     }
-                    db.close()
+                    await clearAndFillDatabase(dbName, dbData)
                 }
             }
 
-            data = null
-            alert("General data import successful!")
-            await listFolders() // This will re-trigger getDb() and re-establish the connection
+            if (navigator.serviceWorker.controller) {
+                console.log("Notifying Service Worker and waiting for acknowledgment...")
+                await new Promise((resolve, reject) => {
+                    const timeout = setTimeout(() => reject(new Error("SW ack timed out.")), 5000)
+                    const messageListener = e => {
+                        if (e.data.type === "DB_ACKNOWLEDGED") {
+                            navigator.serviceWorker.removeEventListener("message", messageListener)
+                            clearTimeout(timeout)
+                            resolve()
+                        }
+                    }
+                    navigator.serviceWorker.addEventListener("message", messageListener)
+                    navigator.serviceWorker.controller.postMessage({ type: "DB_IMPORTED" })
+                })
+            }
+
+            // Forcibly unregister the service worker to guarantee a clean slate.
+            console.log("Unregistering active service worker to ensure a clean start.")
+            const reg = await navigator.serviceWorker.getRegistration()
+            if (reg) {
+                const unregistered = await reg.unregister()
+                if (unregistered) {
+                    console.log("Service worker unregistered successfully.")
+                } else {
+                    console.warn("Service worker unregistration failed.")
+                }
+            }
+
+            await listFolders()
+            alert("Import complete! Please reload the page.")
         } catch (error) {
             console.error("Import failed:", error)
-            const message = (error instanceof DOMException && error.name === "OperationError")
-                ? "Import failed. The password may be incorrect."
-                : `An error occurred during import: ${error.message}`
-            alert(message)
+            if (error && error.name === "QuotaExceededError") {
+                alert("The browser ran out of storage space during the import. Please free up disk space or manage site storage in your browser settings.")
+            } else {
+                alert(`An error occurred during import: ${error.message || error.name}`)
+            }
         } finally {
+            // Explicitly nullify the large object to signal the garbage collector.
+            data = null
             setUiBusy(false)
         }
     }
+}
+
+/**
+ * Creates an empty IndexedDB database with a specific version number.
+ * This is used to handle edge cases like Emscripten's /idbfs-test.
+ * @param {string} dbName The name of the database to create.
+ * @param {number} version The version number for the new database.
+ * @returns {Promise<void>}
+ */
+async function createEmptyDatabase(dbName, version) {
+    console.log(`Creating special-case empty database: '${dbName}' version ${version}`)
+
+    // 1. Ensure any old version is completely gone.
+    await new Promise((resolve, reject) => {
+        const delRequest = indexedDB.deleteDatabase(dbName)
+        delRequest.onerror = e => reject(new Error(`Could not delete database: ${dbName}`))
+        delRequest.onblocked = () => reject(new Error(`Import failed: Database "${dbName}" is open in another tab.`))
+        delRequest.onsuccess = () => resolve()
+    })
+
+    // 2. Open the database. The 'onupgradeneeded' will fire, creating the DB.
+    // We don't need to do anything inside it.
+    return new Promise((resolve, reject) => {
+        const request = indexedDB.open(dbName, version)
+        request.onerror = e => reject(new Error(`Could not create empty database: ${dbName}`))
+        request.onupgradeneeded = e => {
+            // The event itself creates the database, no action needed inside.
+        }
+        request.onsuccess = e => {
+            // IMPORTANT: Close the connection immediately to release the lock.
+            e.target.result.close()
+            resolve()
+        }
+    })
+}
+
+function normalizeToArrayBuffers(data) {
+    if (data instanceof Uint8Array) {
+        return new Uint8Array(data)
+    }
+
+    // Recurse for arrays and objects
+    if (Array.isArray(data)) {
+        return data.map(item => normalizeToArrayBuffers(item))
+    }
+
+    if (typeof data === "object" && data !== null && data.constructor === Object) {
+        const newObj = {}
+        for (const key in data) {
+            newObj[key] = normalizeToArrayBuffers(data[key])
+        }
+        return newObj
+    }
+
+    // If the data is already an ArrayBuffer (less common from CBOR),
+    // we should still make a copy to be safe.
+    if (data instanceof ArrayBuffer) {
+        return data.slice(0)
+    }
+
+    return data
+}
+
+/**
+ * Opens a database, clears all its object stores, and fills them with new data.
+ * @param {string} dbName The name of the database to process.
+ * @param {object} dbData The imported data object containing schema and records.
+ * @returns {Promise<void>}
+ */
+async function clearAndFillDatabase(dbName, dbData) {
+    await new Promise((resolve, reject) => {
+        const delRequest = indexedDB.deleteDatabase(dbName)
+        delRequest.onerror = e => reject(new Error(`Could not delete database: ${dbName}. Error: ${e.target.error}`))
+        // This is a critical handler. If the game is open in another tab, we can't delete the database.
+        delRequest.onblocked = () => reject(new Error(`Import failed: Database "${dbName}" is open in another tab. Please close it and try again.`))
+        delRequest.onsuccess = () => resolve()
+    })
+
+    const db = await new Promise((resolve, reject) => {
+        const request = indexedDB.open(dbName, dbData.version)
+        request.onerror = e => reject(new Error(`Could not open database: ${dbName}. Error: ${e.target.error}`))
+        request.onupgradeneeded = e => {
+            const dbHandle = e.target.result
+            for (const storeName in dbData.stores) {
+                // We are creating a new DB, so no need to check if stores exist
+                const { schema } = dbData.stores[storeName]
+                const storeHandle = dbHandle.createObjectStore(storeName, { keyPath: schema.keyPath, autoIncrement: schema.autoIncrement })
+                schema.indexes?.forEach(idx => {
+                    storeHandle.createIndex(idx.name, idx.keyPath, { unique: idx.unique, multiEntry: idx.multiEntry })
+                })
+            }
+        }
+        request.onsuccess = e => resolve(e.target.result)
+    })
+
+    const storeNames = Object.keys(dbData.stores)
+    for (const storeName of storeNames) {
+        console.log(`Restoring store: ${dbName}/${storeName}`)
+        const storeInfo = dbData.stores[storeName]
+        const transaction = db.transaction([storeName], "readwrite")
+        const store = transaction.objectStore(storeName)
+
+        // It's a new database, so no need to clear the store first
+        for (const record of storeInfo.data) {
+            // The schema tells us if the key is stored "in-line" (part of the value) or "out-of-line" (a separate key parameter)
+            if (storeInfo.schema.keyPath != null) {
+                store.put(record.value)
+            } else {
+                store.put(record.value, record.key)
+            }
+        }
+
+        await promisifyTransaction(transaction)
+    }
+
+    db.close()
+    console.log(`Database '${dbName}' restore complete.`)
 }
 
 function createAndDisplayDownloadLink(buffer, parentElement, filename) {

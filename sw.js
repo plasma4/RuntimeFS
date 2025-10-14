@@ -191,7 +191,7 @@ function getDb() {
                 db.onversionchange = () => {
                     console.warn("Database version change requested, closing connection.")
                     db.close()
-                    dbPromise = null // Ensure the connection is reopened next time.
+                    dbPromise = null
                 }
                 resolve(db)
             }
@@ -418,17 +418,17 @@ self.addEventListener("message", e => {
             setTimeout(() => decryptionKeyStore.delete(e.data.requestId), 30000)
             break
 
-        // NEW: Handle request from main thread to close the DB
-        case "CLOSE_DB":
-            console.log("SW: Received request to close DB connection.")
-            if (db) {
-                db.close()
-                db = null
+        case "DB_IMPORTED":
+            console.log("SW: Received DB_IMPORTED. Clearing cache and acknowledging.")
+            folderCache.clear()
+            folderLoadingPromises.clear()
+            if (dbPromise) {
+                dbPromise.then(db => db.close())
                 dbPromise = null
-                console.log("SW: DB connection closed.")
             }
+            // Send a message back to the client that we are done.
             if (e.source) {
-                e.source.postMessage({ type: "DB_CLOSED" })
+                e.source.postMessage({ type: "DB_ACKNOWLEDGED" })
             }
             break
     }

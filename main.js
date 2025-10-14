@@ -21,7 +21,7 @@ function promisifyTransaction(transaction) {
     })
 }
 
-var currentlyBusy = false
+let currentlyBusy = false
 function setUiBusy(isBusy) {
     currentlyBusy = isBusy
     Array.from(document.getElementsByTagName("button")).forEach(button => button.disabled = currentlyBusy)
@@ -448,8 +448,8 @@ async function openFile(overrideFolderName) {
             }
             // Open the file, passing the request ID.
             openUrl(folderName, fileName, requestId)
-        } catch (error) {
-            console.error("Decryption failed:", error)
+        } catch (e) {
+            console.error("Decryption failed:", e)
             alert("Decryption failed. Please check the folder name and password.")
         } finally {
             setUiBusy(false)
@@ -597,7 +597,14 @@ async function performSyncToDb() {
 }
 
 // Fetches all folder names from IndexedDB and displays them in the UI.
+let isListingFolders = false
 async function listFolders() {
+    if (isListingFolders) {
+        console.log("Folder listing already in progress. Skipping.")
+        return
+    }
+
+    isListingFolders = true
     try {
         const db = await getDb()
         const transaction = db.transaction(FOLDERS_SN, "readonly")
@@ -605,24 +612,24 @@ async function listFolders() {
         const allFolders = await promisifyRequest(store.getAll())
 
         const folderList = document.getElementById("folderList")
-        const fragment = document.createDocumentFragment()
+        folderList.innerHTML = "" // Clear the current list.
 
+        const fragment = document.createDocumentFragment()
         allFolders.sort((a, b) => a.id.localeCompare(b.id))
 
-        // Append items to the fragment (this is cheap and doesn't touch the live DOM)
         allFolders.forEach(folder => {
             const li = document.createElement("li")
             li.textContent = folder.encryptionType === "pdf" ? `[Locked] ${folder.id}` : folder.id
             fragment.appendChild(li)
         })
-
-        // Append the entire fragment to the DOM in one single, efficient operation
         folderList.appendChild(fragment)
-    } catch (error) {
-        console.error("Failed to list folders:", error)
-        // Optionally, display an error to the user in the UI.
+
+    } catch (e) {
+        console.error("Failed to list folders:", e)
         const folderList = document.getElementById("folderList")
         folderList.innerHTML = "<li>Error loading folders ):</li>"
+    } finally {
+        isListingFolders = false
     }
 }
 
@@ -667,8 +674,8 @@ async function deleteFolder() {
         document.getElementById("deleteFolderName").value = ""
         // Refresh the folder list in the UI.
         await listFolders()
-    } catch (error) {
-        console.error("Transaction error:", error)
+    } catch (e) {
+        console.error("Transaction error:", e)
     } finally {
         setUiBusy(false)
     }
@@ -1030,8 +1037,8 @@ async function exportData() {
 
                     dataToExport.indexedDB[dbName] = dbExport
                     db.close()
-                } catch (error) {
-                    console.warn(`Could not export database '${dbName}'. Skipping. Reason: ${error.name} - ${error.message}`)
+                } catch (e) {
+                    console.warn(`Could not export database '${dbName}'. Skipping. Reason: ${e.name} - ${e.message}`)
                 }
             }
         }
@@ -1042,9 +1049,9 @@ async function exportData() {
         createAndDisplayDownloadLink(finalBuffer, document.getElementById("c3").parentElement, "result.cbor")
         console.log("Data export prepared.")
 
-    } catch (error) {
-        console.error("Export failed:", error)
-        alert("An error occurred during export: " + (error.message || error.name))
+    } catch (e) {
+        console.error("Export failed:", e)
+        alert("An error occurred during export: " + (e.message || e.name))
     } finally {
         setUiBusy(false)
     }
@@ -1171,12 +1178,12 @@ async function importData() {
 
             await listFolders()
             alert("Import complete!")
-        } catch (error) {
-            console.error("Import failed:", error)
-            if (error && error.name === "QuotaExceededError") {
+        } catch (e) {
+            console.error("Import failed:", e)
+            if (e && e.name === "QuotaExceededError") {
                 alert("The browser ran out of storage space during the import. Please free up disk space or manage site storage in your browser settings.")
             } else {
-                alert(`An error occurred during import: ${error.message || error.name}`)
+                alert(`An error occurred during import: ${e.message || e.name}`)
             }
         } finally {
             // Explicitly nullify the large object to signal the garbage collector.

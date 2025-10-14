@@ -272,14 +272,23 @@ self.addEventListener("install", e => {
         const cache = await caches.open(CACHE_NAME)
         const promises = APP_SHELL_FILES.map(async (url) => {
             try {
-                const response = await fetch(url, { cache: "no-store" })
+                const response = await fetch(url)
                 if (response.ok) {
                     await cache.put(url, response)
                 } else {
                     console.warn(`Skipping cache for ${url} - Status: ${response.status}`)
                 }
             } catch (error) {
-                console.warn(`Skipping cache for ${url} - Fetch failed:`, error)
+                console.warn(`Fetch failed for ${e.request.url}; trying to serve from cache.`)
+
+                // If the network request failed (e.g., user is offline), try the cache.
+                const cachedResponse = await caches.match(e.request)
+                if (cachedResponse) {
+                    return cachedResponse
+                }
+
+                // For other failed requests (images, scripts, etc.), just return an error response.
+                return new Response(null, { status: 404, statusText: "Not Found" })
             }
         })
         await Promise.all(promises)
@@ -396,6 +405,7 @@ self.addEventListener("fetch", e => {
         }
 
         // For all other requests, fall through to the network.
+        console.log(e.request)
         return fetch(e.request)
     })())
 })

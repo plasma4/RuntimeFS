@@ -11,6 +11,7 @@ const FOLDERS_SN = "Folders"
 const FILES_SN = "Files"
 const META_SN = "Metadata"
 const DB_VERSION = 2 // Ensure this matches main.js
+const FOLDER_CACHE_MAX_SIZE = 10
 
 // Application shell caching configuration.
 const CACHE_NAME = "fc" // Name for the application shell cache.
@@ -208,7 +209,10 @@ function getDb() {
  */
 function getFolderData(folderName) {
     if (folderCache.has(folderName)) {
-        return Promise.resolve(folderCache.get(folderName))
+        const data = folderCache.get(folderName)
+        folderCache.delete(folderName)
+        folderCache.set(folderName, data)
+        return Promise.resolve(data)
     }
     if (folderLoadingPromises.has(folderName)) {
         return folderLoadingPromises.get(folderName)
@@ -244,6 +248,12 @@ function getFolderData(folderName) {
             }
 
             if (folderData) {
+                if (folderCache.size >= FOLDER_CACHE_MAX_SIZE) {
+                    // Get the first (oldest) key and delete it.
+                    const oldestKey = folderCache.keys().next().value
+                    // console.log(`SW: Cache limit reached. Evicting oldest entry: ${oldestKey}`)
+                    folderCache.delete(oldestKey)
+                }
                 folderCache.set(folderName, folderData) // Cache the reconstructed data.
             }
             return folderData
@@ -416,6 +426,26 @@ self.addEventListener("message", e => {
         case "DECRYPT_KEY":
             decryptionKeyStore.set(e.data.requestId, e.data.key)
             setTimeout(() => decryptionKeyStore.delete(e.data.requestId), 30000)
+            break
+
+        case "PREPARE_FOR_IMPORT":
+            console.log("SW: Received PREPARE_FOR_IMPORT. Closing DB and clearing caches.")
+            // Clear all in-memory state
+            folderCache.clear()
+            folderLoadingPromises.clear()
+            ruleStore.clear()
+            decryptionKeyStore.clear()
+
+            // Close the database connection to release the lock
+            if (dbPromise) {
+                dbPromise.then(db => db.close())
+                dbPromise = null // Nullify the promise to force re-initialization later
+            }
+
+            // Acknowledge completion back to the client
+            if (e.source) {
+                e.source.postMessage({ type: "IMPORT_READY" })
+            }
             break
 
         case "DB_IMPORTED":

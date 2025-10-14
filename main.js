@@ -605,19 +605,19 @@ async function listFolders() {
         const allFolders = await promisifyRequest(store.getAll())
 
         const folderList = document.getElementById("folderList")
-        folderList.innerHTML = "" // Clear the current list.
+        const fragment = document.createDocumentFragment()
 
-        // Sort the results alphabetically by ID.
         allFolders.sort((a, b) => a.id.localeCompare(b.id))
 
-        // Render the list to the DOM.
+        // Append items to the fragment (this is cheap and doesn't touch the live DOM)
         allFolders.forEach(folder => {
             const li = document.createElement("li")
-            // Add a visual indicator for encrypted folders.
             li.textContent = folder.encryptionType === "pdf" ? `[Locked] ${folder.id}` : folder.id
-            folderList.appendChild(li)
+            fragment.appendChild(li)
         })
 
+        // Append the entire fragment to the DOM in one single, efficient operation
+        folderList.appendChild(fragment)
     } catch (error) {
         console.error("Failed to list folders:", error)
         // Optionally, display an error to the user in the UI.
@@ -954,7 +954,6 @@ async function processAndStoreFolder(name, files, encryptionType = null) {
  */
 async function exportData() {
     const password = prompt("Enter an optional password to encrypt the export; leave blank for a plaintext export:")
-    const skipRuntimeFS = !document.getElementById("c4").checked
     setUiBusy(true)
 
     try {
@@ -977,11 +976,14 @@ async function exportData() {
             dataToExport.cookies = document.cookie
         }
 
-        if (document.getElementById("c3").checked) {
+        const exportRuntimeFS = document.getElementById("c4").checked
+        const exportIndexedDB = document.getElementById("c3").checked
+        if (exportRuntimeFS || exportIndexedDB) {
             const allDbs = await indexedDB.databases()
             for (const dbInfo of allDbs) {
                 const dbName = dbInfo.name
-                if (skipRuntimeFS && dbName === DBN) continue
+                if (!exportRuntimeFS && dbName === DBN) continue
+                else if (exportRuntimeFS && !exportIndexedDB && dbName !== DBN) continue
 
                 try {
                     const db = await new Promise((resolve, reject) => {
@@ -1057,6 +1059,11 @@ async function encryptPayload(payload, password) {
     return { type: "FS-EE", s: salt, iv: iv, p: new Uint8Array(encryptedBuffer) }
 }
 
+async function getServiceWorkerController() {
+    const registration = await navigator.serviceWorker.ready
+    return registration.active
+}
+
 async function importData() {
     const input = document.createElement("input")
     input.type = "file"
@@ -1077,13 +1084,27 @@ async function importData() {
             if (navigator.storage && navigator.storage.estimate) {
                 const estimate = await navigator.storage.estimate()
                 const availableSpace = estimate.quota - estimate.usage
-                console.log(`Available storage: ${(availableSpace / 1024 / 1024).toFixed(2)} MB`)
-                console.log(`Import file size: ${(file.size / 1024 / 1024).toFixed(2)} MB`)
 
                 if (file.size > availableSpace) {
-                    throw new Error(`Import failed: The file size (${(file.size / 1024 / 1024).toFixed(2)} MB) is larger than the available browser storage (${(availableSpace / 1024 / 1024).toFixed(2)} MB). Please free up space and try again.`)
+                    throw new Error(`Import failed: The file size (${(file.size / 1024 / 1024).toFixed(2)} MB) seems to be larger than the available browser storage (${(availableSpace / 1024 / 1024).toFixed(2)} MB). Please free up space and try again.`)
                 }
             }
+
+            const controller = await getServiceWorkerController()
+            await new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => reject(new Error("SW failed to acknowledge import preparation.")), 5000)
+
+                const messageListener = e => {
+                    if (e.data.type === "IMPORT_READY") {
+                        navigator.serviceWorker.removeEventListener("message", messageListener)
+                        clearTimeout(timeout)
+                        console.log("SW Acknowledged. Proceeding with import.")
+                        resolve()
+                    }
+                }
+                navigator.serviceWorker.addEventListener("message", messageListener)
+                controller.postMessage({ type: "PREPARE_FOR_IMPORT" })
+            })
 
             const buffer = await file.arrayBuffer()
             const decodedItems = CBOR.decodeMultiple(new Uint8Array(buffer))
@@ -1132,7 +1153,7 @@ async function importData() {
                 }
             }
 
-            if (navigator.serviceWorker.controller) {
+            if (controller) {
                 console.log("Notifying Service Worker and waiting for acknowledgment...")
                 await new Promise((resolve, reject) => {
                     const timeout = setTimeout(() => reject(new Error("SW ack timed out.")), 5000)
@@ -1144,24 +1165,12 @@ async function importData() {
                         }
                     }
                     navigator.serviceWorker.addEventListener("message", messageListener)
-                    navigator.serviceWorker.controller.postMessage({ type: "DB_IMPORTED" })
+                    controller.postMessage({ type: "DB_IMPORTED" })
                 })
             }
 
-            // Forcibly unregister the service worker to guarantee a clean slate.
-            console.log("Unregistering active service worker to ensure a clean start.")
-            const reg = await navigator.serviceWorker.getRegistration()
-            if (reg) {
-                const unregistered = await reg.unregister()
-                if (unregistered) {
-                    console.log("Service worker unregistered successfully.")
-                } else {
-                    console.warn("Service worker unregistration failed.")
-                }
-            }
-
             await listFolders()
-            alert("Import complete! Please reload the page.")
+            alert("Import complete!")
         } catch (error) {
             console.error("Import failed:", error)
             if (error && error.name === "QuotaExceededError") {

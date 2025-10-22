@@ -6,6 +6,10 @@ if($_COOKIE["cookie"]=="1"){echo'
 font-family: monospace;
 }
 
+body {
+cursor: default;
+}
+
 a {
 color: #bbb;
 }
@@ -109,28 +113,11 @@ alert("An unhandled rejection error occurred: " + reason)
 <input type="file" id="folderUploadFallbackInput" webkitdirectory directory style="display: none">
 <hr>
 <label for="openFolderName">Folder to Open:</label>
-<input type="text" id="openFolderName" placeholder="Enter a valid folder...">
+<input type="text" id="openFolderName" placeholder="Enter folder name...">
 <label for="fileName" placeholder="File name...">File:</label>
 <input type="text" id="fileName" value="index.html">
 <button onclick="openFile()">Open</button>
 <button onclick="syncAndOpenFile()">Sync Folder & Open</button>
-</fieldset>
-
-<fieldset>
-<legend>
-<h2>Create Encrypted Folders</h2>
-</legend>
-<label for="encryptFolderName">Folder Name:</label>
-<input type="text" id="encryptFolderName" placeholder="Enter a name...">
-<br>
-<label for="k">Public Key:</label>
-<input type="password" id="k" placeholder="Paste public key...">
-<button onclick="useK()">Encrypt with Key</button>
-<button id="generateBtn">Generate New Key Pair</button>
-<br>
-<label for="password">Password:</label>
-<input type="password" id="password" placeholder="Enter password...">
-<button onclick="uploadAndEncryptWithPassword()">Encrypt with Password</button>
 </fieldset>
 
 <fieldset>
@@ -147,11 +134,14 @@ alert("An unhandled rejection error occurred: " + reason)
 <input type="text" id="deleteFolderName" placeholder="Enter folder name...">
 <button onclick="deleteFolder()">Delete</button>
 </div>
+<div></div>
 <div>
 <strong>Import / Export:</strong><br>
 <button onclick="importData()">Import Data...</button>
 <hr>
 <button onclick="exportData()">Export Data...</button><br>
+</div>
+<div>
 <input type="checkbox" id="c1"><label for="c1">Cookies</label><br>
 <input type="checkbox" id="c2" checked><label for="c2">localStorage</label><br>
 <input type="checkbox" id="c3" checked><label for="c3">IndexedDB</label><br>
@@ -164,24 +154,32 @@ alert("An unhandled rejection error occurred: " + reason)
 <legend>
 <h2>Advanced</h2>
 </legend>
-Regex replacement: spaces around the operator are required. The * character matches all files.
+<h3>Regex Replacement</h3>
+Spaces required; only works on files below 4MB.
 <ul>
 <li><code>file.js | regexHere -> replacement</code> (Global Regex)</li>
 <li><code>file.js $ plain text -> replacement</code> (Global Plain Text)</li>
 <li><code>file.js || singleRegex -> replacement</code> (First Match Regex)</li>
 <li><code>file.js $$ single plain text -> replacement</code> (First Match Plain Text)</li>
 </ul>
-<textarea id="regex" rows="8" cols="60" placeholder="Enter rules here..."></textarea>
-<br>
-Custom headers: override the default headers for network requests.
+<textarea id="regex" rows="5" cols="40" placeholder="Enter rules here..."></textarea>
+<hr>
+<h3>Custom Headers</h3>
 <ul>
-<li><code># Either select all filers or specific types</code></li>
+<li><code># Override the default headers for network requests.</code></li>
 <li><code>* -> X-Frame-Options: DENY</code></li>
 <li><code>*.html -> Content-Security-Policy: default-src \'self\'; worker-src \'self\' blob:;</code></li>
 </ul>
-<textarea id="headers" rows="8" cols="60"
-placeholder="Enter headers here..."></textarea>
+<textarea id="headers" rows="5" cols="40" placeholder="Enter headers here..."></textarea>
+<hr>
+<h3>Encrypt Folders</h3>
+You can encrypt a folder to a bunch of files (will not work in all browsers).
+<br><br>
+<label for="encryptFolderName">Folder Name:</label>
+<input type="text" id="encryptFolderName" placeholder="Enter a name...">
+<br>
+<button onclick="uploadAndEncryptWithPassword()">Password Encrypt Folder (stays in browser)</button>
+<button onclick="encryptAndSaveFolderWithPassword()">Password Encrypt Folder (exports locally)</button>
 </fieldset>';}else{
-    echo'<input style="opacity:0;cursor:default;width:300px;
-    height:60px;"></input>';//invisible input a bit below the header text for mobile users
+echo'<input style="opacity:0;cursor:default;width:300px;height:60px;"></input>';//invisible input a bit below the header text for mobile users
 }?></body></html>

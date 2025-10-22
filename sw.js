@@ -10,13 +10,17 @@ const DBN = "FileCacheDB"
 const FOLDERS_SN = "Folders"
 const FILES_SN = "Files"
 const META_SN = "Metadata"
-const DB_VERSION = 2 // Ensure this matches main.js
+const DB_VERSION = 3
 const FOLDER_CACHE_MAX_SIZE = 10
 
 // Application shell caching configuration.
 const CACHE_NAME = "fc" // Name for the application shell cache.
 // Core files that make up the application's shell.
-const APP_SHELL_FILES = ["./", "./index.php", "./index.html", "./main.js"]
+const APP_SHELL_FILES = ["./", "./index.php", "./index.html", "./main.js", "./cbor-x.js"]
+
+const FULL_APP_SHELL_URLS = APP_SHELL_FILES.map(file => new URL(file, self.location.href).href)
+
+const BASE_PATH_URL = new URL('./', self.location.href).href
 
 // Promise for the IndexedDB connection.
 let dbPromise = null
@@ -48,17 +52,6 @@ function promisifyTransaction(transaction) {
         transaction.onerror = () => reject(transaction.error)
         transaction.onabort = () => reject(transaction.error || new DOMException("Transaction aborted"))
     })
-}
-
-/**
- * Generates a SHA-1 hash of an ArrayBuffer. Used for creating ETags.
- * @param {ArrayBuffer} buffer The buffer to hash.
- * @returns {Promise<string>} A promise resolving with the hex-encoded hash.
- */
-async function generateETag(buffer) {
-    const hashBuffer = await crypto.subtle.digest("SHA-1", buffer)
-    const hashArray = Array.from(new Uint8Array(hashBuffer))
-    return hashArray.map(b => b.toString(16).padStart(2, "0")).join("")
 }
 
 /**
@@ -183,6 +176,12 @@ function getDb() {
                     const fileStore = db.createObjectStore(FILES_SN, { autoIncrement: true })
                     fileStore.createIndex("folder", ["folderName", "path"], { unique: true })
                 }
+                if (!db.objectStoreNames.contains("FileChunks")) {
+                    const chunkStore = db.createObjectStore("FileChunks", { keyPath: "id", autoIncrement: true })
+                    // Index this by fileId so we can quickly find all chunks for a file.
+                    chunkStore.createIndex("by_file", "fileId", { unique: false })
+                }
+
                 if (!db.objectStoreNames.contains(META_SN)) {
                     db.createObjectStore(META_SN, { keyPath: "id" })
                 }
@@ -202,18 +201,14 @@ function getDb() {
     return dbPromise
 }
 
-/**
- * Retrieves folder data, using cache or fetching from IndexedDB.
- * @param {string} folderName The name of the folder.
- * @returns {Promise<object | undefined>} A promise resolving with folder data or undefined.
- */
-function getFolderData(folderName) {
+async function getFolderData(folderName) {
     if (folderCache.has(folderName)) {
         const data = folderCache.get(folderName)
         folderCache.delete(folderName)
         folderCache.set(folderName, data)
         return Promise.resolve(data)
     }
+
     if (folderLoadingPromises.has(folderName)) {
         return folderLoadingPromises.get(folderName)
     }
@@ -226,39 +221,30 @@ function getFolderData(folderName) {
             const fileStore = transaction.objectStore(FILES_SN)
             const fileIndex = fileStore.index("folder")
 
-            // 1. Get the folder metadata
             const folderMetadata = await promisifyRequest(folderStore.get(folderName))
-            if (!folderMetadata) {
-                // Folder doesn't exist at all
-                return undefined
-            }
+            if (!folderMetadata) return undefined
 
-            // 2. Get all files associated with this folder
-            const fileRange = IDBKeyRange.bound([folderName, ""], [folderName, "\uffff"])
-            const filesArray = await promisifyRequest(fileIndex.getAll(fileRange))
+            const filesArray = await promisifyRequest(fileIndex.getAll(IDBKeyRange.bound([folderName, ""], [folderName, "\uffff"])))
 
-            // 3. Reconstruct the folder object format that the rest of the code expects
+            // Reconstruct the folder object with a map of path -> metadata.
             const folderData = {
-                ...folderMetadata, // id, encryptionType, etc.
-                files: {}
+                ...folderMetadata,
+                files: new Map() // Use a Map for easier lookups.
             }
 
             for (const fileRecord of filesArray) {
-                folderData.files[fileRecord.path] = fileRecord.content
+                folderData.files.set(fileRecord.path, fileRecord)
             }
 
-            if (folderData) {
-                if (folderCache.size >= FOLDER_CACHE_MAX_SIZE) {
-                    // Get the first (oldest) key and delete it.
-                    const oldestKey = folderCache.keys().next().value
-                    // console.log(`SW: Cache limit reached. Evicting oldest entry: ${oldestKey}`)
-                    folderCache.delete(oldestKey)
-                }
-                folderCache.set(folderName, folderData) // Cache the reconstructed data.
+            // Manage the in-memory cache.
+            if (folderCache.size >= FOLDER_CACHE_MAX_SIZE) {
+                const oldestKey = folderCache.keys().next().value
+                folderCache.delete(oldestKey)
             }
+            folderCache.set(folderName, folderData)
             return folderData
         } finally {
-            folderLoadingPromises.delete(folderName) // Clean up loading state.
+            folderLoadingPromises.delete(folderName)
         }
     })()
 
@@ -365,7 +351,8 @@ self.addEventListener("fetch", e => {
     // Handle GET requests for the app shell and virtual files
     e.respondWith((async () => {
         // First, handle requests for the application shell (cached).
-        if (APP_SHELL_FILES.includes(url.pathname)) {
+        const requestUrl = e.request.url
+        if (requestUrl === BASE_PATH_URL || FULL_APP_SHELL_URLS.includes(requestUrl)) {
             const cachedResponse = await caches.match(e.request)
             return cachedResponse || fetch(e.request)
         }
@@ -384,7 +371,7 @@ self.addEventListener("fetch", e => {
             const response = await generateResponseForVirtualFile(folderName, filePath, requestData, e)
 
             // SPA Fallback: If a navigation request fails, try serving index.html.
-            if (response.status === 404 && e.request.mode === "navigate") {
+            if (response.status === 404 && e.request.mode === "navigate" && filePath !== "index.html") {
                 console.log(`'${filePath}' not found. Attempting SPA fallback to index.html.`)
                 const fallbackResponse = await generateResponseForVirtualFile(folderName, "index.html", requestData, e)
                 return fallbackResponse.status === 200 ? fallbackResponse : response
@@ -405,16 +392,19 @@ self.addEventListener("fetch", e => {
         }
 
         // For all other requests, fall through to the network.
-        console.log(e.request)
-        return fetch(e.request)
+        try {
+            var f = await fetch(e.request)
+        } catch (err) {
+            return new Response(null, { status: 404, statusText: "Couldn't find file content." })
+        }
+        return f
     })())
 })
 
 self.addEventListener("message", e => {
     if (!e.data) return
-
     switch (e.data.type) {
-        case "CUSTOMRULES":
+        case "CUSTOM_RULES":
             ruleStore.set(e.data.requestId, {
                 regex: e.data.rules,
                 headers: e.data.headers
@@ -427,6 +417,7 @@ self.addEventListener("message", e => {
             if (folderName) {
                 console.log(`SW: Invalidating cache for: ${folderName}`)
                 folderCache.delete(folderName)
+                folderLoadingPromises.delete(folderName)
                 if (e.source) {
                     e.source.postMessage({ type: "CACHE_INVALIDATED", folderName: folderName })
                 }
@@ -439,23 +430,21 @@ self.addEventListener("message", e => {
             break
 
         case "PREPARE_FOR_IMPORT":
-            console.log("SW: Received PREPARE_FOR_IMPORT. Closing DB and clearing caches.")
-            // Clear all in-memory state
-            folderCache.clear()
-            folderLoadingPromises.clear()
-            ruleStore.clear()
-            decryptionKeyStore.clear()
+            (async function () {
+                console.log("SW: Acquired import lock. Closing DB.")
+                folderCache.clear()
+                folderLoadingPromises.clear()
 
-            // Close the database connection to release the lock
-            if (dbPromise) {
-                dbPromise.then(db => db.close())
-                dbPromise = null // Nullify the promise to force re-initialization later
-            }
+                if (dbPromise) {
+                    const db = await dbPromise
+                    db.close()
+                    dbPromise = null
+                }
 
-            // Acknowledge completion back to the client
-            if (e.source) {
-                e.source.postMessage({ type: "IMPORT_READY" })
-            }
+                if (e.source) {
+                    e.source.postMessage({ type: "IMPORT_READY" })
+                }
+            })()
             break
 
         case "DB_IMPORTED":
@@ -474,149 +463,188 @@ self.addEventListener("message", e => {
     }
 })
 
-/**
- * Generates an HTTP response for a requested virtual file. Handles decryption,
- * custom rules, Range requests, MIME types, ETags, and security headers.
- * @param {string} folderName The decoded name of the virtual folder.
- * @param {string} requestedFilePath The decoded path of the requested file.
- *- * @param {object} requestData An object containing { regex, headers } strings.
- * @param {FetchEvent} event The original fetch event object.
- * @returns {Promise<Response>} A promise resolving with the HTTP Response.
- */
 async function generateResponseForVirtualFile(folderName, requestedFilePath, requestData, event) {
-    const rules = requestData ? requestData.regex : null
-    const customHeadersRules = requestData ? requestData.headers : ""
-    const parsedCustomHeaders = parseCustomHeaders(customHeadersRules) // You need the parseCustomHeaders helper for this
-
     const decodedFolderName = decodeURIComponent(folderName)
     let decodedFilePath = decodeURIComponent(requestedFilePath)
 
-    const requestId = new URL(event.request.url).searchParams.get("reqId")
-    const decryptionKey = requestId ? decryptionKeyStore.get(requestId) : null
-    if (decryptionKey) decryptionKeyStore.delete(requestId)
-
     const folderData = await getFolderData(decodedFolderName)
     if (!folderData || !folderData.files) {
-        console.warn(`Folder not found: ${decodedFolderName}`)
         return new Response("Folder not found: " + decodedFolderName, { status: 404 })
     }
 
-    let filePath = decodedFilePath
-    if (!filePath) {
-        if (folderData.files["index.html"]) filePath = "index.html"
-        else if (folderData.files["index.php"]) filePath = "index.php"
+    // Handle empty path / SPA fallback.
+    if (!decodedFilePath) {
+        if (folderData.files.has("index.html")) decodedFilePath = "index.html"
+        else if (folderData.files.has("index.php")) decodedFilePath = "index.php"
     }
 
-    let fileData = folderData.files[filePath]
-    let foundPath = filePath
+    let fileMetadata = folderData.files.get(decodedFilePath)
 
-    if (!fileData && event.request.referrer) {
-        const refererUrl = new URL(event.request.referrer)
-        const basePath = refererUrl.pathname.substring(0, refererUrl.pathname.lastIndexOf("/"))
+    if (!fileMetadata) {
+        return new Response("File not found: " + requestedFilePath, { status: 404 })
+    }
 
-        const pathParts = (basePath + "/" + filePath).split("/")
-        const resolvedParts = []
-        for (const part of pathParts) {
-            if (part === "." || part === "") continue
-            if (part === "..") {
-                resolvedParts.pop()
-            } else {
-                resolvedParts.push(part)
+    const requestId = new URL(event.request.url).searchParams.get("reqId")
+    const decryptionKey = decryptionKeyStore.get(requestId)
+    if (requestId) decryptionKeyStore.delete(requestId)
+
+    let fileBuffer = null
+    let fileType = fileMetadata.type || getMimeType(decodedFilePath) || "application/octet-stream"
+    const isSmallFile = fileMetadata.content?.isBufferCached === true
+
+    // Check if regex rules are active and apply to this file.
+    const hasActiveRegex = requestData.regex && doesRegexApplyToFile(decodedFilePath, requestData.regex)
+
+    // If there's a decryption key or an active regex rule, we MUST load the full file into memory.
+    // Case 1: Decryption or Regex is active. We MUST load the full file into a buffer.
+    if (decryptionKey || hasActiveRegex) {
+        let bufferToProcess = null
+
+        if (fileMetadata.content) { // It's a small file, buffer is ready.
+            bufferToProcess = fileMetadata.content.buffer
+        } else if (fileMetadata.size) { // It's a large file, we must reassemble it from chunks.
+            const db = await getDb()
+            bufferToProcess = await reassembleFileFromChunks(db, fileMetadata.id)
+        }
+
+        if (!(bufferToProcess instanceof ArrayBuffer)) {
+            return new Response("Could not find file content for processing rules.", { status: 500 })
+        }
+
+        // If a key exists, decrypt the buffer we just loaded.
+        if (decryptionKey) {
+            try {
+                // The IV is stored with the data for encrypted files.
+                const iv = bufferToProcess.slice(0, 12)
+                const data = bufferToProcess.slice(12)
+                bufferToProcess = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, decryptionKey, data)
+            } catch (e) {
+                console.error("SW Decryption failed:", e)
+                return new Response("Decryption failed. The password may be incorrect.", { status: 403 })
             }
         }
-        // Re-join and remove the leading "/n/folderName" part
-        const resolvedPath = resolvedParts.slice(3).join("/")
-        if (folderData.files[resolvedPath]) {
-            fileData = folderData.files[resolvedPath]
-            foundPath = resolvedPath
+
+        // Now that we have the final, plaintext buffer, apply regex and serve.
+        let finalBuffer = applyRegexRules(decodedFilePath, bufferToProcess, fileType, requestData.regex)
+        const headers = applyCustomHeaders({ "Content-Type": fileType, "Content-Length": finalBuffer.byteLength }, decodedFilePath, requestData.headers)
+        return new Response(finalBuffer, { headers })
+    }
+
+    // Case 2: It's a standard small file with no special rules. Serve the buffer directly.
+    if (fileMetadata.content) {
+        const fileBuffer = fileMetadata.content.buffer
+        if (!(fileBuffer instanceof ArrayBuffer)) {
+            console.error(`Error: Invalid content for ${decodedFilePath}. Expected ArrayBuffer.`)
+            return new Response("Invalid file content in database.", { status: 500 })
         }
+        const headers = applyCustomHeaders({ "Content-Type": fileType, "Content-Length": fileBuffer.byteLength }, decodedFilePath, requestData.headers)
+        return new Response(fileBuffer, { headers })
     }
 
+    // Case 3: It's a standard large file with no special rules. Stream it.
+    if (fileMetadata.size) {
+        const stream = new ReadableStream({
+            start(controller) {
+                getDb().then(db => {
+                    const transaction = db.transaction("FileChunks", "readonly")
+                    const chunkStore = transaction.objectStore("FileChunks")
+                    const index = chunkStore.index("by_file")
+                    const cursorReq = index.openCursor(IDBKeyRange.only(fileMetadata.id))
 
-    if (!fileData) {
-        // Only use the SPA fallback as a last resort for navigation requests.
-        if (event.request.mode === "navigate" && folderData.files["index.html"]) {
-            console.log(`'${filePath}' not found. Attempting SPA fallback to index.html.`)
-            fileData = folderData.files["index.html"]
-            foundPath = "index.html"
-        } else {
-            return new Response("File not found: " + decodedFilePath, { status: 404 })
-        }
-    }
-
-    let fileBuffer = fileData.buffer
-
-    // Decrypt, apply regex rules
-    if (decryptionKey && foundPath !== ".metadata") {
-        try {
-            const iv = fileBuffer.slice(0, 12)
-            const encryptedData = fileBuffer.slice(12)
-            fileBuffer = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, decryptionKey, encryptedData)
-        } catch (e) {
-            console.error(`Decryption failed for ${foundPath}:`, e)
-            return new Response("Decryption Failed. Bad password?", { status: 401 })
-        }
-    }
-
-    const contentType = getMimeType(foundPath) || fileData.type || "application/octet-stream"
-    const modifiedBuffer = applyRegexRules(foundPath, fileBuffer, contentType, rules)
-    const totalSize = modifiedBuffer.byteLength
-
-    const headers = {
-        "Content-Type": contentType,
-        "Cache-Control": "public, max-age=0, must-revalidate", // ETag-friendly caching policy
-        "Accept-Ranges": "bytes",
-        "ETag": await generateETag(modifiedBuffer)
-    }
-
-    // Specific default headers based on file type
-    const extension = foundPath.split(".").pop().toLowerCase()
-    const fontExtensions = ["woff", "woff2", "ttf", "otf", "eot"]
-    if (fontExtensions.includes(extension)) {
-        headers["Access-Control-Allow-Origin"] = "*"
-    }
-
-    // Custom header overrides
-    parsedCustomHeaders.forEach(rule => {
-        if (rule.regex.test(foundPath)) {
-            console.log(`Applying custom header to ${foundPath}: ${rule.header}`)
-            headers[rule.header] = rule.value
-        }
-    })
-
-    const ifNoneMatch = event.request.headers.get("if-none-match")
-    if (ifNoneMatch && ifNoneMatch === headers["ETag"]) {
-        console.log(`ETag match for ${foundPath}. Serving 304 Not Modified.`)
-        return new Response(null, { status: 304, headers })
-    }
-
-    const rangeHeader = event.request.headers.get("range")
-    if (rangeHeader) {
-        const rangeMatch = rangeHeader.match(/bytes=(\d+)-(\d*)/)
-        if (rangeMatch) {
-            const start = Number(rangeMatch[1])
-            let end = rangeMatch[2] ? Number(rangeMatch[2]) : totalSize - 1
-
-            if (start < totalSize && start <= end) {
-                end = Math.min(end, totalSize - 1) // Clamp end to file size
-                const chunk = modifiedBuffer.slice(start, end + 1)
-                headers["Content-Length"] = chunk.byteLength
-                headers["Content-Range"] = `bytes ${start}-${end}/${totalSize}`
-
-                return new Response(chunk, { status: 206, statusText: "Partial Content", headers })
+                    cursorReq.onsuccess = () => {
+                        const cursor = cursorReq.result
+                        if (cursor) {
+                            controller.enqueue(cursor.value.data)
+                            cursor.continue()
+                        } else {
+                            controller.close()
+                        }
+                    }
+                    transaction.onerror = e => controller.error(e.target.error)
+                }).catch(e => controller.error(e))
             }
-        }
+        })
+
+        const headers = applyCustomHeaders({
+            "Content-Type": fileType,
+            "Content-Length": fileMetadata.size
+        }, decodedFilePath, requestData.headers)
+
+        return new Response(stream, { headers })
     }
 
-    headers["Content-Length"] = totalSize
-    return new Response(modifiedBuffer, { headers })
+    // If we ended up with a buffer (from any of the logic above), apply rules and serve it.
+    if (fileBuffer !== null) {
+        if (!(fileBuffer instanceof ArrayBuffer)) {
+            console.error(`Error: Attempted to serve a file (${decodedFilePath}) but the content was not an ArrayBuffer.`, fileBuffer)
+            return new Response("Invalid file content found in cache or database.", { status: 500 })
+        }
+
+        let finalBuffer = applyRegexRules(decodedFilePath, fileBuffer, fileType, requestData.regex)
+        const headers = applyCustomHeaders({ "Content-Type": fileType, "Content-Length": finalBuffer.byteLength }, decodedFilePath, requestData.headers)
+        return new Response(finalBuffer, { headers: headers })
+    }
+
+    // Fallback for any other case
+    return new Response("Could not load file content.", { status: 500 })
 }
 
 /**
- * Parses a string of custom header rules into a structured array.
- * @param {string} rulesString The raw string from the textarea.
- * @returns {Array<object>} An array of rule objects.
+ * Reads all chunks for a file from IndexedDB and reassembles them into a single ArrayBuffer.
+ * @param {IDBDatabase} db The database instance.
+ * @param {number} fileId The primary key of the file in the FILES_SN store.
+ * @returns {Promise<ArrayBuffer>} A promise that resolves with the complete file buffer.
  */
+async function reassembleFileFromChunks(db, fileId) {
+    const transaction = db.transaction("FileChunks", "readonly")
+    const chunkStore = transaction.objectStore("FileChunks")
+    const index = chunkStore.index("by_file")
+    const allChunks = await promisifyRequest(index.getAll(IDBKeyRange.only(fileId)))
+
+    // Sort chunks by their index to ensure correct order
+    allChunks.sort((a, b) => a.index - b.index)
+
+    let totalSize = 0
+    for (const chunk of allChunks) {
+        totalSize += chunk.data.byteLength
+    }
+
+    const reassembled = new Uint8Array(totalSize)
+    let offset = 0
+    for (const chunk of allChunks) {
+        reassembled.set(new Uint8Array(chunk.data), offset)
+        offset += chunk.data.byteLength
+    }
+
+    return reassembled.buffer
+}
+
+
+/**
+ * Quickly checks if any regex rule applies to a given file path without running the replacement.
+ * @param {string} filePath The path of the file.
+ * @param {string} regexRules The full string of regex rules.
+ * @returns {boolean} True if a rule matches the file path.
+ */
+function doesRegexApplyToFile(filePath, regexRules) {
+    if (!regexRules || !regexRules.trim()) return false
+    const rules = regexRules.trim().split("\n")
+    for (const line of rules) {
+        const [matchPart] = line.split("->")
+        if (!matchPart) continue
+        const operatorMatch = matchPart.match(/^(.*?)\s(\$|\$\$|\|\||\|)\s(.*?)$/)
+        if (!operatorMatch) continue
+
+        const fileMatch = operatorMatch[1].trim()
+        const fileRegex = new RegExp(fileMatch === "*" ? ".*" : fileMatch)
+
+        if (fileRegex.test(filePath)) {
+            return true // Found a matching rule
+        }
+    }
+    return false // No rules matched
+}
+
 function parseCustomHeaders(rulesString) {
     if (!rulesString || !rulesString.trim()) {
         return []
@@ -629,10 +657,11 @@ function parseCustomHeaders(rulesString) {
         const parts = line.split("->")
         if (parts.length < 2) return
 
-        const glob = parts[0].trim()
-        const headerPart = parts.slice(1).join("->").trim()
+        const [globPart, ...headerParts] = parts
+        const glob = globPart.trim()
+        const headerLine = headerParts.join("->").trim()
 
-        const headerMatch = headerPart.match(/^([^:]+):\s*(.*)$/)
+        const headerMatch = headerLine.match(/^([^:]+):\s*(.*)$/)
         if (!headerMatch) return
 
         const [, headerName, headerValue] = headerMatch
@@ -647,4 +676,20 @@ function parseCustomHeaders(rulesString) {
         })
     })
     return rules
+}
+
+function applyCustomHeaders(baseHeaders, filePath, rulesString) {
+    if (!rulesString) {
+        return baseHeaders
+    }
+
+    const customHeaderRules = parseCustomHeaders(rulesString)
+
+    for (const rule of customHeaderRules) {
+        if (rule.regex.test(filePath)) {
+            baseHeaders[rule.header] = rule.value
+        }
+    }
+
+    return baseHeaders
 }

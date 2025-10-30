@@ -306,7 +306,7 @@ self.addEventListener("fetch", e => {
             if (refererUrl.origin === self.location.origin && refererUrl.pathname.startsWith("/n/")) {
                 const pathParts = refererUrl.pathname.split("/").slice(2)
                 // Asset requests from a page won't have custom rules, so we pass an empty object.
-                return generateResponseForVirtualFile(pathParts[0], url.pathname.substring(1), {}, e)
+                return generateResponseForVirtualFile(pathParts[0], url.pathname.substring(1), e, null)
             }
         }
 
@@ -556,6 +556,7 @@ async function generateResponseForVirtualFile(folderName, requestedFilePath, eve
     let fileMetadata = await promisifyRequest(index.get([decodedFolderName, decodedFilePath]))
 
     // SPA fallback
+    console.log(event)
     if (!fileMetadata && event.request.mode === "navigate") {
         fileMetadata = await promisifyRequest(index.get([decodedFolderName, "index.html"]))
     }

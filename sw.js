@@ -2,14 +2,12 @@
 const ruleStore = new Map()
 // Temporary storage for decryption keys, keyed by request ID. Keys expire after 30 seconds.
 const decryptionKeyStore = new Map()
-const clientRulesCache = new Map()
 
 const DBN = "FileCacheDB"
 const FOLDERS_SN = "Folders"
 const FILES_SN = "Files"
-const META_SN = "Metadata"
 const RULES_SN = "Rules"
-const DB_VERSION = 10 // Version 1.0
+const DB_VERSION = 11 // Version 1.1
 
 const CACHE_NAME = "fc"
 const APP_SHELL_FILES = ["./", "./index.html", "./main.js", "./cbor-x.js"] // core files
@@ -177,28 +175,44 @@ function getDb() {
     if (!dbPromise) {
         dbPromise = new Promise((resolve, reject) => {
             const request = indexedDB.open(DBN, DB_VERSION)
+
             request.onupgradeneeded = function (e) {
                 const db = e.target.result
-                if (!db.objectStoreNames.contains(RULES_SN)) {
-                    db.createObjectStore(RULES_SN, { keyPath: "id" })
-                }
+                const transaction = e.target.transaction
+
+                // Create standard stores if they don't exist
                 if (!db.objectStoreNames.contains(FOLDERS_SN)) {
                     db.createObjectStore(FOLDERS_SN, { keyPath: "id" })
                 }
-                if (!db.objectStoreNames.contains(FILES_SN)) {
-                    const fileStore = db.createObjectStore(FILES_SN, { keyPath: "id", autoIncrement: true })
-                    fileStore.createIndex("folder", ["folderName", "path"], { unique: true })
+                if (!db.objectStoreNames.contains(RULES_SN)) {
+                    db.createObjectStore(RULES_SN, { keyPath: "id" })
                 }
+
+                let fileStore
+                if (!db.objectStoreNames.contains(FILES_SN)) {
+                    fileStore = db.createObjectStore(FILES_SN, { keyPath: "id", autoIncrement: true })
+                } else {
+                    fileStore = transaction.objectStore(FILES_SN)
+                }
+
+                if (!fileStore.indexNames.contains("lookup")) {
+                    fileStore.createIndex("lookup", "lookupPath", { unique: true })
+                }
+
                 if (!db.objectStoreNames.contains("FileChunks")) {
                     const chunkStore = db.createObjectStore("FileChunks", { keyPath: "id", autoIncrement: true })
                     chunkStore.createIndex("by_file", "fileId", { unique: false })
                 }
             }
+
             request.onsuccess = e => {
-                const db = e.target.result
+                db = e.target.result
                 db.onversionchange = () => {
-                    console.warn("Database version change requested, closing connection.")
-                    db.close()
+                    console.warn("Database version change detected, closing connection.")
+                    if (db) {
+                        db.close()
+                    }
+                    db = null
                     dbPromise = null
                 }
                 resolve(db)
@@ -250,7 +264,7 @@ self.addEventListener("fetch", e => {
     const url = new URL(e.request.url)
     if (url.origin !== self.location.origin) return
 
-    if ((e.request.method === "POST" || e.request.method === "PUT") && url.pathname.startsWith("/n/")) {
+    if ((e.request.method === "POST" || e.request.method === "PUT") && url.pathname.startsWith(virtualPathPrefix)) {
         e.respondWith((async () => {
             try {
                 const pathParts = url.pathname.split("/").slice(2)
@@ -261,16 +275,15 @@ self.addEventListener("fetch", e => {
                 const db = await getDb()
                 const transaction = db.transaction([FILES_SN], "readwrite")
                 const fileStore = transaction.objectStore(FILES_SN)
-                const index = fileStore.index("folder")
+                const index = fileStore.index("lookup")
 
-                const fileRecord = await promisifyRequest(index.get([folderName, filePath]))
+                const fileRecord = await promisifyRequest(index.get(`${folderName}/${filePath}`))
                 const newRecord = {
                     folderName: folderName,
                     path: filePath,
-                    content: {
-                        buffer: newContent,
-                        type: e.request.headers.get("content-type") || "application/octet-stream"
-                    }
+                    buffer: new Blob([newContent]),
+                    type: e.request.headers.get("content-type") || "application/octet-stream",
+                    lookupPath: `${folderName}/${filePath}`
                 }
                 if (fileRecord) newRecord.id = fileRecord.id
 
@@ -284,33 +297,41 @@ self.addEventListener("fetch", e => {
         return
     }
 
-    // Main GET request handler
     e.respondWith((async () => {
         if (FULL_APP_SHELL_URLS.includes(e.request.url)) {
             return caches.match(e.request).then(res => res || fetch(e.request))
         }
 
-        if (url.pathname.startsWith(virtualPathPrefix)) {
-            const virtualPath = url.pathname.substring(virtualPathPrefix.length)
+        const requestPath = url.pathname
+
+        const isVirtualFileNav = e.request.mode === "navigate" && requestPath.startsWith(virtualPathPrefix)
+
+        // Use basic loader for first load
+        if (isVirtualFileNav && e.request.url !== e.request.referrer) {
+            return new Response("<!DOCTYPE html><script>window.location.replace(window.location.href)<\/script></html>", { headers: { "Content-Type": "text/html" } })
+        }
+
+        if (requestPath.startsWith(virtualPathPrefix)) {
+            // Check the runtime cache first for this resource.
+            const cache = await caches.open(CACHE_NAME)
+            const cachedResponse = await cache.match(e.request)
+            if (cachedResponse) {
+                return cachedResponse
+            }
+
+            // If not in cache, generate it from the DB.
+            const virtualPath = requestPath.substring(virtualPathPrefix.length)
             const pathParts = virtualPath.split("/")
             const folderName = pathParts[0]
             const filePath = pathParts.slice(1).join("/")
             const requestId = url.searchParams.get("reqId")
-            return generateResponseForVirtualFile(folderName, filePath, e, requestId)
-        }
 
-        // Now handle asset requests originating from virtual pages.
-        const referer = e.request.referrer
-        if (referer) {
-            const refererUrl = new URL(referer)
-            if (refererUrl.origin === self.location.origin && refererUrl.pathname.startsWith("/n/")) {
-                const pathParts = refererUrl.pathname.split("/").slice(2)
-                // Asset requests from a page won't have custom rules, so we pass an empty object.
-                return generateResponseForVirtualFile(pathParts[0], url.pathname.substring(1), e, null)
+            if (folderName && filePath) {
+                return generateResponseForVirtualFile(folderName, filePath, e, requestId)
             }
         }
 
-        // For all other requests, fall through to the network.
+        // For any other request, fall back to the network.
         return fetch(e.request).catch(() => new Response("Network error", { status: 500 }))
     })())
 })
@@ -318,12 +339,18 @@ self.addEventListener("fetch", e => {
 self.addEventListener("message", e => {
     if (!e.data) return
     switch (e.data.type) {
-        case "CUSTOM_RULES":
+        case "SET_RULES":
             ruleStore.set(e.data.requestId, {
                 regex: e.data.rules,
                 headers: e.data.headers
             })
             setTimeout(() => ruleStore.delete(e.data.requestId), STORE_ENTRY_TTL)
+            if (e.source) {
+                e.source.postMessage({
+                    type: "RULES_READY",
+                    requestId: e.data.requestId
+                })
+            }
             break
 
         case "INVALIDATE_CACHE":
@@ -373,24 +400,6 @@ self.addEventListener("message", e => {
                 }
                 if (e.source) {
                     e.source.postMessage({ type: "IMPORT_READY" })
-                }
-            })()
-            break
-
-        case "DB_IMPORTED":
-            (async function () {
-                console.log("SW: Received DB_IMPORTED, re-initializing connection.")
-                dbPromise = null // Force re-initialization
-                try {
-                    await getDb() // Proactively create a new connection and wait for it
-                    console.log("SW: DB connection re-established.")
-                } catch (error) {
-                    console.error("SW: Failed to re-establish DB connection post-import:", error)
-                } finally {
-                    // Always acknowledge, even on failure, to unblock the main thread.
-                    if (e.source) {
-                        e.source.postMessage({ type: "DB_ACKNOWLEDGED" })
-                    }
                 }
             })()
             break
@@ -539,90 +548,93 @@ function applyCustomHeaders(baseHeaders, filePath, rulesString) {
     return baseHeaders
 }
 
-// Actually creates a response based on a request.
-async function generateResponseForVirtualFile(folderName, requestedFilePath, event, requestId) {
+async function generateResponseForVirtualFile(folderName, requestedFilePath, event, requestId, cacheKey) {
     const decodedFolderName = decodeURIComponent(folderName)
     let decodedFilePath = decodeURIComponent(requestedFilePath)
 
     if (!decodedFilePath || decodedFilePath.endsWith("/")) {
-        decodedFilePath += "index.html"
+        decodedFilePath = (decodedFilePath || "") + "index.html"
     }
 
     const db = await getDb()
-    const transaction = db.transaction([FILES_SN, "FileChunks", FOLDERS_SN, RULES_SN], "readonly")
-    const fileStore = transaction.objectStore(FILES_SN)
-    const index = fileStore.index("folder")
+    const transaction = db.transaction([FILES_SN, FOLDERS_SN], "readonly")
 
-    let fileMetadata = await promisifyRequest(index.get([decodedFolderName, decodedFilePath]))
+    const fileMetadataPromise = (async () => {
+        const index = transaction.objectStore(FILES_SN).index("lookup")
+        const lookupKey = `${decodedFolderName}/${decodedFilePath}`
+        let metadata = await promisifyRequest(index.get(lookupKey))
 
-    // SPA fallback
-    console.log(event)
-    if (!fileMetadata && event.request.mode === "navigate") {
-        fileMetadata = await promisifyRequest(index.get([decodedFolderName, "index.html"]))
-    }
+        if (!metadata && event.request.mode === "navigate") {
+            const fallbackPath = "index.html"
+            const fallbackKey = `${decodedFolderName}/${fallbackPath}`
+            const fallbackMetadata = await promisifyRequest(index.get(fallbackKey))
+            if (fallbackMetadata) {
+                decodedFilePath = fallbackPath
+                metadata = fallbackMetadata
+            }
+        }
+        return metadata
+    })()
+
+    const folderDataPromise = promisifyRequest(transaction.objectStore(FOLDERS_SN).get(decodedFolderName))
+
+    const [fileMetadata, folderData] = await Promise.all([
+        fileMetadataPromise,
+        folderDataPromise
+    ])
+    const requestData = ruleStore.get(requestId) || {}
 
     if (!fileMetadata) {
         return new Response(`File not found: ${requestedFilePath}`, { status: 404 })
     }
 
-    const folderStore = transaction.objectStore(FOLDERS_SN)
-    const folderData = await promisifyRequest(folderStore.get(decodedFolderName))
-    let fileBuffer
-
-    if (folderData && folderData.encryptionType === "pdf" && requestId) {
-        const key = decryptionKeyStore.get(requestId)
-        if (!key) {
-            return new Response("Decryption key expired or not found. Please try opening the folder again.", { status: 403 })
-        }
-
-        const rawBuffer = fileMetadata.content ? fileMetadata.content.buffer : await reassembleFileFromChunks(db, fileMetadata.id)
-        if (!rawBuffer) {
-            return new Response("Could not load encrypted file content.", { status: 500 })
-        }
-
-        try {
-            const iv = rawBuffer.slice(0, 12)
-            const encryptedData = rawBuffer.slice(12)
-            fileBuffer = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, encryptedData)
-        } catch (e) {
-            console.error("SW Decryption Error:", e)
-            return new Response("Decryption failed in Service Worker. The password may be incorrect.", { status: 500 })
-        }
-    } else {
-        // This is the original path for non-encrypted files.
-        fileBuffer = fileMetadata.content ? fileMetadata.content.buffer : null
-    }
-
-    // The rest of the function now operates on the (potentially decrypted) fileBuffer
-    const ruleStore = transaction.objectStore(RULES_SN)
-    const requestData = await promisifyRequest(ruleStore.get("current_rules")) || {}
-
     const fileType = fileMetadata.type || getMimeType(decodedFilePath) || "application/octet-stream"
+    const regexApplies = doesRegexApplyToFile(decodedFilePath, requestData.regex)
+    const isEncrypted = folderData?.encryptionType === "pdf"
+
     const headers = applyCustomHeaders({ "Content-Type": fileType }, decodedFilePath, requestData.headers)
+    let response
 
-    // If regex rules apply, we must have the full buffer
-    if (doesRegexApplyToFile(decodedFilePath, requestData.regex)) {
-        // If we don't have the buffer yet (e.g., large non-encrypted file), load it now.
-        const bufferToProcess = fileBuffer !== null ? fileBuffer : await reassembleFileFromChunks(db, fileMetadata.id)
-        if (!bufferToProcess) return new Response("Could not find file content for processing.", { status: 500 })
+    const mustBuffer = regexApplies || isEncrypted
 
-        const finalBuffer = applyRegexRules(decodedFilePath, bufferToProcess, fileType, requestData.regex)
+    if (mustBuffer) {
+        let fileBuffer = fileMetadata.buffer ? await fileMetadata.buffer.arrayBuffer() : await reassembleFileFromChunks(db, fileMetadata.id)
+        if (!fileBuffer) return new Response("Could not load file content for processing.", { status: 500 })
+
+        if (isEncrypted) {
+            const key = decryptionKeyStore.get(requestId)
+            if (!key) return new Response("Decryption key expired or not found", { status: 403 })
+            try {
+                const iv = fileBuffer.slice(0, 12)
+                const encryptedData = fileBuffer.slice(12)
+                fileBuffer = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, encryptedData)
+            } catch (e) {
+                console.error("SW Decryption Error:", e)
+                return new Response("Decryption failed in Service Worker", { status: 500 })
+            }
+        }
+
+        const finalBuffer = applyRegexRules(decodedFilePath, fileBuffer, fileType, requestData.regex)
         headers["Content-Length"] = finalBuffer.byteLength
-        return new Response(finalBuffer, { headers })
+        response = new Response(finalBuffer, { headers })
+    } else {
+        if (fileMetadata.buffer) {
+            const fileBuffer = await fileMetadata.buffer.arrayBuffer()
+            headers["Content-Length"] = fileBuffer.byteLength
+            response = new Response(fileBuffer, { headers })
+        } else if (fileMetadata.size) {
+            const stream = streamFileFromChunks(db, fileMetadata.id)
+            headers["Content-Length"] = fileMetadata.size
+            response = new Response(stream, { headers })
+        } else {
+            return new Response("Could not load file content", { status: 500 })
+        }
     }
 
-    // For decrypted content, we already have the buffer, so we can respond directly.
-    if (fileBuffer) {
-        headers["Content-Length"] = fileBuffer.byteLength
-        return new Response(fileBuffer, { headers })
+    if (response.ok && !regexApplies && event.request.mode !== "navigate") {
+        const cache = await caches.open(CACHE_NAME)
+        cache.put(event.request, response.clone())
     }
 
-    // For large, chunked files (that weren't encrypted and didn't have regex), stream the response.
-    if (fileMetadata.size) {
-        headers["Content-Length"] = fileMetadata.size
-        const stream = streamFileFromChunks(db, fileMetadata.id)
-        return new Response(stream, { headers })
-    }
-
-    return new Response("Could not load file content.", { status: 500 })
+    return response
 }

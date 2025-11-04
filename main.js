@@ -3,9 +3,10 @@ const FOLDERS_SN = "Folders"
 const FILES_SN = "Files"
 const META_SN = "Metadata"
 const RULES_SN = "Rules"
-const DB_VERSION = 10 // Version 1.0
+const DB_VERSION = 11 // Version 1.1
 
 const CHUNK_SIZE = 4 * 1024 * 1024 // 4MB chunks
+const BATCH_SIZE = 50 // Batch of 50
 // Fetches all folder names from IndexedDB and displays them in the UI.
 let isListingFolders = false
 
@@ -43,11 +44,14 @@ navigator.storage.persist().then(persistent => {
 let dbPromise = null
 function getDb() {
     if (!dbPromise) {
-        // console.log("No DB connection promise, creating a new one.")
         dbPromise = new Promise((resolve, reject) => {
             const request = indexedDB.open(DBN, DB_VERSION)
+
             request.onupgradeneeded = function (e) {
                 const db = e.target.result
+                const transaction = e.target.transaction
+
+                // Create standard stores if they don't exist
                 if (!db.objectStoreNames.contains(FOLDERS_SN)) {
                     db.createObjectStore(FOLDERS_SN, { keyPath: "id" })
                 }
@@ -55,19 +59,23 @@ function getDb() {
                     db.createObjectStore(RULES_SN, { keyPath: "id" })
                 }
 
+                let fileStore
                 if (!db.objectStoreNames.contains(FILES_SN)) {
-                    const fileStore = db.createObjectStore(FILES_SN, { keyPath: "id", autoIncrement: true })
-                    // Create an index to quickly look up files by folder and path
-                    fileStore.createIndex("folder", ["folderName", "path"], { unique: true })
+                    fileStore = db.createObjectStore(FILES_SN, { keyPath: "id", autoIncrement: true })
+                } else {
+                    fileStore = transaction.objectStore(FILES_SN)
                 }
 
-                // Large files
+                if (!fileStore.indexNames.contains("lookup")) {
+                    fileStore.createIndex("lookup", "lookupPath", { unique: true })
+                }
+
                 if (!db.objectStoreNames.contains("FileChunks")) {
                     const chunkStore = db.createObjectStore("FileChunks", { keyPath: "id", autoIncrement: true })
-                    // Create an index to look up all chunks belonging to a single file
                     chunkStore.createIndex("by_file", "fileId", { unique: false })
                 }
             }
+
             request.onsuccess = e => {
                 db = e.target.result
                 db.onversionchange = () => {
@@ -98,124 +106,149 @@ async function uploadFolder() {
     const folderNameInput = document.getElementById("folderName")
     const name = folderNameInput.value.trim()
     if (!name) {
-        alert("Please enter a name for the folder.")
+        alert("Please enter a name for the folder")
         return
     }
 
-    var resetUI = true
     setUiBusy(true)
     try {
-        if (!window.showDirectoryPicker) {
+        // Modern path using File System Access API
+        if (window.showDirectoryPicker) {
+            const localDirHandle = await window.showDirectoryPicker({ mode: "read" })
+            // If the code reaches here, the user has selected a folder
+            await processFolderSelection(name, localDirHandle)
+        } else {
+            // Fallback path for other browsers like Firefox
             document.getElementById("folderUploadFallbackInput").click()
-            resetUI = false
+        }
+    } catch (err) {
+        // This catch block specifically handles cancellation of showDirectoryPicker
+        if (err.name !== "AbortError") {
+            console.error("Upload error:", err)
+            alert("An error occurred during upload: " + err.message)
+        }
+        // Always reset the UI if the main path fails or is cancelled
+    } finally {
+        setUiBusy(false)
+    }
+}
+
+async function processFolderSelection(name, handle) {
+    dirHandle = handle
+    folderName = name
+    let files = {}
+
+    // Check for manifest.enc to determine if the folder is encrypted
+    try {
+        const manifestHandle = await handle.getFileHandle("manifest.enc")
+        console.log("Encrypted folder detected. Starting decryption process...")
+        files = await decryptAndLoadFolder(handle, manifestHandle)
+    } catch (e) {
+        if (e.name !== "NotFoundError") throw e // Re-throw unexpected errors
+
+        files = await getFilesRecursively(handle)
+        if (observer) observer.disconnect()
+
+        try {
+            observer = new FileSystemObserver((records) => {
+                console.log(`${records.length} file system change(s) detected`)
+                changes.push(...records)
+            })
+            observer.observe(dirHandle, { recursive: true })
+        } catch (e) {
+            if (e.name !== "NotSupportedError") throw e
+            console.error("Cannot observe directories for modifications.")
+            console.warn(e)
+        }
+        changes.length = 0
+    }
+
+    await processAndStoreFolder(name, files)
+
+    if (navigator.serviceWorker.controller) {
+        navigator.serviceWorker.controller.postMessage({ type: "INVALIDATE_CACHE", folderName: name })
+    }
+    document.getElementById("folderName").value = ""
+    document.getElementById("openFolderName").value = name
+}
+
+async function processFileListAndStore(name, fileList) {
+    // Note: The UI should already be set to busy before calling this function
+    try {
+        if (!fileList.length) {
+            console.log("File list is empty, nothing to process")
             return
         }
 
-        const localDirHandle = await window.showDirectoryPicker({ mode: "read" })
-        dirHandle = localDirHandle
-        folderName = name
-        let files = {}
+        const files = {}
+        // Determine the common base path from the first file (e.g., "MyProject/")
+        // This is necessary because webkitRelativePath includes the selected folder's name
+        let basePath = ""
+        if (fileList.length > 0 && fileList[0].webkitRelativePath.includes("/")) {
+            basePath = fileList[0].webkitRelativePath.split("/")[0] + "/"
+        }
 
-        // Check for manifest.enc to determine if the folder is encrypted
-        try {
-            const manifestHandle = await localDirHandle.getFileHandle("manifest.enc")
-            console.log("Encrypted folder detected. Starting decryption process...")
-            files = await decryptAndLoadFolder(localDirHandle, manifestHandle)
-        } catch (e) {
-            // If not found, treat as a plaintext folder
-            if (e.name === "NotFoundError") {
-                files = await getFilesRecursively(localDirHandle)
-                if (observer) {
-                    observer.disconnect()
-                }
+        // Use a standard for-loop as FileList is not a true array
+        for (let i = 0; i < fileList.length; i++) {
+            const file = fileList[i]
+            let path = file.webkitRelativePath
 
-                try {
-                    // Create and start the new observer to watch the local folder for changes.
-                    observer = new FileSystemObserver((records) => {
-                        console.log(`${records.length} file system change(s) detected.`)
-                        changes.push(...records)
-                    })
-                    observer.observe(dirHandle, { recursive: true })
-                } catch (e) {
-                    if (e.name === "NotSupportedError") {
-                        // Older browser/implementation perhaps? Can't observe then.
-                        console.error("Cannot observe directories for modifications.")
-                        console.warn(e)
-                    } else {
-                        throw e
-                    }
-                }
+            // Strip the base path to get the correct relative path for storage
+            if (basePath && path.startsWith(basePath)) {
+                path = path.substring(basePath.length)
+            }
 
-                changes.length = 0
+            // If path is now empty (e.g., a hidden file at the root), skip it
+            if (!path) {
+                continue
+            }
+
+            if (file.size <= CHUNK_SIZE) {
+                const buffer = await file.arrayBuffer()
+                files[path] = { buffer, type: getMimeType(path) || file.type }
             } else {
-                throw e
+                files[path] = file // Store large file object for streaming
             }
         }
+
+        if (Object.keys(files).length === 0) {
+            alert("No processable files found in the selection.")
+            return
+        }
+
         await processAndStoreFolder(name, files)
 
         if (navigator.serviceWorker.controller) {
             navigator.serviceWorker.controller.postMessage({ type: "INVALIDATE_CACHE", folderName: name })
         }
-        folderNameInput.value = ""
+        document.getElementById("folderName").value = ""
         document.getElementById("openFolderName").value = name
         await listFolders()
     } catch (err) {
-        if (err.name !== "AbortError") {
-            console.error("Upload error:", err)
-            alert("An error occurred during upload: " + err.message)
-        }
+        console.error("File processing error:", err)
+        alert("An error occurred during file processing: " + err.message)
     } finally {
-        if (resetUI) setUiBusy(false)
+        // The calling function is responsible for resetting the UI busy state
     }
 }
 
-function getFilesFromEntryRecursively(dirEntry) {
-    return new Promise((resolve, reject) => {
-        const files = {}
-        let entriesPending = 0
-        let allEntriesRead = false
+// Handles the file input change event for fallback folder uploads.
+async function uploadFolderFallback(event) {
+    const name = document.getElementById("folderName").value.trim()
+    const input = event.target
 
-        const reader = dirEntry.createReader()
+    if (!input.files.length) {
+        console.log("Fallback folder selection cancelled.")
+        setUiBusy(false) // User cancelled, so reset UI
+        return
+    }
 
-        const readEntries = () => {
-            reader.readEntries(async (entries) => {
-                if (entries.length === 0) {
-                    // If no more entries are returned, we might be done.
-                    if (entriesPending === 0) {
-                        allEntriesRead = true
-                        resolve(files)
-                    }
-                    return
-                }
-
-                entriesPending += entries.length
-
-                for (const entry of entries) {
-                    if (entry.isFile) {
-                        entry.file(async (file) => {
-                            const buffer = await file.arrayBuffer()
-                            files[entry.fullPath.substring(1)] = { buffer, type: getMimeType(entry.name) || file.type }
-                            entriesPending--
-                            if (allEntriesRead && entriesPending === 0) resolve(files)
-                        }, (err) => reject(err))
-                    } else if (entry.isDirectory) {
-                        try {
-                            const subFiles = await getFilesFromEntryRecursively(entry)
-                            Object.assign(files, subFiles)
-                        } catch (err) {
-                            reject(err)
-                        } finally {
-                            entriesPending--
-                            if (allEntriesRead && entriesPending === 0) resolve(files)
-                        }
-                    }
-                }
-                // readEntries is recursive because the API might not return all entries in one go.
-                readEntries()
-            }, (err) => reject(err))
-        }
-        readEntries()
-    })
+    try {
+        await processFileListAndStore(name, input.files)
+    } finally {
+        input.value = "" // Reset input for next use
+        setUiBusy(false) // Ensure UI is always reset
+    }
 }
 
 async function decryptAndLoadFolder(dirHandle, manifestHandle) {
@@ -333,120 +366,6 @@ async function scanFilesRecursively(dirHandle, path = "") {
     return fileMap
 }
 
-async function openFile(overrideFolderName) {
-    const folderName = overrideFolderName || document.getElementById("openFolderName").value.trim()
-    const fileName = document.getElementById("fileName").value.trim()
-    if (!folderName) {
-        alert("Please provide a folder name.")
-        return
-    }
-
-    const regexRules = document.getElementById("regex").value.trim()
-    const customHeaders = document.getElementById("headers").value.trim()
-
-    // Store rules in IndexedDB before opening the file.
-    try {
-        const db = await getDb()
-        // Assuming you have a "Rules" object store.
-        const transaction = db.transaction("Rules", "readwrite")
-        const store = transaction.objectStore("Rules")
-
-        // Use a constant, predictable key that the SW can query.
-        await promisifyRequest(store.put({ id: "current_rules", regex: regexRules, headers: customHeaders }))
-        await promisifyTransaction(transaction) // Ensure the write completes
-    } catch (err) {
-        console.error("Failed to save custom rules to IndexedDB:", err)
-        // Decide if you want to proceed without rules or show an error.
-        alert("Error: Could not save custom rules. The file will open without them.")
-    }
-
-    try {
-        const db = await getDb()
-        const transaction = db.transaction("Rules", "readwrite")
-        const store = transaction.objectStore("Rules")
-        // Use a constant key. The SW knows to look for "current_rules".
-        await promisifyRequest(store.put({ id: "current_rules", regex: regexRules, headers: customHeaders }))
-        await promisifyTransaction(transaction) // Ensure the write is complete
-    } catch (err) {
-        console.error("Failed to save custom rules to IndexedDB:", err)
-        alert("Error: Could not save custom rules. The file will open without them.")
-    }
-
-    const db = await getDb()
-    const folderData = await db.transaction(FOLDERS_SN).objectStore(FOLDERS_SN).get(folderName)
-
-    if (!folderData) {
-        alert(`Folder "${folderName}" not found.`)
-        return
-    }
-
-    const urlToOpen = `/n/${folderName}/${fileName}`
-    const pathSegments = urlToOpen.split('/')
-    const encodedPathSegments = pathSegments.map(segment => encodeURIComponent(segment))
-    let url = encodedPathSegments.join('/')
-
-    if (folderData.encryptionType === "pdf") {
-        const password = prompt(`Enter password for folder "${folderName}":`)
-        if (!password) return
-
-        try {
-            setUiBusy(true)
-            const transaction = db.transaction(FILES_SN, "readonly")
-            const fileStore = transaction.objectStore(FILES_SN)
-            const fileIndex = fileStore.index("folder")
-            const metadataFileRecord = await promisifyRequest(fileIndex.get([folderName, ".metadata"]))
-
-            if (!metadataFileRecord) {
-                throw new Error("Encryption metadata is missing for this folder.")
-            }
-            const salt = new Uint8Array(metadataFileRecord.content.buffer)
-            const key = await deriveKeyFromPassword(password, salt)
-
-            // The requestId is still needed here for the short-lived decryption key.
-            const decryptionRequestId = crypto.randomUUID()
-
-            if (navigator.serviceWorker.controller) {
-                navigator.serviceWorker.controller.postMessage({
-                    type: "DECRYPT_KEY",
-                    requestId: decryptionRequestId,
-                    key: key
-                })
-            }
-
-            // Append ONLY the decryption ID to the URL.
-            url += `?reqId=${decryptionRequestId}`
-        } catch (e) {
-            console.error("Decryption failed:", e)
-            alert("Decryption failed. Please check the folder name and password.")
-            setUiBusy(false) // Make sure to re-enable UI on failure
-            return
-        } finally {
-            setUiBusy(false)
-        }
-    }
-
-    // Finally, open the new tab.
-    window.open(url, "_blank")
-}
-
-async function syncFiles() {
-    if (!folderName || !dirHandle) return alert("Upload a folder first.")
-    if (changes.length === 0) return alert("No changes to sync.")
-
-    setUiBusy(true)
-    try {
-        const count = await performSyncToDb()
-        // Tell the SW to clear cache and WAIT for confirmation
-        await invalidateCacheAndWait(folderName)
-        alert(`Synced ${count} changes.`)
-    } catch (e) {
-        console.error(e)
-        alert("Sync failed: " + e.message)
-    } finally {
-        setUiBusy(false)
-    }
-}
-
 async function syncAndOpenFile() {
     if (!folderName || !dirHandle) return alert("Upload a folder first.")
 
@@ -459,11 +378,7 @@ async function syncAndOpenFile() {
         }
         console.log("Opening file...")
         openFile(folderName)
-    } catch (e) {
-        console.error(e)
-        alert("Error: " + e.message)
     } finally {
-        // Re-enable UI *after* the new tab has likely opened.
         setUiBusy(false)
     }
 }
@@ -477,106 +392,81 @@ async function performSyncToDb() {
     const db = await getDb()
     let updateCount = 0
 
-    // Process each change sequentially to avoid race conditions
+    const operations = []
     for (const change of changes) {
         const path = change.relativePathComponents.join("/")
         try {
-            let fileContent = null
-            let operation = null
-            let oldPath = null
-
-            // Determine the operation and gather necessary file data first
             switch (change.type) {
                 case "created":
                 case "modified": {
-                    operation = "put"
                     const fileHandle = await getHandleFromPath(dirHandle, path)
                     if (fileHandle?.kind === "file") {
                         const file = await fileHandle.getFile()
-                        // Differentiate between large and small files for optimal storage
-                        if (file.size > CHUNK_SIZE) {
-                            fileContent = file // Keep as File object for streaming
-                        } else {
-                            fileContent = { // Load small files into memory
-                                buffer: await file.arrayBuffer(),
-                                type: getMimeType(path) || file.type
-                            }
-                        }
+                        operations.push({ type: "put", path, file })
                     }
                     break
                 }
                 case "deleted": {
-                    operation = "delete"
+                    operations.push({ type: "delete", path })
                     break
                 }
                 case "moved": {
-                    operation = "move"
-                    oldPath = change.relativePathMovedFrom.join("/")
+                    const oldPath = change.relativePathMovedFrom.join("/")
                     const fileHandle = await getHandleFromPath(dirHandle, path)
                     if (fileHandle?.kind === "file") {
                         const file = await fileHandle.getFile()
-                        if (file.size > CHUNK_SIZE) {
-                            fileContent = file
-                        } else {
-                            fileContent = {
-                                buffer: await file.arrayBuffer(),
-                                type: getMimeType(path) || file.type
-                            }
-                        }
+                        operations.push({ type: "move", oldPath, path, file })
                     }
                     break
                 }
             }
-
-            if (operation) {
-                const transaction = db.transaction([FILES_SN, "FileChunks"], "readwrite")
-                const fileStore = transaction.objectStore(FILES_SN)
-                const folderIndex = fileStore.index("folder")
-
-                if (operation === "put" && fileContent) {
-                    const existing = await promisifyRequest(folderIndex.get([folderName, path]))
-                    if (existing?.id) {
-                        // If it exists, first delete its old chunks to prevent orphans
-                        await deleteFileAndChunks(db, existing.id)
-                    }
-                    // Now add the new version
-                    if (fileContent instanceof File) {
-                        await streamFileToDb(db, folderName, path, fileContent)
-                    } else {
-                        await storeBufferToDb(db, folderName, path, fileContent.buffer, fileContent.type)
-                    }
-                    updateCount++
-                } else if (operation === "delete") {
-                    const keyRequest = folderIndex.getKey([folderName, path])
-                    const key = await promisifyRequest(keyRequest)
-                    if (key) {
-                        await deleteFileAndChunks(db, key)
-                        updateCount++
-                    }
-                } else if (operation === "move" && fileContent) {
-                    const oldKeyRequest = folderIndex.getKey([folderName, oldPath])
-                    const oldKey = await promisifyRequest(oldKeyRequest)
-                    if (oldKey) {
-                        // Delete the old entry and its chunks
-                        await deleteFileAndChunks(db, oldKey)
-                    }
-                    // Add the new entry
-                    if (fileContent instanceof File) {
-                        await streamFileToDb(db, folderName, path, fileContent)
-                    } else {
-                        await storeBufferToDb(db, folderName, path, fileContent.buffer, fileContent.type)
-                    }
-                    updateCount++
-                }
-                await promisifyTransaction(transaction)
-            }
         } catch (e) {
-            // Log and ignore individual file sync failures, allowing the sync to continue
             console.warn(`Skipping sync for path "${path}": ${e.message}`)
         }
     }
 
-    changes.length = 0 // Clear changes after processing
+    for (const op of operations) {
+        if (op.type === "put") {
+            await deleteFileByPathAndChunks(db, folderName, op.path)
+            if (op.file.size > CHUNK_SIZE) {
+                await streamFileToDb(db, folderName, op.path, op.file)
+            } else {
+                const addTx = db.transaction(FILES_SN, "readwrite")
+                const buffer = await op.file.arrayBuffer()
+                addTx.objectStore(FILES_SN).put({
+                    folderName: folderName,
+                    path: op.path,
+                    buffer: new Blob([buffer]),
+                    type: getMimeType(op.path) || op.file.type,
+                    lookupPath: `${folderName}/${op.path}`
+                })
+                await promisifyTransaction(addTx)
+            }
+            updateCount++
+        } else if (op.type === "delete") {
+            await deleteFileByPathAndChunks(db, folderName, op.path)
+            updateCount++
+        } else if (op.type === "move") {
+            await deleteFileByPathAndChunks(db, folderName, op.oldPath)
+            if (op.file.size > CHUNK_SIZE) {
+                await streamFileToDb(db, folderName, op.path, op.file)
+            } else {
+                const addTx = db.transaction(FILES_SN, "readwrite")
+                const buffer = await op.file.arrayBuffer()
+                addTx.objectStore(FILES_SN).put({
+                    folderName: folderName,
+                    path: op.path,
+                    buffer: new Blob([buffer]),
+                    type: getMimeType(op.path) || op.file.type, // Corrected line
+                    lookupPath: `${folderName}/${op.path}`
+                })
+                await promisifyTransaction(addTx)
+            }
+            updateCount++
+        }
+    }
+
+    changes.length = 0
     return updateCount
 }
 
@@ -594,7 +484,7 @@ async function listFolders() {
         const allFolders = await promisifyRequest(store.getAll())
 
         const folderList = document.getElementById("folderList")
-        folderList.innerHTML = "" // Clear the current list.
+        folderList.innerHTML = ""
 
         const fragment = document.createDocumentFragment()
         allFolders.sort((a, b) => a.id.localeCompare(b.id))
@@ -625,30 +515,41 @@ async function deleteFolder(folderNameToDelete, skipConfirm = false) {
     setUiBusy(true)
     try {
         const db = await getDb()
-        const transaction = db.transaction([FOLDERS_SN, FILES_SN, "FileChunks"], "readwrite")
-        const folderStore = transaction.objectStore(FOLDERS_SN)
-        const fileStore = transaction.objectStore(FILES_SN)
-        const chunkStore = transaction.objectStore("FileChunks")
-        const fileIndex = fileStore.index("folder")
-        const chunkIndex = chunkStore.index("by_file")
+        const storesToUse = [FOLDERS_SN]
+        // Defensively check if the other stores exist before adding them to the transaction
+        if (db.objectStoreNames.contains(FILES_SN)) {
+            storesToUse.push(FILES_SN)
+        }
+        if (db.objectStoreNames.contains("FileChunks")) {
+            storesToUse.push("FileChunks")
+        }
 
+        const transaction = db.transaction(storesToUse, "readwrite")
+        const folderStore = transaction.objectStore(FOLDERS_SN)
         folderStore.delete(folderName)
 
-        // Find all files associated with this folder to delete them and their chunks.
-        const folderFileRange = IDBKeyRange.bound([folderName, ""], [folderName, "\uffff"])
-        const filesToDelete = await promisifyRequest(fileIndex.getAll(folderFileRange))
+        // Only attempt to delete files if the Files store and its index actually exist.
+        if (db.objectStoreNames.contains(FILES_SN)) {
+            const fileStore = transaction.objectStore(FILES_SN)
+            if (fileStore.indexNames.contains("lookup")) {
+                const chunkStore = transaction.objectStore("FileChunks")
+                const lookupIndex = fileStore.index("lookup")
+                const chunkIndex = chunkStore.index("by_file")
 
-        // For each file, delete its associated chunks first, then the file itself.
-        for (const file of filesToDelete) {
-            const fileId = file.id // This is the primary key of the file record
-            if (file.size && file.size > 0) { // Check if the file was chunked
-                const chunkKeys = await promisifyRequest(chunkIndex.getAllKeys(IDBKeyRange.only(fileId)))
-                for (const chunkKey of chunkKeys) {
-                    chunkStore.delete(chunkKey)
+                const folderFileRange = IDBKeyRange.bound(folderName + "/", folderName + "/\uffff")
+                const filesToDelete = await promisifyRequest(lookupIndex.getAll(folderFileRange))
+
+                for (const file of filesToDelete) {
+                    const fileId = file.id
+                    if (file.size && file.size > 0) {
+                        const chunkKeys = await promisifyRequest(chunkIndex.getAllKeys(IDBKeyRange.only(fileId)))
+                        for (const chunkKey of chunkKeys) {
+                            chunkStore.delete(chunkKey)
+                        }
+                    }
+                    fileStore.delete(fileId)
                 }
             }
-            // Finally, delete the file's main record.
-            fileStore.delete(fileId)
         }
 
         await promisifyTransaction(transaction)
@@ -661,7 +562,7 @@ async function deleteFolder(folderNameToDelete, skipConfirm = false) {
         console.error("Delete folder error:", e)
         alert("An error occurred during deletion: " + e.message)
     } finally {
-        setUiBusy(false)
+        if (!skipConfirm) setUiBusy(false)
     }
 }
 
@@ -816,63 +717,179 @@ async function processAndStoreFolder(name, files, encryptionType = null) {
     console.log(`Processing ${Object.keys(files).length} files for folder "${name}"...`)
     const db = await getDb()
 
-    // Cleanly delete old data first
+    // First, clear any old version of this folder
     await deleteFolder(name, true)
 
-    // Make new folder metadata
+    const largeFilesToStream = []
+    const smallFileEntries = []
+
+    for (const path in files) {
+        const fileData = files[path]
+        if (fileData instanceof File && fileData.size > CHUNK_SIZE) {
+            largeFilesToStream.push({ path, fileData })
+        } else if (fileData) {
+            smallFileEntries.push({ path, fileData })
+        }
+    }
+
+    if (smallFileEntries.length > 0) {
+        const transaction = db.transaction([FILES_SN], "readwrite")
+        const fileStore = transaction.objectStore(FILES_SN)
+        for (const entry of smallFileEntries) {
+            const { path, fileData } = entry
+            const buffer = await (fileData.buffer ? fileData.buffer : fileData.arrayBuffer())
+            const type = fileData.type || getMimeType(path)
+
+            fileStore.put({
+                folderName: name,
+                path: path,
+                buffer: new Blob([buffer]),
+                type: type,
+                lookupPath: `${name}/${path}`
+            })
+        }
+        await promisifyTransaction(transaction)
+    }
+
+    for (const largeFile of largeFilesToStream) {
+        await streamFileToDb(db, name, largeFile.path, largeFile.fileData)
+    }
+
+    // Save the folder metadata
     const folderTransaction = db.transaction([FOLDERS_SN], "readwrite")
     await promisifyRequest(folderTransaction.objectStore(FOLDERS_SN).put({ id: name, lastModified: new Date(), encryptionType }))
     await promisifyTransaction(folderTransaction)
 
-    const largeFilePromises = []
-    const smallFilesTransaction = db.transaction([FILES_SN], "readwrite")
-    const fileStore = smallFilesTransaction.objectStore(FILES_SN)
-    const smallFilePromises = []
-
-    for (const path in files) {
-        const fileData = files[path]
-
-        // Large files must be streamed and handled individually.
-        if (fileData instanceof File && fileData.size > CHUNK_SIZE) {
-            largeFilePromises.push(streamFileToDb(db, name, path, fileData))
-        }
-        // Small files (already in memory or as File objects) get batched.
-        else if (fileData) {
-            const processSmallFile = async () => {
-                let buffer, type
-                if (fileData.buffer instanceof ArrayBuffer) {
-                    buffer = fileData.buffer
-                    type = fileData.type
-                } else if (fileData instanceof File) {
-                    buffer = await fileData.arrayBuffer()
-                    type = getMimeType(path) || fileData.type
-                }
-                const fileRecord = {
-                    folderName: name,
-                    path: path,
-                    content: { buffer: buffer, type: type }
-                }
-                // Add the PUT request to our list of promises for the single transaction.
-                smallFilePromises.push(promisifyRequest(fileStore.put(fileRecord)))
-            }
-            processSmallFile()
-        }
-    }
-
-    await Promise.all(smallFilePromises)
-    await promisifyTransaction(smallFilesTransaction)
-
-    // Wait for any large file streaming operations to complete...
-    await Promise.all(largeFilePromises)
-
+    // Notify the service worker to invalidate its cache for this folder
     if (navigator.serviceWorker.controller) {
         navigator.serviceWorker.controller.postMessage({ type: "INVALIDATE_CACHE", folderName: name })
     }
 
-    console.log(`Folder "${name}" stored successfully.`)
+    console.log(`Folder "${name}" stored successfully`)
     document.getElementById("folderName").value = ""
     document.getElementById("openFolderName").value = name
     await listFolders()
+}
+
+async function openFile(overrideFolderName) {
+    const folderName = overrideFolderName || document.getElementById("openFolderName").value.trim()
+    const fileName = document.getElementById("fileName").value.trim()
+    if (!folderName) {
+        alert("Please provide a folder name.")
+        return
+    }
+
+    const db = await getDb()
+    const folderData = await db.transaction(FOLDERS_SN).objectStore(FOLDERS_SN).get(folderName)
+    if (!folderData) {
+        alert(`Folder "${folderName}" not found.`)
+        return
+    }
+
+    const regexRules = document.getElementById("regex").value.trim()
+    const customHeaders = document.getElementById("headers").value.trim()
+    const isEncrypted = folderData.encryptionType === "pdf"
+
+    const needsRequestId = regexRules || customHeaders || isEncrypted
+    let requestId = null
+
+    const encodedFolderName = encodeURIComponent(folderName)
+    const encodedFilePath = fileName.split("/").map(segment => encodeURIComponent(segment)).join("/")
+    let url = `/n/${encodedFolderName}/${encodedFilePath}`
+
+    if (needsRequestId) {
+        requestId = crypto.randomUUID()
+        url += `?reqId=${requestId}`
+
+        try {
+            await new Promise((resolve, reject) => {
+                const controller = navigator.serviceWorker.controller
+                if (!controller) {
+                    return reject(new Error("Service Worker not active."))
+                }
+
+                const timeout = setTimeout(() => {
+                    reject(new Error("Service Worker acknowledgment timed out."))
+                }, 4000)
+
+                const messageListener = e => {
+                    if (e.data.type === "RULES_READY" && e.data.requestId === requestId) {
+                        clearTimeout(timeout)
+                        navigator.serviceWorker.removeEventListener("message", messageListener)
+                        resolve()
+                    }
+                }
+                navigator.serviceWorker.addEventListener("message", messageListener)
+
+                // Send the rules to the service worker.
+                controller.postMessage({
+                    type: "SET_RULES",
+                    requestId: requestId,
+                    rules: regexRules,
+                    headers: customHeaders
+                })
+            })
+        } catch (err) {
+            alert(`Error preparing advanced rules: ${err.message}`)
+            return
+        }
+    }
+
+    if (isEncrypted) {
+        const password = prompt(`Enter password for folder "${folderName}":`)
+        if (!password) return
+
+        try {
+            setUiBusy(true)
+            const transaction = db.transaction(FILES_SN, "readonly")
+            const fileStore = transaction.objectStore(FILES_SN)
+            const fileIndex = fileStore.index("lookup")
+            const metadataFileRecord = await promisifyRequest(fileIndex.get(`${folderName}/.metadata`))
+
+            if (!metadataFileRecord) throw new Error("Encryption metadata is missing.")
+
+            const saltBuffer = await metadataFileRecord.buffer.arrayBuffer()
+            const salt = new Uint8Array(saltBuffer)
+            const key = await deriveKeyFromPassword(password, salt)
+
+            // The requestId will have already been generated and added to the URL.
+            navigator.serviceWorker.controller.postMessage({
+                type: "DECRYPT_KEY",
+                requestId: requestId,
+                key: key
+            })
+        } catch (e) {
+            console.error("Decryption failed:", e)
+            alert("Decryption failed. Please check the folder name and password.")
+            return
+        } finally {
+            setUiBusy(false)
+        }
+    }
+
+    // This now only runs AFTER the promise has resolved, guaranteeing the SW is ready.
+    window.open(url, "_blank")
+}
+
+async function storeBufferToDb(db, folderName, path, buffer, fileType) {
+    if (buffer.byteLength < CHUNK_SIZE) {
+        const transaction = db.transaction([FILES_SN], "readwrite")
+        // Storing a flattened object now
+        await promisifyRequest(transaction.objectStore(FILES_SN).add({ folderName, path, buffer: buffer, type: fileType }))
+        await promisifyTransaction(transaction)
+    } else {
+        let fileId
+        const metadataTransaction = db.transaction([FILES_SN], "readwrite")
+        fileId = await promisifyRequest(metadataTransaction.objectStore(FILES_SN).add({ folderName, path, type: fileType, size: buffer.byteLength }))
+        await promisifyTransaction(metadataTransaction)
+
+        for (let i = 0; i < buffer.byteLength; i += CHUNK_SIZE) {
+            const chunkTransaction = db.transaction(["FileChunks"], "readwrite")
+            const chunk = buffer.slice(i, Math.min(i + CHUNK_SIZE, buffer.byteLength))
+            await promisifyRequest(chunkTransaction.objectStore("FileChunks").add({ fileId, index: i / CHUNK_SIZE, data: chunk }))
+            await promisifyTransaction(chunkTransaction)
+        }
+    }
 }
 
 async function clearAndFillDatabase(dbName, dbData) {
@@ -975,84 +992,62 @@ async function storeInMemoryFilesToDb(db, name, files) {
 }
 
 async function streamFileToDb(db, folderName, path, file) {
-    const metadataTransaction = db.transaction([FILES_SN], "readwrite")
-    const fileStore = metadataTransaction.objectStore(FILES_SN)
-    const fileMetadata = { folderName, path, type: getMimeType(path) || file.type, size: file.size }
+    const metaTx = db.transaction([FILES_SN], "readwrite")
+    const fileStore = metaTx.objectStore(FILES_SN)
+    const fileMetadata = {
+        folderName,
+        path,
+        type: getMimeType(path) || file.type,
+        size: file.size,
+        lookupPath: `${folderName}/${path}`
+    }
     const fileId = await promisifyRequest(fileStore.add(fileMetadata))
-    await promisifyTransaction(metadataTransaction)
+    await promisifyTransaction(metaTx)
 
+    // Now, process the chunks in batches for performance.
     const reader = file.stream().getReader()
     let chunkIndex = 0
-    let buffer = new Uint8Array(CHUNK_SIZE)
-    let bufferOffset = 0
+    let chunkBatch = []
 
     while (true) {
         const { done, value } = await reader.read()
-        if (done) break
+        if (value) {
+            chunkBatch.push({ fileId, index: chunkIndex++, data: value })
+        }
 
-        let sourceOffset = 0
-        while (sourceOffset < value.length) {
-            const spaceLeft = CHUNK_SIZE - bufferOffset
-            const bytesToCopy = Math.min(spaceLeft, value.length - sourceOffset)
-
-            buffer.set(value.subarray(sourceOffset, sourceOffset + bytesToCopy), bufferOffset)
-
-            bufferOffset += bytesToCopy
-            sourceOffset += bytesToCopy
-
-            // If the buffer is full, write it to the database.
-            if (bufferOffset === CHUNK_SIZE) {
-                const chunkTransaction = db.transaction(["FileChunks"], "readwrite")
-                await promisifyRequest(chunkTransaction.objectStore("FileChunks").add({ fileId, index: chunkIndex++, data: buffer.buffer }))
-                await promisifyTransaction(chunkTransaction)
-
-                // Reset buffer for the next chunk
-                buffer = new Uint8Array(CHUNK_SIZE)
-                bufferOffset = 0
+        if ((chunkBatch.length >= BATCH_SIZE || done) && chunkBatch.length > 0) {
+            const chunkTx = db.transaction(["FileChunks"], "readwrite")
+            const chunkStore = chunkTx.objectStore("FileChunks")
+            for (const chunk of chunkBatch) {
+                chunkStore.add(chunk)
             }
+            await promisifyTransaction(chunkTx)
+            chunkBatch = []
         }
-    }
 
-    // Write any remaining data in the buffer as the final chunk.
-    if (bufferOffset > 0) {
-        const finalChunk = buffer.buffer.slice(0, bufferOffset)
-        const chunkTransaction = db.transaction(["FileChunks"], "readwrite")
-        await promisifyRequest(chunkTransaction.objectStore("FileChunks").add({ fileId, index: chunkIndex++, data: finalChunk }))
-        await promisifyTransaction(chunkTransaction)
-    }
-}
-
-async function storeBufferToDb(db, folderName, path, buffer, fileType) {
-    if (buffer.byteLength < CHUNK_SIZE) {
-        const transaction = db.transaction([FILES_SN], "readwrite")
-        await promisifyRequest(transaction.objectStore(FILES_SN).add({ folderName, path, content: { buffer, type: fileType } }))
-        await promisifyTransaction(transaction)
-    } else {
-        let fileId
-        const metadataTransaction = db.transaction([FILES_SN], "readwrite")
-        fileId = await promisifyRequest(metadataTransaction.objectStore(FILES_SN).add({ folderName, path, type: fileType, size: buffer.byteLength }))
-        await promisifyTransaction(metadataTransaction)
-
-        for (let i = 0; i < buffer.byteLength; i += CHUNK_SIZE) {
-            const chunkTransaction = db.transaction(["FileChunks"], "readwrite")
-            const chunk = buffer.slice(i, Math.min(i + CHUNK_SIZE, buffer.byteLength))
-            await promisifyRequest(chunkTransaction.objectStore("FileChunks").add({ fileId, index: i / CHUNK_SIZE, data: chunk }))
-            await promisifyTransaction(chunkTransaction)
+        if (done) {
+            break // Exit the loop once the file stream is exhausted.
         }
     }
 }
 
-async function deleteFileAndChunks(db, fileId) {
+async function deleteFileByPathAndChunks(db, folderName, path) {
+    const fullPath = `${folderName}/${path}`
     const transaction = db.transaction([FILES_SN, "FileChunks"], "readwrite")
     const fileStore = transaction.objectStore(FILES_SN)
     const chunkStore = transaction.objectStore("FileChunks")
+    const lookupIndex = fileStore.index("lookup")
     const chunkIndex = chunkStore.index("by_file")
 
-    fileStore.delete(fileId)
-    const chunkKeys = await promisifyRequest(chunkIndex.getAllKeys(IDBKeyRange.only(fileId)))
-    for (const key of chunkKeys) {
-        chunkStore.delete(key)
+    const record = await promisifyRequest(lookupIndex.get(fullPath))
+    if (record?.id) {
+        const chunkKeys = await promisifyRequest(chunkIndex.getAllKeys(IDBKeyRange.only(record.id)))
+        for (const key of chunkKeys) {
+            chunkStore.delete(key)
+        }
+        fileStore.delete(record.id)
     }
+
     return promisifyTransaction(transaction)
 }
 
@@ -1136,7 +1131,7 @@ async function exportData() {
                     dataToExport.indexedDB[dbName] = dbExport
                     db.close()
                 } catch (e) {
-                    console.warn(`Could not export database '${dbName}'. Skipping. Reason: ${e.name} - ${e.message}`)
+                    console.warn(`Could not export database "${dbName}". Skipping. Reason: ${e.name} - ${e.message}`)
                 }
             }
         }
@@ -1270,7 +1265,7 @@ async function importData() {
 
             data = normalizeToArrayBuffers(data)
 
-            if (data.localStorage) { // This will now work
+            if (data.localStorage) {
                 Object.keys(data.localStorage).forEach(key => {
                     if (key !== "pk") localStorage.setItem(key, data.localStorage[key])
                 })
@@ -1281,10 +1276,6 @@ async function importData() {
                     const dbData = data.indexedDB[dbName]
                     await clearAndFillDatabase(dbName, dbData)
                 }
-            }
-
-            if (navigator.serviceWorker.controller) {
-                navigator.serviceWorker.controller.postMessage({ type: "DB_IMPORTED" })
             }
 
             await listFolders()
@@ -1299,6 +1290,7 @@ async function importData() {
     }
 }
 
+// Crucial for saving memory!
 function normalizeToArrayBuffers(data) {
     if (ArrayBuffer.isView(data)) {
         return new data.constructor(data)
@@ -1313,7 +1305,7 @@ function normalizeToArrayBuffers(data) {
     if (Array.isArray(data)) {
         return data.map(item => normalizeToArrayBuffers(item))
     }
-    if (typeof data === "object" && data !== null && data.constructor === Object) {
+    if (data !== null && typeof data === "object" && data.constructor === Object) {
         const newObj = {}
         for (const key in data) {
             newObj[key] = normalizeToArrayBuffers(data[key])
@@ -1333,7 +1325,7 @@ function normalizeToArrayBuffers(data) {
  * @returns {Promise<void>}
  */
 async function createEmptyDatabase(dbName, version) {
-    console.log(`Creating special-case empty database: '${dbName}' version ${version}`)
+    console.log(`Creating special-case empty database: "${dbName}" version ${version}`)
 
     // Ensure any old version is completely gone.
     await new Promise((resolve, reject) => {
@@ -1442,26 +1434,21 @@ async function uploadAndEncryptWithPassword() {
         dirHandle = localDirHandle
         folderName = name
         const files = await getFilesRecursively(localDirHandle)
-        // Generate a random salt for the key derivation.
         const salt = crypto.getRandomValues(new Uint8Array(16))
         const key = await deriveKeyFromPassword(password, salt)
 
-        // Encrypt each file in the folder.
         for (const path in files) {
             const file = files[path]
-            const iv = crypto.getRandomValues(new Uint8Array(12)) // Generate a new IV for each file.
+            const iv = crypto.getRandomValues(new Uint8Array(12))
             const encryptedBuffer = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, key, file.buffer)
-            // Prepend the IV to the encrypted data.
             file.buffer = concatBuffers(iv.buffer, encryptedBuffer)
         }
-        // Store the salt in a metadata file.
-        files[".metadata"] = { buffer: salt.buffer, type: "application/octet-stream" }
+        files[".metadata"] = { buffer: new Blob([salt.buffer]), type: "application/octet-stream" }
 
         await processAndStoreFolder(name, files, "pdf")
 
         console.log(`Folder "${name}" encrypted and stored successfully.`)
         folderNameInput.value = ""
-        await listFolders()
     } catch (err) {
         if (err.name !== "AbortError") {
             console.error("Password encryption error:", err)
@@ -1498,7 +1485,7 @@ async function encryptAndSaveFolderWithPassword() {
         const sourceDirHandle = await window.showDirectoryPicker({ mode: "read" })
         const destDirHandle = await window.showDirectoryPicker({ mode: "readwrite" })
 
-        // 1. Derive the master key from the password.
+        // Derive the master key from the password.
         const salt = crypto.getRandomValues(new Uint8Array(16))
         const key = await deriveKeyFromPassword(password, salt) // Your existing helper is perfect.
 
@@ -1524,13 +1511,13 @@ async function encryptAndSaveFolderWithPassword() {
             await writable.close()
         }
 
-        // 3. Create and encrypt the manifest payload.
+        // Create and encrypt the manifest payload.
         const manifestString = JSON.stringify(pathManifest)
         const manifestBuffer = new TextEncoder().encode(manifestString)
         const manifestIv = crypto.getRandomValues(new Uint8Array(12))
         const encryptedManifestPayload = await crypto.subtle.encrypt({ name: "AES-GCM", iv: manifestIv }, key, manifestBuffer)
 
-        // 4. Create the final manifest.enc file content.
+        // Create the final manifest.enc file content.
         const manifestFileObject = {
             encryptionType: "password",
             salt: await bufferToBase64(salt),
@@ -1553,186 +1540,76 @@ async function encryptAndSaveFolderWithPassword() {
     }
 }
 
-// Add keyboard shortcuts for common actions.
-document.getElementById("folderName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), currentlyBusy || uploadFolder()))
-document.getElementById("openFolderName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), currentlyBusy || openFile()))
-document.getElementById("fileName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), currentlyBusy || openFile()))
-document.getElementById("deleteFolderName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), currentlyBusy || deleteFolder()))
-document.getElementById("folderUploadFallbackInput").addEventListener("change", uploadFolderFallback)
-document.getElementById("folderUploadFallbackInput").addEventListener("cancel", () => setUiBusy(false))
-document.body.addEventListener("dragover", e => {
-    e.preventDefault()
-    document.body.style.backgroundColor = "#385b7e"
-})
-
-document.body.addEventListener("dragleave", () => {
-    document.body.style.backgroundColor = "" // Reset visual feedback
-})
-
-function readAllEntries(directoryReader) {
-    return new Promise((resolve, reject) => {
-        let allEntries = []
-        const readMore = () => {
-            directoryReader.readEntries(
-                (entries) => {
-                    if (entries.length === 0) resolve(allEntries)
-                    else {
-                        allEntries = allEntries.concat(entries)
-                        readMore()
-                    }
-                },
-                (error) => reject(error)
-            )
-        }
-        readMore()
-    })
-}
-
-/**
- * Promisifies the entry.file() callback API.
- * @param {FileSystemFileEntry} fileEntry The file entry to convert.
- * @returns {Promise<File>} A promise that resolves with the File object.
- */
-function getFileFromEntry(fileEntry) {
-    return new Promise((resolve, reject) => {
-        fileEntry.file(
-            (file) => {
-                resolve(file)
-            },
-            (error) => {
-                reject(error)
-            }
-        )
-    })
-}
-
-// A new, modern helper to recursively read directory entries using Promises
-async function readEntriesAsync(dirReader) {
-    return new Promise((resolve, reject) => {
-        dirReader.readEntries(resolve, reject)
-    })
-}
-
-// A new, modern helper to get a File object from a FileEntry using Promises
-async function getFileAsync(fileEntry) {
-    return new Promise((resolve, reject) => {
-        fileEntry.file(resolve, reject)
-    })
-}
-
-// The rewritten recursive function using modern async/await
-async function getFilesFromDroppedItems(dataTransferItemList) {
-    const files = {}
-    const rootEntries = Array.from(dataTransferItemList).map(item => item.webkitGetAsEntry())
-
-    async function processEntry(entry) {
-        if (entry.isFile) {
-            const file = await getFileAsync(entry)
-            const path = entry.fullPath.substring(1) // Remove leading "/"
-
-            if (file.size <= CHUNK_SIZE) {
-                const buffer = await file.arrayBuffer()
-                files[path] = { buffer, type: getMimeType(path) || file.type }
-            } else {
-                files[path] = file // Store large files for streaming
-            }
-        } else if (entry.isDirectory) {
-            const dirReader = entry.createReader()
-            // Loop until all entries are read, as readEntries() may not return all at once
-            let entries
-            do {
-                entries = await readEntriesAsync(dirReader)
-                await Promise.all(entries.map(processEntry))
-            } while (entries.length > 0)
-        }
-    }
-
-    // Process all top-level dropped items in parallel
-    await Promise.all(rootEntries.map(processEntry))
-    return files
-}
-
-
-async function uploadFolderFallback(event) {
-    setUiBusy(true)
-    const name = document.getElementById("folderName").value.trim()
-    const input = event.target
-
-    if (!input.files.length) {
-        setUiBusy(false)
-        return
-    }
-
-    try {
-        const files = {}
-        await Promise.all(Array.from(input.files).map(async (file) => {
-            const path = file.webkitRelativePath
-            if (file.size <= CHUNK_SIZE) {
-                const buffer = await file.arrayBuffer()
-                files[path] = { buffer, type: getMimeType(path) || file.type }
-            } else {
-                files[path] = file // Store large file object
-            }
-        }))
-
-        await processAndStoreFolder(name, files)
-
-        // Invalidate service worker cache and update UI
-        if (navigator.serviceWorker.controller) {
-            navigator.serviceWorker.controller.postMessage({ type: "INVALIDATE_CACHE", folderName: name })
-        }
-        document.getElementById("folderName").value = ""
-        document.getElementById("openFolderName").value = name
-        await listFolders()
-    } catch (err) {
-        console.error("Fallback upload error:", err)
-        alert("An error occurred during fallback upload: " + err.message)
-    } finally {
-        input.value = "" // Reset input for next use
-        setUiBusy(false)
-    }
-}
-
-document.body.addEventListener("drop", async e => {
-    e.preventDefault()
-    document.body.style.backgroundColor = ""
-
-    let defaultFolderName = ""
-    const items = e.dataTransfer.items
-    if (items && items.length > 0 && items[0].webkitGetAsEntry) {
-        // We only want to process if the first item is a directory.
-        const firstEntry = items[0].webkitGetAsEntry()
-        if (firstEntry.isDirectory) {
-            defaultFolderName = firstEntry.name
+function initializeApp() {
+    document.getElementById("folderName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), currentlyBusy || uploadFolder()))
+    document.getElementById("openFolderName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), currentlyBusy || openFile()))
+    document.getElementById("fileName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), currentlyBusy || openFile()))
+    document.getElementById("deleteFolderName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), currentlyBusy || deleteFolder()))
+    document.getElementById("folderUploadFallbackInput").addEventListener("change", uploadFolderFallback)
+    document.getElementById("folderUploadFallbackInput").addEventListener("cancel", () => setUiBusy(false))
+    document.body.addEventListener("dragover", e => { e.preventDefault(); document.body.style.backgroundColor = "#385b7e" })
+    document.body.addEventListener("dragleave", () => { document.body.style.backgroundColor = "" })
+    document.body.addEventListener("drop", async e => {
+        e.preventDefault()
+        document.body.style.backgroundColor = ""
+        const files = e.dataTransfer.files
+        if (!files || files.length === 0) return alert("No files were dropped.")
+        let defaultFolderName = ""
+        if (files[0].webkitRelativePath) {
+            defaultFolderName = files[0].webkitRelativePath.split("/")[0]
         } else {
-            // If the user dropped a file, inform them and stop.
-            alert("Please drop a folder, not a file.")
-            return
+            return alert("Please drop a folder, not individual files.")
         }
-    } else {
-        alert("This browser does not support folder dropping.")
-        return
-    }
-
-    const name = prompt("Please enter a name for the folder:", defaultFolderName)
-    if (name === null) {
-        return
-    }
-    setUiBusy(true)
-    try {
-        const files = await getFilesFromDroppedItems(items)
-
-        if (Object.keys(files).length === 0) {
-            alert("The dropped folder appears to be empty.")
-            return
+        const name = prompt("Please enter a name for the folder:", defaultFolderName)
+        if (name === null) return
+        setUiBusy(true)
+        try {
+            await processFileListAndStore(name.trim(), files)
+        } catch (err) {
+            console.error("Drag-and-drop error:", err)
+            alert("An error occurred during drop: " + err.message)
+        } finally {
+            setUiBusy(false)
         }
+    })
 
-        // Use the name from the prompt to store the folder.
-        await processAndStoreFolder(name.trim(), files)
-    } catch (err) {
-        console.error("Drag-and-drop error:", err)
-        alert("An error occurred during drop: " + err.message)
-    } finally {
-        setUiBusy(false)
-    }
-})
+    let refreshing = false
+    navigator.serviceWorker.addEventListener("controllerchange", () => {
+        if (refreshing) return
+        refreshing = true
+        window.location.reload()
+    })
+
+    // Initial folder list load.
+    getDb().then(() => listFolders())
+}
+
+if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("./sw.js").then(reg => {
+        reg.addEventListener("updatefound", () => {
+            const newWorker = reg.installing
+            newWorker.addEventListener("statechange", () => {
+                if (newWorker.state === "installed" && navigator.serviceWorker.controller) {
+                    console.log("A new version is available! Please refresh.")
+                }
+            })
+        })
+
+        return navigator.serviceWorker.ready
+    }).then(registration => {
+        console.log("Service Worker is active.")
+        if (!navigator.serviceWorker.controller) {
+            console.log("No controller found. Reloading to ensure service worker takes control.")
+            window.location.reload()
+        } else {
+            console.log("Service Worker is controlling the page. Initializing app.")
+            initializeApp()
+        }
+    }).catch(err => {
+        console.error("Service Worker registration failed:", err)
+        alert("The application could not start correctly. Please try reloading the page.")
+    })
+} else {
+    alert("Service Workers not supported.")
+    console.error("Service Workers not supported.")
+}

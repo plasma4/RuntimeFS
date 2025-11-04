@@ -6,7 +6,7 @@ RuntimeFS is a no-nonsense `IndexedDB` and `ServiceWorker` file-system, served i
 Imagine a localhost, in your browser, with no traces of network activity of files hosted and no server-based storage of files. It saves all files and data locally, and can easily be integrated within an existing website too (the code is under the MIT License).
 
 After initial page load, RuntimeFS no longer needs internet connection to function.
-**This tool is Chromium-focused for now, as it uses the File System API, but has working fallback for other browsers.** Using the tool in Incognito might fail due to memory limitations (with a `QuotaExceededError`).
+RuntimeFS has been tested in Chromium and Firefox (although most features will never work for Firefox, as they use the File System API). Using the tool in Incognito might fail due to memory limitations with a `QuotaExceededError`.
 
 If you are hosting this, it is suggested that you simply minify the JavaScript files first with a tool like https://jscompress.com/. When compressed, RuntimeFS is `<100KB`.
 

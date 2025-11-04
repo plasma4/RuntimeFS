@@ -135,9 +135,8 @@ function applyRegexRules(filePath, fileBuffer, fileType, regexRules) {
     if (!/^(text|application\/(javascript|json|xml))/.test(fileType)) return fileBuffer
 
     try {
-        const content = new TextDecoder().decode(fileBuffer)
+        let content = new TextDecoder().decode(fileBuffer)
         const rules = regexRules.trim().split("\n")
-        let modifiedContent = content
 
         for (const line of rules) {
             const [matchPart, replacePart] = line.split("->").map(s => s.trim())
@@ -158,9 +157,9 @@ function applyRegexRules(filePath, fileBuffer, fileType, regexRules) {
                 case "||": searchRegex = new RegExp(searchPattern); break
                 case "$$": searchRegex = new RegExp(escapeRegex(searchPattern)); break
             }
-            modifiedContent = modifiedContent.replace(searchRegex, replacePart)
+            content = content.replace(searchRegex, replacePart)
         }
-        return new TextEncoder().encode(modifiedContent).buffer
+        return new TextEncoder().encode(content).buffer
     } catch (e) {
         console.error(`Error applying regex rules to ${filePath}:`, e)
         return fileBuffer // Return original buffer on error.
@@ -472,7 +471,6 @@ async function reassembleFileFromChunks(db, fileId) {
 
     return reassembled.buffer
 }
-
 
 /**
  * Quickly checks if any regex rule applies to a given file path.

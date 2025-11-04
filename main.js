@@ -106,7 +106,7 @@ async function uploadFolder() {
     const folderNameInput = document.getElementById("folderName")
     const name = folderNameInput.value.trim()
     if (!name) {
-        alert("Please enter a name for the folder")
+        alert("Please enter a name for the folder.")
         return
     }
 
@@ -212,7 +212,7 @@ async function processFileListAndStore(name, fileList) {
         }
 
         if (Object.keys(files).length === 0) {
-            alert("No processable files found in the selection.")
+            alert("No valid files found.")
             return
         }
 
@@ -350,7 +350,6 @@ async function getFilesRecursively(dirHandle, path = "") {
     }
     return files
 }
-
 
 async function scanFilesRecursively(dirHandle, path = "") {
     const fileMap = {}

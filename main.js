@@ -94,9 +94,6 @@ function getDb() {
     return dbPromise
 }
 
-// Immediately initialize the DB on load
-getDb().then(() => listFolders())
-
 // Global variables to hold state for the currently managed folder.
 let folderName, dirHandle, observer
 // An array to keep track of file system changes for syncing.
@@ -370,16 +367,12 @@ async function syncAndOpenFile() {
 
     // Keep the UI locked so the user doesn't close the tab while waiting
     setUiBusy(true)
-    try {
-        if (changes.length > 0) {
-            await performSyncToDb()
-            await invalidateCacheAndWait(folderName)
-        }
-        console.log("Opening file...")
-        openFile(folderName)
-    } finally {
-        setUiBusy(false)
+    if (changes.length > 0) {
+        await performSyncToDb()
+        await invalidateCacheAndWait(folderName)
     }
+    console.log("Opening file...")
+    openFile(folderName)
 }
 
 async function performSyncToDb() {
@@ -397,27 +390,24 @@ async function performSyncToDb() {
         try {
             switch (change.type) {
                 case "created":
-                case "modified": {
-                    const fileHandle = await getHandleFromPath(dirHandle, path)
+                case "modified":
+                    var fileHandle = await getHandleFromPath(dirHandle, path)
                     if (fileHandle?.kind === "file") {
                         const file = await fileHandle.getFile()
                         operations.push({ type: "put", path, file })
                     }
                     break
-                }
-                case "deleted": {
+                case "deleted":
                     operations.push({ type: "delete", path })
                     break
-                }
-                case "moved": {
+                case "moved":
                     const oldPath = change.relativePathMovedFrom.join("/")
-                    const fileHandle = await getHandleFromPath(dirHandle, path)
+                    var fileHandle = await getHandleFromPath(dirHandle, path)
                     if (fileHandle?.kind === "file") {
                         const file = await fileHandle.getFile()
                         operations.push({ type: "move", oldPath, path, file })
                     }
                     break
-                }
             }
         } catch (e) {
             console.warn(`Skipping sync for path "${path}": ${e.message}`)
@@ -471,7 +461,6 @@ async function performSyncToDb() {
 
 async function listFolders() {
     if (isListingFolders) {
-        console.log("Folder listing already in progress. Skipping.")
         return
     }
 
@@ -773,6 +762,7 @@ async function processAndStoreFolder(name, files, encryptionType = null) {
 async function openFile(overrideFolderName) {
     const folderName = overrideFolderName || document.getElementById("openFolderName").value.trim()
     const fileName = document.getElementById("fileName").value.trim()
+
     if (!folderName) {
         alert("Please provide a folder name.")
         return
@@ -780,26 +770,53 @@ async function openFile(overrideFolderName) {
 
     const db = await getDb()
     const folderData = await db.transaction(FOLDERS_SN).objectStore(FOLDERS_SN).get(folderName)
+
     if (!folderData) {
         alert(`Folder "${folderName}" not found.`)
         return
     }
 
-    const regexRules = document.getElementById("regex").value.trim()
-    const customHeaders = document.getElementById("headers").value.trim()
-    const isEncrypted = folderData.encryptionType === "pdf"
+    // Set the UI to a busy state before starting any long-running operations.
+    setUiBusy(true)
+    try {
+        const regexRules = document.getElementById("regex").value.trim()
+        const customHeaders = document.getElementById("headers").value.trim()
 
-    const needsRequestId = regexRules || customHeaders || isEncrypted
-    let requestId = null
+        if (regexRules || customHeaders) {
+            try {
+                await invalidateCacheAndWait(folderName)
+            } catch (err) {
+                console.error("Cache invalidation failed before opening file:", err)
+                alert("Could not clear cache before applying rules. You may see stale content.")
+            }
+        }
 
-    const encodedFolderName = encodeURIComponent(folderName)
-    const encodedFilePath = fileName.split("/").map(segment => encodeURIComponent(segment)).join("/")
-    let url = `/n/${encodedFolderName}/${encodedFilePath}`
+        const isEncrypted = folderData.encryptionType === "pdf"
+        let decryptionKey = null
 
-    if (needsRequestId) {
-        requestId = crypto.randomUUID()
-        url += `?reqId=${requestId}`
+        if (isEncrypted) {
+            const password = prompt(`Enter password for folder "${folderName}":`)
+            if (!password) return // The 'finally' block will still run, fixing the bug.
 
+            try {
+                const transaction = db.transaction(FILES_SN, "readonly")
+                const fileStore = transaction.objectStore(FILES_SN)
+                const fileIndex = fileStore.index("lookup")
+                const metadataFileRecord = await promisifyRequest(fileIndex.get(`${folderName}/.metadata`))
+
+                if (!metadataFileRecord) throw new Error("Encryption metadata is missing.")
+
+                const saltBuffer = await metadataFileRecord.buffer.arrayBuffer()
+                const salt = new Uint8Array(saltBuffer)
+                decryptionKey = await deriveKeyFromPassword(password, salt)
+            } catch (e) {
+                console.error("Decryption failed:", e)
+                alert("Decryption failed. Please check the folder name and password.")
+                return // The 'finally' block will also run here.
+            }
+        }
+
+        const requestId = crypto.randomUUID()
         try {
             await new Promise((resolve, reject) => {
                 const controller = navigator.serviceWorker.controller
@@ -820,54 +837,57 @@ async function openFile(overrideFolderName) {
                 }
                 navigator.serviceWorker.addEventListener("message", messageListener)
 
-                // Send the rules to the service worker.
                 controller.postMessage({
                     type: "SET_RULES",
                     requestId: requestId,
                     rules: regexRules,
-                    headers: customHeaders
+                    headers: customHeaders,
+                    key: decryptionKey
                 })
             })
         } catch (err) {
-            alert(`Error preparing advanced rules: ${err.message}`)
-            return
+            alert(`Error preparing to open file: ${err.message}`)
+            return // And here too, 'finally' will execute.
         }
+
+        const encodedFolderName = encodeURIComponent(folderName)
+        const encodedFilePath = fileName.split("/").map(segment => encodeURIComponent(segment)).join("/")
+        const url = `/n/${encodedFolderName}/${encodedFilePath}`
+        window.open(url, "_blank")
+    } finally {
+        // This block is guaranteed to run, ensuring the UI is always re-enabled.
+        setUiBusy(false)
+    }
+}
+
+async function syncFiles() {
+    if (!folderName || !dirHandle) {
+        alert("Please upload a folder first to enable syncing.")
+        return
     }
 
-    if (isEncrypted) {
-        const password = prompt(`Enter password for folder "${folderName}":`)
-        if (!password) return
-
-        try {
-            setUiBusy(true)
-            const transaction = db.transaction(FILES_SN, "readonly")
-            const fileStore = transaction.objectStore(FILES_SN)
-            const fileIndex = fileStore.index("lookup")
-            const metadataFileRecord = await promisifyRequest(fileIndex.get(`${folderName}/.metadata`))
-
-            if (!metadataFileRecord) throw new Error("Encryption metadata is missing.")
-
-            const saltBuffer = await metadataFileRecord.buffer.arrayBuffer()
-            const salt = new Uint8Array(saltBuffer)
-            const key = await deriveKeyFromPassword(password, salt)
-
-            // The requestId will have already been generated and added to the URL.
-            navigator.serviceWorker.controller.postMessage({
-                type: "DECRYPT_KEY",
-                requestId: requestId,
-                key: key
-            })
-        } catch (e) {
-            console.error("Decryption failed:", e)
-            alert("Decryption failed. Please check the folder name and password.")
-            return
-        } finally {
-            setUiBusy(false)
-        }
+    if (changes.length === 0) {
+        alert("No changes detected to sync.")
+        return
     }
 
-    // This now only runs AFTER the promise has resolved, guaranteeing the SW is ready.
-    window.open(url, "_blank")
+    setUiBusy(true)
+    console.log("Starting file synchronization...")
+    try {
+        const updateCount = await performSyncToDb()
+        if (updateCount > 0) {
+            await invalidateCacheAndWait(folderName)
+            alert(`Sync complete. ${updateCount} change(s) processed.`)
+        } else {
+            alert("Sync complete. No changes needed to be applied.")
+        }
+        console.log("Sync process finished.")
+    } catch (err) {
+        console.error("Sync failed:", err)
+        alert("An error occurred during sync: " + err.message)
+    } finally {
+        setUiBusy(false)
+    }
 }
 
 async function storeBufferToDb(db, folderName, path, buffer, fileType) {
@@ -1458,23 +1478,6 @@ async function uploadAndEncryptWithPassword() {
     }
 }
 
-// Register the service worker.
-if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("./sw.js").then(reg => {
-        // Listen for updates to the service worker.
-        reg.addEventListener("updatefound", () => {
-            const newWorker = reg.installing
-            newWorker.addEventListener("statechange", () => {
-                // If a new version is installed and there's an active controller,
-                // it means the user should refresh to get the latest version.
-                if (newWorker.state === "installed" && navigator.serviceWorker.controller) {
-                    console.log("A new version is available! Please refresh the page to update.")
-                }
-            })
-        })
-    }).catch(err => console.log("Service worker not registered.", err))
-}
-
 async function encryptAndSaveFolderWithPassword() {
     const password = prompt("After entering a password, first select the folder you want to encrypt, then another folder (ideally empty) to encrypt the data to. Enter a secure password:")
     if (!password) return
@@ -1546,7 +1549,7 @@ function initializeApp() {
     document.getElementById("deleteFolderName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), currentlyBusy || deleteFolder()))
     document.getElementById("folderUploadFallbackInput").addEventListener("change", uploadFolderFallback)
     document.getElementById("folderUploadFallbackInput").addEventListener("cancel", () => setUiBusy(false))
-    document.body.addEventListener("dragover", e => { e.preventDefault(); document.body.style.backgroundColor = "#385b7e" })
+    document.body.addEventListener("dragover", e => { e.preventDefault(), document.body.style.backgroundColor = "#385b7e" })
     document.body.addEventListener("dragleave", () => { document.body.style.backgroundColor = "" })
     document.body.addEventListener("drop", async e => {
         e.preventDefault()
@@ -1572,43 +1575,73 @@ function initializeApp() {
         }
     })
 
-    let refreshing = false
-    navigator.serviceWorker.addEventListener("controllerchange", () => {
-        if (refreshing) return
-        refreshing = true
-        window.location.reload()
-    })
-
-    // Initial folder list load.
+    // Initial folder list load
     getDb().then(() => listFolders())
 }
 
-if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("./sw.js").then(reg => {
-        reg.addEventListener("updatefound", () => {
-            const newWorker = reg.installing
-            newWorker.addEventListener("statechange", () => {
-                if (newWorker.state === "installed" && navigator.serviceWorker.controller) {
-                    console.log("A new version is available! Please refresh.")
-                }
-            })
+document.addEventListener("DOMContentLoaded", () => {
+    initializeApp()
+
+    if ("serviceWorker" in navigator) {
+        let refreshing = false
+        // This listener handles reloading the page when a new service worker takes control
+        navigator.serviceWorker.addEventListener("controllerchange", () => {
+            if (refreshing) return
+            refreshing = true
+            window.location.reload()
         })
 
-        return navigator.serviceWorker.ready
-    }).then(registration => {
-        console.log("Service Worker is active.")
-        if (!navigator.serviceWorker.controller) {
-            console.log("No controller found. Reloading to ensure service worker takes control.")
-            window.location.reload()
-        } else {
-            console.log("Service Worker is controlling the page. Initializing app.")
-            initializeApp()
+        navigator.serviceWorker.register("./sw.js").then(reg => {
+            // This event fires when a new version of the service worker is found
+            reg.addEventListener("updatefound", () => {
+                const newWorker = reg.installing
+                newWorker.addEventListener("statechange", () => {
+                    if (newWorker.state === "installed" && navigator.serviceWorker.controller) {
+                        console.log("A new version is available! The page will reload automatically.")
+                    }
+                })
+            })
+
+            // Check if a service worker is active but not controlling the page
+            // This is the state after a force reload (Shift+Refresh)
+            navigator.serviceWorker.ready.then(registration => {
+                if (!navigator.serviceWorker.controller && registration.active) {
+                    console.log("Service worker is active but not controlling the page. Reloading to fix...")
+                    window.location.reload()
+                }
+            })
+
+        }).catch(err => {
+            console.error("Service Worker registration failed:", err)
+            alert("The application could not start correctly. Please try reloading the page.")
+        })
+    } else {
+        alert("Service Workers are not supported in this browser. The application will not work.")
+        console.error("Service Workers not supported.")
+    }
+
+    const regexTextarea = document.getElementById("regex")
+    const headersTextarea = document.getElementById("headers")
+
+    // Load saved values on startup
+    try {
+        regexTextarea.value = localStorage.getItem("fsRegex") || ""
+        headersTextarea.value = localStorage.getItem("fsHeaders") || ""
+    } catch (e) {
+        console.warn(e)
+    }
+
+    setTimeout(() => {
+        try {
+            // Save values on input
+            regexTextarea.addEventListener("input", () => {
+                localStorage.setItem("fsRegex", regexTextarea.value)
+            })
+            headersTextarea.addEventListener("input", () => {
+                localStorage.setItem("fsHeaders", headersTextarea.value)
+            })
+        } catch (e) {
+            console.warn("Could not load saved rules from localStorage:", e)
         }
-    }).catch(err => {
-        console.error("Service Worker registration failed:", err)
-        alert("The application could not start correctly. Please try reloading the page.")
-    })
-} else {
-    alert("Service Workers not supported.")
-    console.error("Service Workers not supported.")
-}
+    }, 0)
+})

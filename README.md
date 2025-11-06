@@ -10,7 +10,7 @@ RuntimeFS has been tested in Chromium and Firefox (although most features will n
 
 If you are hosting this, it is suggested that you simply minify the JavaScript files first with a tool like https://jscompress.com/. When compressed, RuntimeFS is `<100KB`.
 
-Do note that not all code you download from the internet will immediately work, and may require configuration. Many web projects require you to compile them locally, such as Vite projects (or require you to add a tag like `<base href="/n/my-folder/">`).
+Do note that many projects might not work; projects that use **synchronous** AJAX requests (commonly done with JQuery's `$.ajax({type: "GET", url: "...", async: false })`) will not work due to fundamental ServiceWorker limitations. (This type of request is also being phased out from browsers gradually.)
 
 ### TODO
 - More optimization, and ability to export large `.cbor` files without crashes

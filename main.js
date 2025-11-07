@@ -935,61 +935,62 @@ async function clearAndFillDatabase(dbName, dbData) {
         request.onsuccess = e => resolve(e.target.result)
     })
 
-    // This is the key logic that preserves relationships for RuntimeFS
-    if (dbName === DBN && dbData.stores[FILES_SN] && dbData.stores.FileChunks) {
-        const idMap = new Map()
+    const idMap = new Map()
 
+    // Special pre-processing ONLY for FileCacheDB's auto-incrementing stores
+    if (dbName === DBN && dbData.stores[FILES_SN]) {
         const filesStoreInfo = dbData.stores[FILES_SN]
         const filesTx = db.transaction([FILES_SN], "readwrite")
         const filesStore = filesTx.objectStore(FILES_SN)
         for (const record of filesStoreInfo.data) {
             const oldId = record.key
             let value = record.value
-            delete value.id // Ensure a new key is generated
+            delete value.id
             const addRequest = filesStore.add(value)
             const newId = await promisifyRequest(addRequest)
             idMap.set(oldId, newId)
         }
         await promisifyTransaction(filesTx)
-
-        const chunksStoreInfo = dbData.stores.FileChunks
-        const chunksTx = db.transaction(["FileChunks"], "readwrite")
-        const chunksStore = chunksTx.objectStore("FileChunks")
-        for (const record of chunksStoreInfo.data) {
-            let value = record.value
-            const newFileId = idMap.get(value.fileId)
-            if (newFileId == null) continue
-            value.fileId = newFileId
-            delete value.id
-            chunksStore.add(value)
-        }
-        await promisifyTransaction(chunksTx)
-
-        // Process other stores like "Folders" normally
-        const otherStores = Object.keys(dbData.stores).filter(name => name !== FILES_SN && name !== "FileChunks")
-        for (const storeName of otherStores) {
-            const storeInfo = dbData.stores[storeName]
-            const tx = db.transaction([storeName], "readwrite")
-            const store = tx.objectStore(storeName)
-            for (const record of storeInfo.data) {
-                if (store.keyPath) store.put(record.value)
-                else store.put(record.value, record.key)
-            }
-            await promisifyTransaction(tx)
-        }
-    } else {
-        // For all other databases, use the simple restore logic
-        for (const storeName in dbData.stores) {
-            const storeInfo = dbData.stores[storeName]
-            const transaction = db.transaction([storeName], "readwrite")
-            const store = transaction.objectStore(storeName)
-            for (const record of storeInfo.data) {
-                if (store.keyPath != null) store.put(record.value)
-                else store.put(record.value, record.key)
-            }
-            await promisifyTransaction(transaction)
-        }
     }
+
+    const storeNamesToRestore = Object.keys(dbData.stores).filter(name => {
+        // Skip stores that were handled in the special block above
+        return !(dbName === DBN && name === FILES_SN)
+    })
+
+    if (storeNamesToRestore.length > 0) {
+        const transaction = db.transaction(storeNamesToRestore, "readwrite")
+        for (const storeName of storeNamesToRestore) {
+            const storeInfo = dbData.stores[storeName]
+            const store = transaction.objectStore(storeName)
+
+            for (const record of storeInfo.data) {
+                let valueToPut = record.value
+
+                if (dbName === DBN && storeName === "FileChunks") {
+                    const newFileId = idMap.get(valueToPut.fileId)
+                    if (newFileId == null) continue // Skip orphaned chunks
+                    valueToPut.fileId = newFileId
+                }
+
+                // Convert any ArrayBuffers in FileCacheDB back to Blobs
+                if (dbName === DBN && storeName === FILES_SN && valueToPut.buffer instanceof ArrayBuffer) {
+                    valueToPut.buffer = new Blob([valueToPut.buffer])
+                }
+
+                // This is the universal put logic
+                if (store.keyPath) {
+                    // For stores with in-line keys (like Folders, Rules, etc)
+                    store.put(valueToPut)
+                } else {
+                    // For stores with out-of-line keys
+                    store.put(valueToPut, record.key)
+                }
+            }
+        }
+        await promisifyTransaction(transaction)
+    }
+
     db.close()
 }
 
@@ -1074,12 +1075,18 @@ async function deleteFileByPathAndChunks(db, folderName, path) {
  * Gathers all application data (IndexedDB, localStorage, cookies), optionally
  * encrypts it, and presents a download link to the user.
  */
+// In main.js
+
+/**
+ * Gathers all application data (IndexedDB, localStorage, cookies), optionally
+ * encrypts it, and presents a download link to the user
+ */
 async function exportData() {
-    const password = prompt("Enter an optional password to encrypt the export; leave blank for a plaintext export:")
+    const password = prompt("Enter an optional password to encrypt the export leave blank for a plaintext export:")
     setUiBusy(true)
 
     try {
-        var dataToExport = {
+        const dataToExport = {
             localStorage: {},
             indexedDB: {},
             cookies: ""
@@ -1102,10 +1109,11 @@ async function exportData() {
         const exportIndexedDB = document.getElementById("c3").checked
         if (exportRuntimeFS || exportIndexedDB) {
             const allDbs = await indexedDB.databases()
-            for (const dbInfo of allDbs) {
+
+            const dbProcessingPromises = allDbs.map(async (dbInfo) => {
                 const dbName = dbInfo.name
-                if (!exportRuntimeFS && dbName === DBN) continue
-                else if (exportRuntimeFS && !exportIndexedDB && dbName !== DBN) continue
+                if (!exportRuntimeFS && dbName === DBN) return null
+                if (exportRuntimeFS && !exportIndexedDB && dbName !== DBN) return null
 
                 try {
                     const db = await new Promise((resolve, reject) => {
@@ -1115,17 +1123,18 @@ async function exportData() {
                     })
 
                     const dbExport = { version: db.version, stores: {} }
+                    const storeNames = Array.from(db.objectStoreNames)
 
-                    if (db.objectStoreNames.length > 0) {
-                        const transaction = db.transaction(db.objectStoreNames, "readonly")
-                        for (const storeName of db.objectStoreNames) {
+                    if (storeNames.length > 0) {
+                        const transaction = db.transaction(storeNames, "readonly")
+                        const storeProcessingPromises = storeNames.map(async (storeName) => {
                             const store = transaction.objectStore(storeName)
                             const indexes = Array.from(store.indexNames).map(name => {
                                 const index = store.index(name)
                                 return { name: index.name, keyPath: index.keyPath, unique: index.unique, multiEntry: index.multiEntry }
                             })
 
-                            const records = await new Promise((resolve, reject) => {
+                            const recordsWithKeys = await new Promise((resolve, reject) => {
                                 const cursorReq = store.openCursor()
                                 const allRecords = []
                                 cursorReq.onerror = e => reject(e.target.error)
@@ -1140,23 +1149,70 @@ async function exportData() {
                                 }
                             })
 
-                            dbExport.stores[storeName] = {
-                                schema: { keyPath: store.keyPath, autoIncrement: store.autoIncrement, indexes },
-                                data: records
+                            if (dbName === DBN && storeName === FILES_SN) {
+                                const recordsWithBlobs = recordsWithKeys.filter(r => r.value.buffer instanceof Blob)
+                                if (recordsWithBlobs.length > 0) {
+                                    console.log(`Found ${recordsWithBlobs.length} file records with Blobs to process...`)
+                                    const MAX_BATCH_SIZE_BYTES = 128 * 1024 * 1024 // 128MB
+                                    let currentBatch = []
+                                    let currentBatchSizeBytes = 0
+                                    let batchNum = 1
+
+                                    for (const recordItem of recordsWithBlobs) {
+                                        const recordSize = recordItem.value.buffer.size
+                                        if (currentBatch.length > 0 && (currentBatchSizeBytes + recordSize) > MAX_BATCH_SIZE_BYTES) {
+                                            console.log(`Processing batch #${batchNum}: ${currentBatch.length} files, ~${(currentBatchSizeBytes / 1024 / 1024).toFixed(2)} MB`)
+                                            const conversionPromises = currentBatch.map(async (item) => {
+                                                const buffer = await item.value.buffer.arrayBuffer()
+                                                item.value.buffer = buffer // Modify the object directly
+                                            })
+                                            await Promise.all(conversionPromises)
+                                            currentBatch = []
+                                            currentBatchSizeBytes = 0
+                                            batchNum++
+                                        }
+                                        currentBatch.push(recordItem)
+                                        currentBatchSizeBytes += recordSize
+                                    }
+
+                                    if (currentBatch.length > 0) {
+                                        console.log(`Processing final batch #${batchNum}: ${currentBatch.length} files, ~${(currentBatchSizeBytes / 1024 / 1024).toFixed(2)} MB`)
+                                        const conversionPromises = currentBatch.map(async (item) => {
+                                            const buffer = await item.value.buffer.arrayBuffer()
+                                            item.value.buffer = buffer // Modify the object directly
+                                        })
+                                        await Promise.all(conversionPromises)
+                                    }
+                                }
                             }
+
+                            return [storeName, {
+                                schema: { keyPath: store.keyPath, autoIncrement: store.autoIncrement, indexes },
+                                data: recordsWithKeys
+                            }]
+                        })
+
+                        const processedStoresArray = await Promise.all(storeProcessingPromises)
+                        for (const [storeName, storeData] of processedStoresArray) {
+                            dbExport.stores[storeName] = storeData
                         }
                     }
 
-                    dataToExport.indexedDB[dbName] = dbExport
                     db.close()
+                    return [dbName, dbExport]
                 } catch (e) {
-                    console.warn(`Could not export database "${dbName}". Skipping. Reason: ${e.name} - ${e.message}`)
+                    console.warn(`Could not export database "${dbName}" Skipping Reason: ${e.name} - ${e.message}`)
+                    return null
                 }
+            })
+
+            const processedDbsArray = (await Promise.all(dbProcessingPromises)).filter(Boolean)
+            for (const [dbName, dbExport] of processedDbsArray) {
+                dataToExport.indexedDB[dbName] = dbExport
             }
         }
 
         const encoded = CBOR.encode(dataToExport)
-        dataToExport = null
         let finalBuffer = password ? CBOR.encode(await encryptPayload(encoded, password)) : encoded
 
         if (window.showSaveFilePicker) {
@@ -1173,19 +1229,16 @@ async function exportData() {
                 await writable.close()
                 console.log("Data export complete!")
             } catch (err) {
-                // Handle user cancellation (AbortError) or other errors gracefully
                 if (err.name !== "AbortError") {
                     console.error("Could not save file with File System Access API, falling back:", err)
-                    // If it fails for any reason other than user cancellation, fall back
                     createAndDisplayDownloadLink(finalBuffer, document.getElementById("c3").parentElement, "result.cbor")
                 }
             }
         } else {
-            // Fallback for browsers that don't support it
             createAndDisplayDownloadLink(finalBuffer, document.getElementById("c3").parentElement, "result.cbor")
         }
 
-        console.log("Data export prepared.")
+        console.log("Data export prepared")
     } catch (e) {
         console.error("Export failed:", e)
         alert("An error occurred during export: " + (e.message || e.name))
@@ -1395,7 +1448,7 @@ async function createAndDisplayDownloadLink(buffer, parentElement, filename) {
                     types: [{
                         description: "CBOR File",
                         accept: { "application/octet-stream": [".cbor"] },
-                    }],
+                    }]
                 })
                 const writable = await handle.createWritable()
                 await writable.write(buffer)

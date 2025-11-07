@@ -8,7 +8,7 @@ Imagine a localhost, in your browser, with no traces of network activity of file
 After initial page load, RuntimeFS no longer needs internet connection to function.
 RuntimeFS has been tested in Chromium and Firefox (although most features will never work for Firefox, as they use the File System API). Using the tool in Incognito might fail due to memory limitations with a `QuotaExceededError`.
 
-If you are hosting this, it is suggested that you simply minify the JavaScript files first with a tool like https://jscompress.com/. When compressed, RuntimeFS is `<100KB`.
+If you are hosting this, it is suggested that you simply minify the JavaScript files first with a tool like https://jscompress.com/. When minified, RuntimeFS is `<100KB`.
 
 Do note that many projects might not work; projects that use **synchronous** AJAX requests (commonly done with JQuery's `$.ajax({type: "GET", url: "...", async: false })`) will not work due to fundamental ServiceWorker limitations. (This type of request is also being phased out from browsers gradually.)
 

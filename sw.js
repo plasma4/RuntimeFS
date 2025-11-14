@@ -140,7 +140,7 @@ function applyRegexRules(filePath, fileBuffer, fileType, regexRules) {
             if (parts.length < 2) continue
 
             const matchPart = parts[0].trim()
-            // This correctly handles cases where '->' might exist in the replacement string
+            // This correctly handles cases where "->" might exist in the replacement string
             const replacePart = parts.slice(1).join("->").trim()
 
             // Use a robust regex that correctly parses the file match, operator, and search pattern
@@ -282,7 +282,7 @@ self.addEventListener("activate", e => {
                 for (const client of allClients) {
                     client.postMessage({ type: "SW_READY" })
                 }
-                console.log("SW: Database is ready, posted 'SW_READY' to clients.")
+                console.log(`SW: Database is ready, posted "SW_READY" to clients.`)
             } catch (err) {
                 console.error("SW: Failed to initialize database during activation:", err)
             }
@@ -293,6 +293,22 @@ self.addEventListener("activate", e => {
 self.addEventListener("fetch", e => {
     const { request, clientId } = e
     const url = new URL(request.url)
+
+    const isAppShellRequest = FULL_APP_SHELL_URLS.includes(request.url)
+    const isVirtualRequest = url.pathname.startsWith(virtualPathPrefix)
+
+    if (!isAppShellRequest && !isVirtualRequest && request.referrer) {
+        const referrerUrl = new URL(request.referrer)
+        if (referrerUrl.pathname.startsWith(virtualPathPrefix)) {
+            // The request is coming from within one of your virtual folders.
+            const pathParts = referrerUrl.pathname.substring(virtualPathPrefix.length).split("/")
+            const folderName = pathParts[0]
+
+            const newUrl = `${self.location.origin}/n/${folderName}${url.pathname}`
+            e.respondWith(fetch(newUrl))
+            return; // Stop processing here
+        }
+    }
 
     // Main file serving logic
     e.respondWith((async () => {
@@ -330,7 +346,7 @@ self.addEventListener("fetch", e => {
             if (!session && pendingNavData) {
                 session = pendingNavData
             }
-            if (request.mode === 'navigate' && pendingNavData) {
+            if (request.mode === "navigate" && pendingNavData) {
                 clientSessionStore.set(clientId, { ...pendingNavData, timestamp: Date.now() })
                 setTimeout(() => { if (pendingNavData === session) pendingNavData = null }, 2000)
             }
@@ -364,7 +380,7 @@ self.addEventListener("fetch", e => {
         // Fallback for any other request
         return fetch(request).catch(() => new Response("Network error", {
             status: 500,
-            headers: { 'Cache-Control': 'no-store' }
+            headers: { "Cache-Control": "no-store" }
         }))
     })())
 })
@@ -611,10 +627,11 @@ async function generateResponseForVirtualFile(request, session) {
     const folderName = pathParts[0]
     let decodedFilePath = pathParts.slice(1).join("/")
 
+    decodedFilePath = decodedFilePath.replace(/\/+/g, "/")
+
     if (!decodedFilePath || decodedFilePath.endsWith("/")) {
         decodedFilePath = (decodedFilePath || "") + "index.html"
     }
-
     const db = await getDb()
     const transaction = db.transaction([FILES_SN, FOLDERS_SN], "readonly") // Locate stuff
     const fileStore = transaction.objectStore(FILES_SN)
@@ -636,7 +653,7 @@ async function generateResponseForVirtualFile(request, session) {
     if (!fileMetadata) {
         return new Response(`File not found: ${decodedFilePath}`, {
             status: 404,
-            headers: { 'Cache-Control': 'no-store' }
+            headers: { "Cache-Control": "no-store" }
         })
     }
 

@@ -376,10 +376,6 @@ async function syncAndOpenFile() {
 }
 
 async function performSyncToDb() {
-    if (changes.length === 0) {
-        return 0
-    }
-
     console.log(`Processing ${changes.length} changes for "${folderName}"...`)
     const db = await getDb()
     let updateCount = 0
@@ -420,8 +416,8 @@ async function performSyncToDb() {
             if (op.file.size > CHUNK_SIZE) {
                 await streamFileToDb(db, folderName, op.path, op.file)
             } else {
-                const addTx = db.transaction(FILES_SN, "readwrite")
                 const buffer = await op.file.arrayBuffer()
+                const addTx = db.transaction(FILES_SN, "readwrite")
                 addTx.objectStore(FILES_SN).put({
                     folderName: folderName,
                     path: op.path,
@@ -440,13 +436,13 @@ async function performSyncToDb() {
             if (op.file.size > CHUNK_SIZE) {
                 await streamFileToDb(db, folderName, op.path, op.file)
             } else {
-                const addTx = db.transaction(FILES_SN, "readwrite")
                 const buffer = await op.file.arrayBuffer()
+                const addTx = db.transaction(FILES_SN, "readwrite")
                 addTx.objectStore(FILES_SN).put({
                     folderName: folderName,
                     path: op.path,
                     buffer: new Blob([buffer]),
-                    type: getMimeType(op.path) || op.file.type, // Corrected line
+                    type: getMimeType(op.path) || op.file.type,
                     lookupPath: `${folderName}/${op.path}`
                 })
                 await promisifyTransaction(addTx)
@@ -796,7 +792,7 @@ async function openFile(overrideFolderName) {
 
         if (isEncrypted) {
             const password = prompt(`Enter password for folder "${folderName}":`)
-            if (!password) return // The 'finally' block will still run, fixing the bug.
+            if (!password) return
 
             try {
                 const transaction = db.transaction(FILES_SN, "readonly")
@@ -812,7 +808,7 @@ async function openFile(overrideFolderName) {
             } catch (e) {
                 console.error("Decryption failed:", e)
                 alert("Decryption failed. Please check the folder name and password.")
-                return // The 'finally' block will also run here.
+                return
             }
         }
 
@@ -847,12 +843,12 @@ async function openFile(overrideFolderName) {
             })
         } catch (err) {
             alert(`Error preparing to open file: ${err.message}`)
-            return // And here too, 'finally' will execute.
+            return
         }
 
         const encodedFolderName = encodeURIComponent(folderName)
         const encodedFilePath = fileName.split("/").map(segment => encodeURIComponent(segment)).join("/")
-        const url = `/n/${encodedFolderName}/${encodedFilePath}`
+        const url = `n/${encodedFolderName}/${encodedFilePath}`
         window.open(url, "_blank")
     } finally {
         // This block is guaranteed to run, ensuring the UI is always re-enabled.

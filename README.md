@@ -10,7 +10,7 @@ RuntimeFS has been tested in Chromium and Firefox (although most features will n
 
 If you are hosting this, it is suggested that you simply minify the JavaScript files first with a tool like https://jscompress.com/. When minified, RuntimeFS is `<100KB`.
 
-Do note that many projects might not work; projects that use **synchronous** AJAX requests (commonly done with JQuery's `$.ajax({type: "GET", url: "...", async: false })`) will not work due to fundamental ServiceWorker limitations. (This type of request is also being phased out from browsers gradually.)
+Do note that many projects might not work; projects that use **synchronous** AJAX requests (commonly done with JQuery's `$.ajax({type: "GET", url: "...", async: false })`) will not work due to fundamental ServiceWorker limitations. (This type of request is also being phased out from browsers gradually.) Additionally, file names are case-sensitive!
 
 ### TODO
 - More optimization, and ability to export large `.cbor` files without crashes

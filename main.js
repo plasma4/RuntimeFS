@@ -1,30 +1,7 @@
-const DBN = "FileCacheDB"
-const FOLDERS_SN = "Folders"
-const FILES_SN = "Files"
-const META_SN = "Metadata"
-const RULES_SN = "Rules"
-const DB_VERSION = 11 // Version 1.1
-
-const CHUNK_SIZE = 4 * 1024 * 1024 // 4MB chunks
-const BATCH_SIZE = 50 // Batch of 50
+import {CACHE_NAME,clientSessionStore,DBN,DB_VERSION,dbPromise,FILES_SN,FOLDERS_SN,FULL_APP_SHELL_URLS,promisifyRequest,promisifyTransaction,getDb,getMimeType,escapeRegex,applyRegexRules} from './util'
 // Fetches all folder names from IndexedDB and displays them in the UI.
 let isListingFolders = false
 
-// Helper function to wrap IndexedDB requests in a Promise
-function promisifyRequest(request) {
-    return new Promise((resolve, reject) => {
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-    })
-}
-
-function promisifyTransaction(transaction) {
-    return new Promise((resolve, reject) => {
-        transaction.oncomplete = () => resolve()
-        transaction.onerror = () => reject(transaction.error)
-        transaction.onabort = () => reject(transaction.error || new DOMException("Transaction aborted"))
-    })
-}
 
 let currentlyBusy = false
 function setUiBusy(isBusy) {
@@ -41,58 +18,6 @@ navigator.storage.persist().then(persistent => {
     }
 })
 
-let dbPromise = null
-function getDb() {
-    if (!dbPromise) {
-        dbPromise = new Promise((resolve, reject) => {
-            const request = indexedDB.open(DBN, DB_VERSION)
-
-            request.onupgradeneeded = function (e) {
-                const db = e.target.result
-                const transaction = e.target.transaction
-
-                // Create standard stores if they don't exist
-                if (!db.objectStoreNames.contains(FOLDERS_SN)) {
-                    db.createObjectStore(FOLDERS_SN, { keyPath: "id" })
-                }
-                if (!db.objectStoreNames.contains(RULES_SN)) {
-                    db.createObjectStore(RULES_SN, { keyPath: "id" })
-                }
-
-                let fileStore
-                if (!db.objectStoreNames.contains(FILES_SN)) {
-                    fileStore = db.createObjectStore(FILES_SN, { keyPath: "id", autoIncrement: true })
-                } else {
-                    fileStore = transaction.objectStore(FILES_SN)
-                }
-
-                if (!fileStore.indexNames.contains("lookup")) {
-                    fileStore.createIndex("lookup", "lookupPath", { unique: true })
-                }
-
-                if (!db.objectStoreNames.contains("FileChunks")) {
-                    const chunkStore = db.createObjectStore("FileChunks", { keyPath: "id", autoIncrement: true })
-                    chunkStore.createIndex("by_file", "fileId", { unique: false })
-                }
-            }
-
-            request.onsuccess = e => {
-                db = e.target.result
-                db.onversionchange = () => {
-                    console.warn("Database version change detected, closing connection.")
-                    if (db) {
-                        db.close()
-                    }
-                    db = null
-                    dbPromise = null
-                }
-                resolve(db)
-            }
-            request.onerror = e => reject(e.target.errorCode)
-        })
-    }
-    return dbPromise
-}
 
 // Global variables to hold state for the currently managed folder.
 let folderName, dirHandle, observer
@@ -594,54 +519,7 @@ function invalidateCacheAndWait(folderName) {
     })
 }
 
-/**
- * Determines the MIME type of a file based on its extension.
- * @param {string} filePath The path to the file.
- * @returns {string | undefined} The MIME type or undefined if not found.
- */
-function getMimeType(filePath) {
-    const ext = filePath.split(".").pop().toLowerCase()
-    const mimeTypes = {
-        // Web Text/Markup
-        "html": "text/html", "htm": "text/html", "css": "text/css",
-        "js": "application/javascript", "mjs": "application/javascript",
-        "json": "application/json", "xml": "application/xml",
-        "txt": "text/plain", "md": "text/markdown", "csv": "text/csv",
-        "php": "text/html", "appcache": "text/cache-manifest",
-        "xhtml": "application/xhtml+xml",
 
-        // Images
-        "ico": "image/x-icon", "bmp": "image/bmp", "gif": "image/gif",
-        "jpeg": "image/jpeg", "jpg": "image/jpeg", "png": "image/png",
-        "svg": "image/svg+xml", "tif": "image/tiff", "tiff": "image/tiff",
-        "webp": "image/webp", "avif": "image/avif",
-
-        // Audio
-        "mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg",
-        "weba": "audio/webm", "mid": "audio/midi",
-
-        // Video
-        "mp4": "video/mp4", "webm": "video/webm", "mpeg": "video/mpeg",
-        "ogv": "video/ogg", "3gp": "video/3gpp", "avi": "video/x-msvideo",
-
-        // Documents & Other Apps
-        "pdf": "application/pdf", "rtf": "application/rtf",
-        "ogg": "application/ogg", // Generic OGG container
-
-        // Archives/Compressed
-        "zip": "application/zip", "gz": "application/gzip",
-        "rar": "application/vnd.rar", "tar": "application/x-tar",
-        "7z": "application/x-7z-compressed",
-
-        // Fonts
-        "woff": "font/woff", "woff2": "font/woff2", "ttf": "font/ttf",
-        "otf": "font/otf", "eot": "application/vnd.ms-fontobject",
-
-        // WebAssembly
-        "wasm": "application/wasm"
-    }
-    return mimeTypes[ext]
-}
 
 // Retrieves a file or directory handle from a given root directory and a relative path.
 async function getHandleFromPath(rootDirHandle, path) {

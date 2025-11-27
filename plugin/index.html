@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<meta charset="utf-8">
+
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Plugin</title>
+    <style>
+        * {
+            font-family: monospace;
+            box-sizing: border-box;
+        }
+
+        body {
+            background-color: black;
+            color: white;
+            padding: 20px;
+            max-width: 600px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            color: #e1d5be;
+            border-bottom: 1px solid white;
+            padding-bottom: 10px;
+        }
+
+        h2 {
+            color: #e1d5be;
+            font-size: 1.2em;
+            margin-top: 30px;
+            border-bottom: 1px solid #555;
+            padding-bottom: 5px;
+        }
+
+        .warning {
+            color: #ff6b6b;
+            border: 1px solid #ff6b6b;
+            padding: 10px;
+            margin-bottom: 15px;
+        }
+
+        input,
+        button {
+            width: 100%;
+            padding: 10px;
+            margin-bottom: 10px;
+            border-radius: 5px;
+            border: 1px solid #959595;
+            background: #3a5774;
+            color: white;
+        }
+
+        button {
+            background-color: #15e264;
+            border-color: #3d4c3d;
+            cursor: pointer;
+            color: black;
+            font-weight: bold;
+        }
+
+        button:hover {
+            background-color: #14af50;
+        }
+
+        button.danger {
+            background-color: #d64545;
+            color: white;
+            border-color: #8a2a2a;
+        }
+
+        button.danger:hover {
+            background-color: #b03636;
+        }
+
+        .log {
+            background: #111;
+            padding: 10px;
+            border: 1px solid #333;
+            min-height: 100px;
+            white-space: pre-wrap;
+            font-size: 0.9em;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>RuntimeFS Plugin</h1>
+
+    <div class="warning">
+        Warning: These actions affect the Service Worker Cache ("fc").
+        Changes require a page reload to take effect.
+    </div>
+
+    <h2>Patch Specific File</h2>
+    <label>Target File to Patch (e.g., ./main.js)</label>
+    <input type="text" id="targetPath" value="./main.js">
+
+    <label>Select New File</label>
+    <input type="file" id="fileInput">
+
+    <button onclick="patchCache()">Patch App Shell</button>
+
+    <h2>Maintenance</h2>
+    <p>If you want to force an update for RuntimeFS itself, clear the cache (and uninstall the worker). Make sure to reload after!</p>
+    <button class="danger" onclick="clearStuff()">Delete RuntimeFS Cache and Worker</button>
+
+    <div class="log" id="log"></div>
+
+    <script>
+        const logElem = document.getElementById("log")
+        function log(msg) { logElem.textContent += msg + "\n" }
+        const CACHE_NAME = "fc"
+        async function patchCache() {
+            const targetPath = document.getElementById("targetPath").value.trim()
+            const fileInput = document.getElementById("fileInput")
+
+            if (!targetPath || !fileInput.files.length) {
+                return alert("Please select a file and a target path.")
+            }
+
+            try {
+                log(`Opening cache: ${CACHE_NAME}...`)
+                const cache = await caches.open(CACHE_NAME)
+
+                const file = fileInput.files[0]
+                const fileContent = await file.arrayBuffer()
+
+                const headers = new Headers()
+                headers.append("Content-Type", file.type || "application/javascript")
+                headers.append("Content-Length", file.size)
+
+                const response = new Response(fileContent, {
+                    status: 200,
+                    statusText: "OK",
+                    headers: headers
+                })
+
+                const url = new URL(targetPath, window.location.href).href
+
+                log(`Patching ${url}...`)
+                await cache.put(url, response)
+
+                log("Success! Reload the page to see changes.")
+                alert("Patch applied. Please reload the page.")
+            } catch (e) {
+                log(`Error: ${e.message}`)
+                console.error(e)
+            }
+        }
+
+        async function clearStuff() {
+            try {
+                if (!navigator.onLine) {
+                    const proceed = confirm("You are offline!\nIf you clear the cache now, RuntimeFS will stop functioning until you reconnect to the internet.\n\nContinue anyway?")
+                    if (!proceed) return
+                }
+
+                log(`Attempting to delete cache and worker...`)
+                const success = await caches.delete(CACHE_NAME)
+                if (success) {
+                    log("Cache deleted successfully.")
+                } else {
+                    log("Cache not found!")
+                }
+                var scriptURL = null
+                navigator.serviceWorker.getRegistrations().then(async registrations => {
+                    let count = 0
+                    for (const registration of registrations) {
+                        const worker = registration.active || registration.waiting || registration.installing
+                        scriptURL = worker.scriptURL
+                        if (worker && scriptURL.slice(-5) === "sw.js") {
+                            const success = await registration.unregister()
+                            if (success) {
+                                log(`Unregistered RuntimeFS worker at: ${registration.scope}.`)
+                                count++
+                            }
+                        }
+                    }
+
+                    if (count === 0) log("No RuntimeFS service worker found!")
+                })
+            } catch (e) {
+                log(`Error deleting cache: ${e.message}`)
+                console.error(e)
+            }
+        }
+    </script>
+</body>
+
+</html>

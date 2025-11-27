@@ -3,685 +3,438 @@ let pendingNavData = null
 // A single map to store session data (rules, keys) for each client tab.
 const clientSessionStore = new Map()
 
-const DBN = "FileCacheDB"
-const FOLDERS_SN = "Folders"
-const FILES_SN = "Files"
-const RULES_SN = "Rules"
-const DB_VERSION = 11 // Version 1.1
-
+const RFS_PREFIX = "rfs"
+const SYSTEM_FILE = "rfs_system.json"
 const CACHE_NAME = "fc"
-const APP_SHELL_FILES = ["./", "./index.html", "./main.js", "./cbor-x.js"] // core files
-
+const APP_SHELL_FILES = ["./", "./index.html", "./main.js", "./cbor-x.js"]
 const FULL_APP_SHELL_URLS = APP_SHELL_FILES.map(file => new URL(file, self.location.href).href)
 
-// Promise for the IndexedDB connection.
-let dbPromise = null
-
 const STORE_ENTRY_TTL = 30000 // 30 seconds
-
 const basePath = new URL("./", self.location).pathname
 const virtualPathPrefix = basePath + "n/"
+
+// Cache for the system.json registry to avoid disk reads on every request
+let registryCache = null
 
 function cleanupExpiredStores() {
     const now = Date.now()
     for (const [clientId, sessionData] of clientSessionStore.entries()) {
-        if (now - sessionData.timestamp > (STORE_ENTRY_TTL * 2)) {
+        if (now - sessionData.timestamp > STORE_ENTRY_TTL) {
             clientSessionStore.delete(clientId)
-            console.log(`SW: Cleaned up expired session for client ${clientId}.`)
         }
     }
 }
 
-cleanupExpiredStores()
+setInterval(cleanupExpiredStores, 60000)
 
-/**
- * Promisifies an IndexedDB request.
- * @param {IDBRequest} req The IndexedDB request.
- * @returns {Promise<any>} A promise that resolves with the request result or rejects on error.
- */
-function promisifyRequest(req) {
-    return new Promise((resolve, reject) => {
-        req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error)
-    })
-}
-
-/**
- * Promisifies an IndexedDB transaction completion.
- * @param {IDBTransaction} transaction The IndexedDB transaction.
- * @returns {Promise<void>} A promise that resolves when the transaction completes or rejects on error/abort.
- */
-function promisifyTransaction(transaction) {
-    return new Promise((resolve, reject) => {
-        transaction.oncomplete = () => resolve()
-        transaction.onerror = () => reject(transaction.error)
-        transaction.onabort = () => reject(transaction.error || new DOMException("Transaction aborted"))
-    })
-}
-
-/**
- * Determines the MIME type of a file based on its extension.
- * @param {string} filePath The path to the file.
- * @returns {string | undefined} The MIME type or undefined if not found.
- */
-function getMimeType(filePath) {
-    const ext = filePath.split(".").pop().toLowerCase()
-    const mimeTypes = {
-        // Web Text/Markup
-        "html": "text/html", "htm": "text/html", "css": "text/css",
-        "js": "application/javascript", "mjs": "application/javascript",
-        "json": "application/json", "xml": "application/xml",
-        "txt": "text/plain", "md": "text/markdown", "csv": "text/csv",
-        "php": "text/html", "appcache": "text/cache-manifest",
-        "xhtml": "application/xhtml+xml",
-
-        // Images
-        "ico": "image/x-icon", "bmp": "image/bmp", "gif": "image/gif",
-        "jpeg": "image/jpeg", "jpg": "image/jpeg", "png": "image/png",
-        "svg": "image/svg+xml", "tif": "image/tiff", "tiff": "image/tiff",
-        "webp": "image/webp", "avif": "image/avif",
-
-        // Audio
-        "mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg",
-        "weba": "audio/webm", "mid": "audio/midi",
-
-        // Video
-        "mp4": "video/mp4", "webm": "video/webm", "mpeg": "video/mpeg",
-        "ogv": "video/ogg", "3gp": "video/3gpp", "avi": "video/x-msvideo",
-
-        // Documents & Other Apps
-        "pdf": "application/pdf", "rtf": "application/rtf",
-        "ogg": "application/ogg", // Generic OGG container
-
-        // Archives/Compressed
-        "zip": "application/zip", "gz": "application/gzip",
-        "rar": "application/vnd.rar", "tar": "application/x-tar",
-        "7z": "application/x-7z-compressed",
-
-        // Fonts
-        "woff": "font/woff", "woff2": "font/woff2", "ttf": "font/ttf",
-        "otf": "font/otf", "eot": "application/vnd.ms-fontobject",
-
-        // WebAssembly
-        "wasm": "application/wasm"
-    }
-    return mimeTypes[ext]
-}
-
-/**
- * Escapes special characters in a string for safe use in a regular expression.
- * @param {string} string The string to escape.
- * @returns {string} The escaped string.
- */
 function escapeRegex(string) {
     return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
 
-/**
- * Applies regex search and replace rules to file content if it's text-based.
- * @param {string} filePath The path of the file being processed.
- * @param {ArrayBuffer} fileBuffer The file's content.
- * @param {string} fileType The file's MIME type.
- * @param {string | null} regexRules The rules string.
- * @returns {ArrayBuffer} The potentially modified file content.
- */
-function applyRegexRules(filePath, fileBuffer, fileType, regexRules) {
-    if (!regexRules || !regexRules.trim()) return fileBuffer
+function compileRules(rulesString) {
+    if (!rulesString || !rulesString.trim()) return []
+    const compiled = []
+    const lines = rulesString.trim().split(/\r?\n/)
 
-    // A more inclusive check to ensure JS, JSON, and other text files are processed
-    if (!/^(text\/|application\/(javascript|json|xml|x-javascript))/.test(fileType)) return fileBuffer
+    for (const line of lines) {
+        const parts = line.split("->")
+        if (parts.length < 2) continue
+
+        const matchPart = parts[0].trim()
+        const replacePart = parts.slice(1).join("->").trim()
+        const operatorMatch = matchPart.match(/^(.*?)\s+(\$|\$\$|\|\||\|)\s+(.*)$/s)
+
+        if (!operatorMatch) continue
+
+        const [, fileMatch, operator, searchPattern] = operatorMatch
+        const fileRegex = new RegExp(fileMatch.trim() === "*" ? ".*" : fileMatch.trim())
+
+        let searchRegex
+        try {
+            switch (operator) {
+                case "|": searchRegex = new RegExp(searchPattern, "g"); break
+                case "$": searchRegex = new RegExp(escapeRegex(searchPattern), "g"); break
+                case "||": searchRegex = new RegExp(searchPattern); break
+                case "$$": searchRegex = new RegExp(escapeRegex(searchPattern)); break
+            }
+        } catch (e) { continue }
+
+        if (searchRegex) compiled.push({ fileRegex, searchRegex, replacePart })
+    }
+    return compiled
+}
+
+function applyRegexRules(filePath, fileBuffer, fileType, compiledRules) {
+    // Optimization: Don't run regex on binaries or huge files
+    if (!/^(text\/|application\/(javascript|json|xml|x-javascript|typescript))/.test(fileType)) return fileBuffer
+    if (fileBuffer.byteLength > 10 * 1024 * 1024) return fileBuffer
 
     try {
         let content = new TextDecoder().decode(fileBuffer)
-        const rules = regexRules.trim().split("\n")
+        let modified = false
 
-        for (const line of rules) {
-            const parts = line.split("->")
-            if (parts.length < 2) continue
-
-            const matchPart = parts[0].trim()
-            // This correctly handles cases where "->" might exist in the replacement string
-            const replacePart = parts.slice(1).join("->").trim()
-
-            // Use a robust regex that correctly parses the file match, operator, and search pattern
-            const operatorMatch = matchPart.match(/^(.*?)\s+(\$|\$\$|\|\||\|)\s+(.*)$/s)
-            if (!operatorMatch) continue
-
-            const [, fileMatch, operator, searchPattern] = operatorMatch
-            const fileRegex = new RegExp(fileMatch.trim() === "*" ? ".*" : fileMatch.trim())
-
-            // If the rule's file path doesn't match, skip to the next rule
-            if (!fileRegex.test(filePath)) continue
-
-            let searchRegex
-            switch (operator) {
-                case "|": // User provides a full regex pattern
-                    searchRegex = new RegExp(searchPattern, "g")
-                    break
-                case "$": // User provides plain text to be searched
-                    searchRegex = new RegExp(escapeRegex(searchPattern), "g")
-                    break
-                case "||": // Single-match version of regex
-                    searchRegex = new RegExp(searchPattern)
-                    break
-                case "$$": // Single-match version of plain text
-                    searchRegex = new RegExp(escapeRegex(searchPattern))
-                    break
-            }
-
-            if (searchRegex) {
-                content = content.replace(searchRegex, replacePart)
+        for (const rule of compiledRules) {
+            if (rule.fileRegex.test(filePath)) {
+                if (rule.searchRegex.test(content)) {
+                    content = content.replace(rule.searchRegex, rule.replacePart)
+                    modified = true
+                }
             }
         }
-        return new TextEncoder().encode(content).buffer
+        return modified ? new TextEncoder().encode(content).buffer : fileBuffer
     } catch (e) {
         console.error(`Error applying regex rules to ${filePath}:`, e)
         return fileBuffer
     }
 }
 
-/**
- * Gets the IndexedDB connection promise, creating it if it doesn't exist.
- * @returns {Promise<IDBDatabase>} A promise that resolves with the DB instance.
- */
-function getDb() {
-    if (!dbPromise) {
-        dbPromise = new Promise((resolve, reject) => {
-            const request = indexedDB.open(DBN, DB_VERSION)
-
-            request.onupgradeneeded = function (e) {
-                const db = e.target.result
-                const transaction = e.target.transaction
-
-                // Create standard stores if they don't exist
-                if (!db.objectStoreNames.contains(FOLDERS_SN)) {
-                    db.createObjectStore(FOLDERS_SN, { keyPath: "id" })
-                }
-                if (!db.objectStoreNames.contains(RULES_SN)) {
-                    db.createObjectStore(RULES_SN, { keyPath: "id" })
-                }
-
-                let fileStore
-                if (!db.objectStoreNames.contains(FILES_SN)) {
-                    fileStore = db.createObjectStore(FILES_SN, { keyPath: "id", autoIncrement: true })
-                } else {
-                    fileStore = transaction.objectStore(FILES_SN)
-                }
-
-                if (!fileStore.indexNames.contains("lookup")) {
-                    fileStore.createIndex("lookup", "lookupPath", { unique: true })
-                }
-
-                if (!db.objectStoreNames.contains("FileChunks")) {
-                    const chunkStore = db.createObjectStore("FileChunks", { keyPath: "id", autoIncrement: true })
-                    chunkStore.createIndex("by_file", "fileId", { unique: false })
-                }
-            }
-
-            request.onsuccess = e => {
-                db = e.target.result
-                db.onversionchange = () => {
-                    console.warn("Database version change detected, closing connection.")
-                    if (db) {
-                        db.close()
-                    }
-                    db = null
-                    dbPromise = null
-                }
-                resolve(db)
-            }
-            request.onerror = e => reject(e.target.errorCode)
-        })
+async function getRegistry() {
+    if (registryCache) return registryCache
+    try {
+        const root = await navigator.storage.getDirectory()
+        const handle = await root.getFileHandle(SYSTEM_FILE)
+        const file = await handle.getFile()
+        registryCache = JSON.parse(await file.text())
+    } catch (e) {
+        registryCache = {}
     }
-    return dbPromise
+    return registryCache
 }
 
-// Service worker installation. Caches the application shell.
-self.addEventListener("install", e => {
-    e.waitUntil((async () => {
-        console.log("SW: Install event triggered. Caching app shell.")
-        const cache = await caches.open(CACHE_NAME)
-        // Use Promise.allSettled to ensure installation completes even if one file is missing
-        const results = await Promise.allSettled(
-            APP_SHELL_FILES.map(url =>
-                fetch(url, { cache: "no-cache" }).then(response => {
-                    if (!response.ok) {
-                        throw new Error(`Request for ${url} failed with status ${response.status}`)
-                    }
-                    return cache.put(url, response)
-                })
-            )
-        )
-        results.forEach(result => {
-            if (result.status === "rejected") {
-                console.warn(`SW Install: Failed to cache a resource. Reason:`, result.reason.message)
-            }
-        })
-        console.log("SW: Caching finished. Activating...")
-        await self.skipWaiting()
-    })())
+self.addEventListener("install", async function () {
+    const cache = await caches.open(CACHE_NAME)
+    await Promise.all(APP_SHELL_FILES.map(async (url) => {
+        try {
+            const response = await fetch(url, { cache: "reload" })
+            if (response.ok) await cache.put(url, response)
+        } catch (e) { console.warn("Failed to cache app shell file:", url) }
+    }))
+    await self.skipWaiting()
 })
 
-// Service worker activation cleans up stuff!
 self.addEventListener("activate", e => {
-    e.waitUntil(
-        (async () => {
-            // Standard cache cleanup
-            const keys = await caches.keys()
-            await Promise.all(
-                keys.map(k => k !== CACHE_NAME ? caches.delete(k) : null)
-            )
-
-            // Ensure the service worker takes control of the page immediately
-            await self.clients.claim()
-
-            // Now, wait for the database to be ready and notify clients.
-            try {
-                await getDb() // This ensures the DB connection is established.
-                const allClients = await self.clients.matchAll({ includeUncontrolled: true })
-                for (const client of allClients) {
-                    client.postMessage({ type: "SW_READY" })
-                }
-                console.log(`SW: Database is ready, posted "SW_READY" to clients.`)
-            } catch (err) {
-                console.error("SW: Failed to initialize database during activation:", err)
-            }
-        })()
-    )
-})
-
-self.addEventListener("fetch", e => {
-    const { request, clientId } = e
-    const url = new URL(request.url)
-
-    const isAppShellRequest = FULL_APP_SHELL_URLS.includes(request.url)
-    const isVirtualRequest = url.pathname.startsWith(virtualPathPrefix)
-
-    if (!isAppShellRequest && !isVirtualRequest && request.referrer) {
-        const referrerUrl = new URL(request.referrer)
-        if (referrerUrl.pathname.startsWith(virtualPathPrefix)) {
-            // The request is coming from within one of your virtual folders.
-            const pathParts = referrerUrl.pathname.substring(virtualPathPrefix.length).split("/")
-            const folderName = pathParts[0]
-
-            const newUrl = `${self.location.origin}/n/${folderName}${url.pathname}`
-            e.respondWith(fetch(newUrl))
-            return; // Stop processing here
-        }
-    }
-
-    // Main file serving logic
-    e.respondWith((async () => {
-        if (url.pathname.startsWith(virtualPathPrefix)) {
-            // Handle POST/PUT requests for saving files
-            if (request.method === "POST" || request.method === "PUT") {
-                try {
-                    const pathParts = url.pathname.split("/").slice(2)
-                    const folderName = decodeURIComponent(pathParts[0])
-                    const filePath = decodeURIComponent(pathParts.slice(1).join("/"))
-                    const newContent = await request.arrayBuffer()
-                    const db = await getDb()
-                    const transaction = db.transaction([FILES_SN], "readwrite")
-                    const fileStore = transaction.objectStore(FILES_SN)
-                    const index = fileStore.index("lookup")
-                    const fileRecord = await promisifyRequest(index.get(`${folderName}/${filePath}`))
-                    const newRecord = {
-                        folderName: folderName,
-                        path: filePath,
-                        buffer: new Blob([newContent]),
-                        type: request.headers.get("content-type") || "application/octet-stream",
-                        lookupPath: `${folderName}/${filePath}`
-                    }
-                    if (fileRecord) newRecord.id = fileRecord.id
-                    await promisifyRequest(fileStore.put(newRecord))
-                    await promisifyTransaction(transaction)
-                    return new Response(JSON.stringify({ success: true }), { status: 200, headers: { "Content-Type": "application/json" } })
-                } catch (err) {
-                    return new Response(JSON.stringify({ success: false, message: err.message }), { status: 500, headers: { "Content-Type": "application/json" } })
-                }
-            }
-
-            // Handle all virtual file GET requests
-            let session = clientSessionStore.get(clientId)
-            if (!session && pendingNavData) {
-                session = pendingNavData
-            }
-            if (request.mode === "navigate" && pendingNavData) {
-                clientSessionStore.set(clientId, { ...pendingNavData, timestamp: Date.now() })
-                setTimeout(() => { if (pendingNavData === session) pendingNavData = null }, 2000)
-            }
-
-            const hasRules = session && session.rules && session.rules.trim().length > 0
-            const hasHeaders = session && session.headers && session.headers.trim().length > 0
-
-            // If no rules are active, use a cache-first strategy for performance.
-            if (!hasRules && !hasHeaders) {
-                const cachedResponse = await caches.match(request)
-                if (cachedResponse) return cachedResponse
-            }
-
-            // If rules ARE active, or if the item is not in the cache, generate a fresh response.
-            const response = await generateResponseForVirtualFile(request, session)
-
-            // Only cache the response if it's successful and no rules were applied.
-            if (response.ok && !hasRules && !hasHeaders) {
-                const cache = await caches.open(CACHE_NAME)
-                cache.put(request, response.clone())
-            }
-
-            return response
-        }
-
-        // If it's not a virtual file, check if it's a core app shell file.
-        if (FULL_APP_SHELL_URLS.includes(request.url)) {
-            return caches.match(request).then(res => res || fetch(request))
-        }
-
-        // Fallback for any other request
-        return fetch(request).catch(() => new Response("Network error", {
-            status: 500,
-            headers: { "Cache-Control": "no-store" }
-        }))
+    e.waitUntil((async function () {
+        await self.clients.claim()
+        registryCache = null
+        try { await navigator.storage.getDirectory() } catch (err) { }
+        const allClients = await self.clients.matchAll({ includeUncontrolled: true })
+        for (const client of allClients) client.postMessage({ type: "SW_READY" })
     })())
 })
 
 self.addEventListener("message", e => {
     if (!e.data) return
-    const clientId = e.source.id
-    if (!clientId) return
+    const clientId = e.source ? e.source.id : null
+
     switch (e.data.type) {
         case "SET_RULES":
-            const { requestId, rules, headers, key } = e.data
+            const { rules, headers, key } = e.data
+            const compiledRules = compileRules(rules)
 
-            // Prime pendingNavData with a single object containing all session data.
-            // This is the correct handoff mechanism.
-            pendingNavData = {
-                rules: rules,
-                headers: headers,
-                key: key
+            // Set data for pending navigation
+            pendingNavData = { rules, compiledRules, headers, key }
+
+            // Set data for current client (if any)
+            if (clientId) {
+                const s = clientSessionStore.get(clientId) || {}
+                s.rules = rules
+                s.compiledRules = compiledRules
+                s.headers = headers
+                if (key) s.key = key
+                clientSessionStore.set(clientId, s)
             }
 
-            setTimeout(() => {
-                if (pendingNavData && pendingNavData.rules === rules) {
-                    pendingNavData = null
-                }
-            }, 5000)
+            // Important: Reply to unlock main.js
+            if (e.ports && e.ports[0]) e.ports[0].postMessage("ACK")
 
-            if (e.source) {
-                e.source.postMessage({ type: "RULES_READY", requestId })
-            }
-            break
-
-        case "PRIME_FOR_NAVIGATE":
-            // Store the data (rules, headers, decryption key) for the next tab to claim.
-            pendingNavData = e.data.data
-            // Set a timeout to clear this data if a navigation never happens.
             setTimeout(() => {
-                if (pendingNavData === e.data.data) pendingNavData = null
+                if (pendingNavData && pendingNavData.key === key) pendingNavData = null
             }, 5000)
             break
 
         case "INVALIDATE_CACHE":
-            (async function () {
-                console.log(`SW: Invalidating cache for folder: ${e.data.folderName}`)
-                try {
-                    const cache = await caches.open(CACHE_NAME)
-                    const keys = await cache.keys()
-                    const deletionPromises = []
-                    const prefix = `${self.location.origin}/n/${encodeURIComponent(e.data.folderName)}/`
-
-                    for (const request of keys) {
-                        if (request.url.startsWith(prefix)) {
-                            deletionPromises.push(cache.delete(request))
-                        }
-                    }
-                    await Promise.all(deletionPromises)
-                    console.log(`SW: Cache invalidated for ${deletionPromises.length} item(s).`)
-                } catch (err) {
-                    console.error("SW: Cache invalidation failed:", err)
-                } finally {
-                    if (e.source) {
-                        e.source.postMessage({ type: "CACHE_INVALIDATED", folderName: e.data.folderName })
-                    }
+            registryCache = null
+            e.waitUntil((async function () {
+                const allClients = await self.clients.matchAll({ includeUncontrolled: true })
+                for (const client of allClients) {
+                    if (client.id !== clientId) client.postMessage({ type: "INVALIDATE_CACHE", folderName: e.data.folderName })
                 }
-            })()
+            })())
             break
 
         case "PREPARE_FOR_IMPORT":
-            (async function () {
-                console.log("SW: Preparing for import, closing DB.")
-                if (dbPromise) {
-                    try {
-                        const db = await dbPromise
-                        db.close()
-                    } catch (err) {
-                        console.warn("SW: Error closing DB during import prep, this is likely okay.", err)
-                    } finally {
-                        dbPromise = null
-                    }
-                }
-                if (e.source) {
-                    e.source.postMessage({ type: "IMPORT_READY" })
-                }
-            })()
+            registryCache = null
+            if (e.source) e.source.postMessage({ type: "IMPORT_READY" })
             break
     }
 })
 
-/**
- * Creates a ReadableStream to serve a large file directly from its chunks in IndexedDB.
- * This avoids loading the entire file into memory.
- * @param {IDBDatabase} db The database instance.
- * @param {number} fileId The primary key of the file.
- * @returns {ReadableStream}
- */
-function streamFileFromChunks(db, fileId) {
-    return new ReadableStream({
-        async start(controller) {
-            try {
-                const transaction = db.transaction("FileChunks", "readonly")
-                const chunkStore = transaction.objectStore("FileChunks")
-                const index = chunkStore.index("by_file")
-                const allChunks = await promisifyRequest(index.getAll(IDBKeyRange.only(fileId)))
-
-                if (!allChunks || allChunks.length === 0) {
-                    controller.close()
-                    return
-                }
-
-                // Sort chunks by their index to ensure correct order
-                allChunks.sort((a, b) => a.index - b.index)
-
-                for (const chunk of allChunks) {
-                    controller.enqueue(new Uint8Array(chunk.data))
-                }
-
-                controller.close()
-            } catch (error) {
-                console.error("Streaming error:", error)
-                controller.error(error)
-            }
-        }
-    })
-}
-
-/**
- * Reads all chunks for a file from IndexedDB and reassembles them into a single ArrayBuffer.
- * @param {IDBDatabase} db The database instance.
- * @param {number} fileId The primary key of the file in the FILES_SN store.
- * @returns {Promise<ArrayBuffer>} A promise that resolves with the complete file buffer.
- */
-async function reassembleFileFromChunks(db, fileId) {
-    const transaction = db.transaction("FileChunks", "readonly")
-    const chunkStore = transaction.objectStore("FileChunks")
-    const index = chunkStore.index("by_file")
-    const allChunks = await promisifyRequest(index.getAll(IDBKeyRange.only(fileId)))
-
-    // Sort chunks by their index to ensure correct order
-    allChunks.sort((a, b) => a.index - b.index)
-
-    let totalSize = 0
-    for (const chunk of allChunks) {
-        totalSize += chunk.data.byteLength
-    }
-
-    const reassembled = new Uint8Array(totalSize)
-    let offset = 0
-    for (const chunk of allChunks) {
-        reassembled.set(new Uint8Array(chunk.data), offset)
-        offset += chunk.data.byteLength
-    }
-
-    return reassembled.buffer
-}
-
-/**
- * Quickly checks if any regex rule applies to a given file path.
- * @param {string} filePath The path of the file.
- * @param {string} regexRules The full string of regex rules.
- * @returns {boolean} True if a rule matches the file path.
- */
-function doesRegexApplyToFile(filePath, regexRules) {
-    if (!regexRules || !regexRules.trim()) return false
-    const rules = regexRules.trim().split("\n")
-
-    for (const line of rules) {
-        const [matchPart] = line.split("->")
-        if (!matchPart) continue
-
-        // This regex is now identical to the one in applyRegexRules, ensuring consistent behavior
-        const operatorMatch = matchPart.match(/^(.*?)\s+(\$|\$\$|\|\||\|)\s+(.*)$/s)
-        if (!operatorMatch) continue
-
-        const fileMatch = operatorMatch[1].trim()
-        try {
-            const fileRegex = new RegExp(fileMatch === "*" ? ".*" : fileMatch)
-            if (fileRegex.test(filePath)) {
-                return true // A rule matches this file, so it should not be cached
-            }
-        } catch (e) {
-            // This prevents a bad user-provided regex from crashing the service worker
-            console.warn(`Invalid file match regex in rule: "${line}"`, e)
-        }
-    }
-    return false // No rules matched this file
-}
-
 function parseCustomHeaders(rulesString) {
-    if (!rulesString || !rulesString.trim()) {
-        return []
-    }
+    if (!rulesString || !rulesString.trim()) return []
     const rules = []
     rulesString.trim().split("\n").forEach(line => {
         line = line.trim()
         if (line.startsWith("#") || line === "") return
-
         const parts = line.split("->")
         if (parts.length < 2) return
-
         const [globPart, ...headerParts] = parts
         const glob = globPart.trim()
-        const headerLine = headerParts.join("->").trim()
+        const fullHeaderString = headerParts.join("->").trim()
+        const colonIndex = fullHeaderString.indexOf(":")
+        if (colonIndex === -1) return
 
-        const headerMatch = headerLine.match(/^([^:]+):\s*(.*)$/)
-        if (!headerMatch) return
+        const headerName = fullHeaderString.substring(0, colonIndex).trim()
+        const headerValue = fullHeaderString.substring(colonIndex + 1).trim()
 
-        const [, headerName, headerValue] = headerMatch
-
-        // Convert file glob to a regex for matching.
-        const regex = new RegExp("^" + glob.replace(/\./g, "\.").replace(/\*/g, ".*").replace(/\?/g, ".") + "$")
-
-        rules.push({
-            regex: regex,
-            header: headerName.trim(),
-            value: headerValue.trim()
-        })
+        try {
+            const regex = new RegExp("^" + glob.replace(/\./g, "\\.").replace(/\*/g, ".*").replace(/\?/g, ".") + "$")
+            rules.push({ regex, header: headerName, value: headerValue })
+        } catch (e) { }
     })
     return rules
 }
 
 function applyCustomHeaders(baseHeaders, filePath, rulesString) {
-    if (!rulesString) {
-        return baseHeaders
-    }
-
+    if (!rulesString) return baseHeaders
     const customHeaderRules = parseCustomHeaders(rulesString)
-
     for (const rule of customHeaderRules) {
         if (rule.regex.test(filePath)) {
             baseHeaders[rule.header] = rule.value
         }
     }
-
     return baseHeaders
 }
 
-async function generateResponseForVirtualFile(request, session) {
-    session = session || {}
-    const { mode } = request
+function getMimeType(filePath) {
+    const ext = filePath.split(".").pop().toLowerCase()
+    const mimeTypes = {
+        "html": "text/html", "htm": "text/html", "css": "text/css",
+        "js": "application/javascript", "mjs": "application/javascript",
+        "json": "application/json", "xml": "application/xml",
+        "txt": "text/plain", "md": "text/markdown", "csv": "text/csv",
+        "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
+        "webp": "image/webp", "svg": "image/svg+xml", "ico": "image/x-icon",
+        "mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg",
+        "mp4": "video/mp4", "webm": "video/webm", "wasm": "application/wasm",
+        "pdf": "application/pdf", "zip": "application/zip",
+        // Mono / .NET
+        "dll": "application/octet-stream",
+        "pdb": "application/octet-stream",
+        "dat": "application/octet-stream",
+        "bin": "application/octet-stream"
+    }
+    return mimeTypes[ext] || "application/octet-stream"
+}
+
+// FETCH HANDLER
+self.addEventListener("fetch", e => {
+    const { request, clientId } = e
     const url = new URL(request.url)
 
-    const requestPath = url.pathname
-    const virtualPath = requestPath.substring(virtualPathPrefix.length)
-    const pathParts = virtualPath.split("/")
-    const folderName = pathParts[0]
-    let decodedFilePath = pathParts.slice(1).join("/")
-
-    decodedFilePath = decodedFilePath.replace(/\/+/g, "/")
-
-    if (!decodedFilePath || decodedFilePath.endsWith("/")) {
-        decodedFilePath = (decodedFilePath || "") + "index.html"
+    // 1. Internal App Shell
+    if (FULL_APP_SHELL_URLS.includes(request.url)) {
+        e.respondWith((async () => {
+            const cached = await caches.match(request)
+            return cached || fetch(request)
+        })())
+        return
     }
-    const db = await getDb()
-    const transaction = db.transaction([FILES_SN, FOLDERS_SN], "readonly") // Locate stuff
-    const fileStore = transaction.objectStore(FILES_SN)
-    const folderStore = transaction.objectStore(FOLDERS_SN)
-    const lookupIndex = fileStore.index("lookup")
 
-    let fileMetadata = await promisifyRequest(lookupIndex.get(`${folderName}/${decodedFilePath}`))
-    const folderData = await promisifyRequest(folderStore.get(folderName))
+    // 2. Virtual File Requests (e.g. /n/Folder/...)
+    if (url.pathname.startsWith(virtualPathPrefix)) {
+        let session = clientSessionStore.get(clientId)
+        if (!session && pendingNavData) session = pendingNavData
 
-    if (!fileMetadata && mode === "navigate") {
-        const fallbackPath = "index.html"
-        const fallbackMetadata = await promisifyRequest(lookupIndex.get(`${folderName}/${fallbackPath}`))
-        if (fallbackMetadata) {
-            decodedFilePath = fallbackPath
-            fileMetadata = fallbackMetadata
+        // Persist session on navigation
+        if (request.mode === "navigate" && pendingNavData) {
+            clientSessionStore.set(clientId, { ...pendingNavData, timestamp: Date.now() })
+            setTimeout(() => { if (pendingNavData === session) pendingNavData = null }, 2000)
         }
+
+        e.respondWith(generateResponseForVirtualFile(request, session))
+        return
     }
 
-    if (!fileMetadata) {
-        return new Response(`File not found: ${decodedFilePath}`, {
-            status: 404,
-            headers: { "Cache-Control": "no-store" }
-        })
-    }
-
-    const fileType = fileMetadata.type || getMimeType(decodedFilePath) || "application/octet-stream"
-    const isEncrypted = folderData?.encryptionType === "pdf"
-
-    let fileBuffer = fileMetadata.buffer ? await fileMetadata.buffer.arrayBuffer() : await reassembleFileFromChunks(db, fileMetadata.id)
-
-    if (!fileBuffer) {
-        return new Response("Could not load file content for processing.", { status: 500 })
-    }
-
-    if (isEncrypted) {
-        const key = session.key
-        if (!key) {
-            return new Response("Decryption key not found for this client session", { status: 403 })
-        }
+    // 3. Fallback for Relative Virtual Fetches
+    // Fixes cases where /mscorlib.dll is requested instead of /n/Celeste/mscorlib.dll
+    if (request.referrer && url.origin === self.location.origin) {
         try {
-            const iv = fileBuffer.slice(0, 12)
-            const encryptedData = fileBuffer.slice(12)
-            fileBuffer = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, encryptedData)
-        } catch (e) {
-            return new Response("Decryption failed in Service Worker", { status: 500 })
-        }
+            const referrerUrl = new URL(request.referrer)
+            if (referrerUrl.pathname.startsWith(virtualPathPrefix)) {
+                // Check if this is arguably a sub-resource request meant for the virtual folder
+                const pathParts = referrerUrl.pathname.substring(virtualPathPrefix.length).split("/")
+                const folderName = pathParts[0]
+                const newVirtualUrl = `${self.location.origin}/n/${folderName}${url.pathname}`
+
+                e.respondWith(fetch(newVirtualUrl))
+                return
+            }
+        } catch (err) { }
     }
 
-    const finalBuffer = applyRegexRules(decodedFilePath, fileBuffer, fileType, session.rules)
-    const headers = applyCustomHeaders({ "Content-Type": fileType, "Content-Length": finalBuffer.byteLength }, decodedFilePath, session.headers)
+    // 5. Standard Network Fetch
+    e.respondWith(fetch(request))
+})
 
-    return new Response(finalBuffer, { headers })
+async function generateResponseForVirtualFile(request, session) {
+    try {
+        const url = new URL(request.url)
+        const { mode } = request
+
+        const isFirefox = typeof InternalError !== "undefined"
+        if (isFirefox && mode === "navigate" && !url.searchParams.has("boot")) {
+            url.searchParams.set("boot", "1")
+            return new Response(`<!DOCTYPE html><script>location.replace("${url.href}");</script>`, {
+                headers: { "Content-Type": "text/html" }
+            })
+        }
+
+        if ((!session || !Object.keys(session).length) && typeof pendingNavData !== "undefined") {
+            session = pendingNavData
+        }
+        session = session || {}
+
+        const virtualPath = url.pathname.substring(virtualPathPrefix.length)
+        const pathParts = virtualPath.split("/").map(p => decodeURIComponent(p))
+        const folderName = pathParts[0]
+        let relativePath = pathParts.slice(1).join("/")
+
+        if (!relativePath || relativePath.endsWith("/")) relativePath += "index.html"
+
+        let root, registry
+        try {
+            root = await navigator.storage.getDirectory()
+            registry = await getRegistry()
+        } catch (e) {
+            return new Response("System error: OPFS inaccessible", { status: 500 })
+        }
+
+        const folderData = registry[folderName] || {}
+
+        async function getFileHandle(dir, name, path) {
+            try {
+                const parts = [RFS_PREFIX, name, ...path.split("/")]
+                let curr = dir
+                for (let i = 0; i < parts.length - 1; i++) {
+                    curr = await curr.getDirectoryHandle(parts[i])
+                }
+                return await curr.getFileHandle(parts[parts.length - 1])
+            } catch (e) { return null }
+        }
+
+        let handle = await getFileHandle(root, folderName, relativePath)
+
+        if (!handle && mode === "navigate") {
+            handle = await getFileHandle(root, folderName, "index.html")
+            if (handle) relativePath = "index.html"
+        } else if (!handle) {
+            return new Response("File not found", { status: 404 })
+        }
+
+        const file = await handle.getFile()
+        let totalSize = file.size
+
+        let contentType = file.type
+        if (!contentType || contentType === "application/octet-stream") {
+            contentType = getMimeType(relativePath) || "application/octet-stream"
+        }
+
+        let compiledRules = session.compiledRules
+        if (!compiledRules && folderData.rules) compiledRules = compileRules(folderData.rules)
+
+        const isEncrypted = folderData.encryptionType === "password"
+        const hasRegex = compiledRules && compiledRules.length > 0
+
+        const isTooLarge = totalSize > 20 * 1024 * 1024
+        const needsProcessing = (isEncrypted || hasRegex) && !isTooLarge
+
+        if (isEncrypted && isTooLarge) {
+            return new Response("File too large to decrypt in browser", { status: 413 })
+        }
+
+        const baseHeaders = {
+            "Content-Type": contentType,
+            "Cache-Control": "no-store",
+            "Accept-Ranges": "bytes",
+            "Cross-Origin-Embedder-Policy": "require-corp",
+            "Cross-Origin-Opener-Policy": "same-origin"
+        }
+
+        const finalHeaders = applyCustomHeaders(baseHeaders, relativePath, session.headers || folderData.headers)
+
+        if (!needsProcessing) {
+            const rangeHeader = request.headers.get("Range")
+
+            if (rangeHeader) {
+                const parts = rangeHeader.replace(/bytes=/, "").split("-")
+                const start = parseInt(parts[0], 10)
+                const end = parts[1] ? parseInt(parts[1], 10) : totalSize - 1
+
+                if (start >= totalSize || end >= totalSize) {
+                    return new Response(null, { status: 416, headers: { "Content-Range": `bytes */${totalSize}` } })
+                }
+
+                const chunkSize = (end - start) + 1
+                const slicedBlob = file.slice(start, end + 1)
+
+                finalHeaders["Content-Range"] = `bytes ${start}-${end}/${totalSize}`
+                finalHeaders["Content-Length"] = chunkSize
+
+                return new Response(slicedBlob, { status: 206, headers: finalHeaders })
+            }
+
+            finalHeaders["Content-Length"] = totalSize
+            return new Response(file, { headers: finalHeaders })
+        }
+
+        let buffer = await file.arrayBuffer()
+
+        if (isEncrypted) {
+            const key = session.key
+            if (!key) return new Response("Key required: Session lost!", { status: 403 })
+            try {
+                const iv = buffer.slice(0, 12)
+                const data = buffer.slice(12)
+                buffer = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data)
+            } catch (e) {
+                return new Response("Decryption failed", { status: 500 })
+            }
+        }
+
+        if (hasRegex) {
+            buffer = applyRegexRules(relativePath, buffer, contentType, compiledRules)
+        }
+
+        const processedSize = buffer.byteLength
+        const rangeHeader = request.headers.get("Range")
+
+        if (rangeHeader) {
+            const parts = rangeHeader.replace(/bytes=/, "").split("-")
+            let start = parseInt(parts[0], 10)
+            let end = parts[1] ? parseInt(parts[1], 10) : processedSize - 1
+
+            if (isNaN(start)) start = 0
+            if (isNaN(end)) end = processedSize - 1
+            if (end >= processedSize) end = processedSize - 1
+
+            if (start >= processedSize) {
+                return new Response(null, { status: 416, headers: { "Content-Range": `bytes */${processedSize}` } })
+            }
+
+            const chunkSize = (end - start) + 1
+            const slicedBuffer = buffer.slice(start, end + 1)
+
+            finalHeaders["Content-Range"] = `bytes ${start}-${end}/${processedSize}`
+            finalHeaders["Content-Length"] = chunkSize
+
+            return new Response(slicedBuffer, { status: 206, headers: finalHeaders })
+        }
+
+        finalHeaders["Content-Length"] = processedSize
+        return new Response(buffer, { headers: finalHeaders })
+
+    } catch (e) {
+        console.error("SW error:", e)
+        return new Response("Internal error", { status: 500 })
+    }
 }

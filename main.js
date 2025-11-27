@@ -1,130 +1,73 @@
-const DBN = "FileCacheDB"
-const FOLDERS_SN = "Folders"
-const FILES_SN = "Files"
-const META_SN = "Metadata"
-const RULES_SN = "Rules"
-const DB_VERSION = 11 // Version 1.1
+const RFS_PREFIX = "rfs"
+const SYSTEM_FILE = "rfs_system.json"
 
-const CHUNK_SIZE = 4 * 1024 * 1024 // 4MB chunks
-const BATCH_SIZE = 50 // Batch of 50
-// Fetches all folder names from IndexedDB and displays them in the UI.
 let isListingFolders = false
-
-// Helper function to wrap IndexedDB requests in a Promise
-function promisifyRequest(request) {
-    return new Promise((resolve, reject) => {
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-    })
-}
-
-function promisifyTransaction(transaction) {
-    return new Promise((resolve, reject) => {
-        transaction.oncomplete = () => resolve()
-        transaction.onerror = () => reject(transaction.error)
-        transaction.onabort = () => reject(transaction.error || new DOMException("Transaction aborted"))
-    })
-}
-
 let currentlyBusy = false
+let folderName, dirHandle, observer
+let changes = []
+
 function setUiBusy(isBusy) {
     currentlyBusy = isBusy
     Array.from(document.getElementsByTagName("button")).forEach(button => button.disabled = currentlyBusy)
 }
 
-// Request persistent storage to prevent the browser from clearing data automatically.
-navigator.storage.persist().then(persistent => {
-    if (persistent) {
-        console.log("Storage will not be cleared except by explicit user action.")
-    } else {
-        console.log("Storage may be cleared by the browser.")
-    }
-})
+navigator.storage.persist().then(p => console.log(p ? "Storage persisted." : "Storage not persisted."))
 
-let dbPromise = null
-function getDb() {
-    if (!dbPromise) {
-        dbPromise = new Promise((resolve, reject) => {
-            const request = indexedDB.open(DBN, DB_VERSION)
-
-            request.onupgradeneeded = function (e) {
-                const db = e.target.result
-                const transaction = e.target.transaction
-
-                // Create standard stores if they don't exist
-                if (!db.objectStoreNames.contains(FOLDERS_SN)) {
-                    db.createObjectStore(FOLDERS_SN, { keyPath: "id" })
-                }
-                if (!db.objectStoreNames.contains(RULES_SN)) {
-                    db.createObjectStore(RULES_SN, { keyPath: "id" })
-                }
-
-                let fileStore
-                if (!db.objectStoreNames.contains(FILES_SN)) {
-                    fileStore = db.createObjectStore(FILES_SN, { keyPath: "id", autoIncrement: true })
-                } else {
-                    fileStore = transaction.objectStore(FILES_SN)
-                }
-
-                if (!fileStore.indexNames.contains("lookup")) {
-                    fileStore.createIndex("lookup", "lookupPath", { unique: true })
-                }
-
-                if (!db.objectStoreNames.contains("FileChunks")) {
-                    const chunkStore = db.createObjectStore("FileChunks", { keyPath: "id", autoIncrement: true })
-                    chunkStore.createIndex("by_file", "fileId", { unique: false })
-                }
-            }
-
-            request.onsuccess = e => {
-                db = e.target.result
-                db.onversionchange = () => {
-                    console.warn("Database version change detected, closing connection.")
-                    if (db) {
-                        db.close()
-                    }
-                    db = null
-                    dbPromise = null
-                }
-                resolve(db)
-            }
-            request.onerror = e => reject(e.target.errorCode)
-        })
-    }
-    return dbPromise
+async function waitForController() {
+    if (navigator.serviceWorker.controller) return navigator.serviceWorker.controller
+    await navigator.serviceWorker.register("./sw.js")
+    const reg = await navigator.serviceWorker.ready
+    return navigator.serviceWorker.controller || reg.active
 }
 
-// Global variables to hold state for the currently managed folder.
-let folderName, dirHandle, observer
-// An array to keep track of file system changes for syncing.
-let changes = []
+async function getRegistry() {
+    try {
+        const root = await navigator.storage.getDirectory()
+        const handle = await root.getFileHandle(SYSTEM_FILE)
+        const file = await handle.getFile()
+        return JSON.parse(await file.text())
+    } catch (e) {
+        return {} // Default empty registry
+    }
+}
+
+async function saveRegistry(registry) {
+    const root = await navigator.storage.getDirectory()
+    const handle = await root.getFileHandle(SYSTEM_FILE, { create: true })
+    const writable = await handle.createWritable()
+    await writable.write(JSON.stringify(registry))
+    await writable.close()
+}
+
+async function updateRegistryEntry(name, data) {
+    const reg = await getRegistry()
+    if (data === null) {
+        delete reg[name]
+    } else {
+        reg[name] = { ...reg[name], ...data, lastModified: Date.now() }
+    }
+    await saveRegistry(reg)
+    // Notify SW to invalidate its memory cache
+    if (navigator.serviceWorker.controller) {
+        navigator.serviceWorker.controller.postMessage({ type: "INVALIDATE_CACHE", folderName: name })
+    }
+}
 
 async function uploadFolder() {
     const folderNameInput = document.getElementById("folderName")
     const name = folderNameInput.value.trim()
-    if (!name) {
-        alert("Please enter a name for the folder.")
-        return
-    }
+    if (!name) return alert("Please enter a name.")
 
     setUiBusy(true)
     try {
-        // Modern path using File System Access API
         if (window.showDirectoryPicker) {
             const localDirHandle = await window.showDirectoryPicker({ mode: "read" })
-            // If the code reaches here, the user has selected a folder
             await processFolderSelection(name, localDirHandle)
         } else {
-            // Fallback path for other browsers like Firefox
             document.getElementById("folderUploadFallbackInput").click()
         }
-    } catch (err) {
-        // This catch block specifically handles cancellation of showDirectoryPicker
-        if (err.name !== "AbortError") {
-            console.error("Upload error:", err)
-            alert("An error occurred during upload: " + err.message)
-        }
-        // Always reset the UI if the main path fails or is cancelled
+    } catch (e) {
+        if (e.name !== "AbortError") alert("Upload error: " + e.message)
     } finally {
         setUiBusy(false)
     }
@@ -133,356 +76,268 @@ async function uploadFolder() {
 async function processFolderSelection(name, handle) {
     dirHandle = handle
     folderName = name
-    let files = {}
 
-    // Check for manifest.enc to determine if the folder is encrypted
     try {
-        const manifestHandle = await handle.getFileHandle("manifest.enc")
-        console.log("Encrypted folder detected. Starting decryption process...")
-        files = await decryptAndLoadFolder(handle, manifestHandle)
+        const encManifest = await handle.getFileHandle("manifest.enc")
+        console.log("Encrypted folder detected.")
+        const root = await navigator.storage.getDirectory()
+        const rfs = await root.getDirectoryHandle(RFS_PREFIX, { create: true })
+        try { await rfs.removeEntry(name, { recursive: true }) } catch (e) { }
+
+        await decryptAndLoadFolderToOpfs(handle, encManifest, await rfs.getDirectoryHandle(name, { create: true }))
+        await updateRegistryEntry(name, { encryptionType: null })
     } catch (e) {
-        if (e.name !== "NotFoundError") throw e // Re-throw unexpected errors
+        await processAndStoreFolderStreaming(name, handle)
+    }
 
-        files = await getFilesRecursively(handle)
-        if (observer) observer.disconnect()
+    if (observer) {
+        try { observer.disconnect() } catch (e) { }
+        observer = null
+    }
 
+    if ("FileSystemObserver" in window) {
         try {
-            observer = new FileSystemObserver((records) => {
-                console.log(`${records.length} file system change(s) detected`)
-                changes.push(...records)
-            })
+            observer = new FileSystemObserver(recs => changes.push(...recs))
             observer.observe(dirHandle, { recursive: true })
-        } catch (e) {
-            if (e.name !== "NotSupportedError") throw e
-            console.error("Cannot observe directories for modifications.")
-            console.warn(e)
-        }
-        changes.length = 0
-    }
-
-    await processAndStoreFolder(name, files)
-
-    if (navigator.serviceWorker.controller) {
-        navigator.serviceWorker.controller.postMessage({ type: "INVALIDATE_CACHE", folderName: name })
-    }
-    document.getElementById("folderName").value = ""
-    document.getElementById("openFolderName").value = name
-}
-
-async function processFileListAndStore(name, fileList) {
-    // Note: The UI should already be set to busy before calling this function
-    try {
-        if (!fileList.length) {
-            console.log("File list is empty, nothing to process")
-            return
-        }
-
-        const files = {}
-        // Determine the common base path from the first file (e.g., "MyProject/")
-        // This is necessary because webkitRelativePath includes the selected folder's name
-        let basePath = ""
-        if (fileList.length > 0 && fileList[0].webkitRelativePath.includes("/")) {
-            basePath = fileList[0].webkitRelativePath.split("/")[0] + "/"
-        }
-
-        // Use a standard for-loop as FileList is not a true array
-        for (let i = 0; i < fileList.length; i++) {
-            const file = fileList[i]
-            let path = file.webkitRelativePath
-
-            // Strip the base path to get the correct relative path for storage
-            if (basePath && path.startsWith(basePath)) {
-                path = path.substring(basePath.length)
-            }
-
-            // If path is now empty (e.g., a hidden file at the root), skip it
-            if (!path) {
-                continue
-            }
-
-            if (file.size <= CHUNK_SIZE) {
-                const buffer = await file.arrayBuffer()
-                files[path] = { buffer, type: getMimeType(path) || file.type }
-            } else {
-                files[path] = file // Store large file object for streaming
-            }
-        }
-
-        if (Object.keys(files).length === 0) {
-            alert("No valid files found.")
-            return
-        }
-
-        await processAndStoreFolder(name, files)
-
-        if (navigator.serviceWorker.controller) {
-            navigator.serviceWorker.controller.postMessage({ type: "INVALIDATE_CACHE", folderName: name })
-        }
-        document.getElementById("folderName").value = ""
-        document.getElementById("openFolderName").value = name
-        await listFolders()
-    } catch (err) {
-        console.error("File processing error:", err)
-        alert("An error occurred during file processing: " + err.message)
-    } finally {
-        // The calling function is responsible for resetting the UI busy state
-    }
-}
-
-// Handles the file input change event for fallback folder uploads.
-async function uploadFolderFallback(event) {
-    const name = document.getElementById("folderName").value.trim()
-    const input = event.target
-
-    if (!input.files.length) {
-        console.log("Fallback folder selection cancelled.")
-        setUiBusy(false) // User cancelled, so reset UI
-        return
-    }
-
-    try {
-        await processFileListAndStore(name, input.files)
-    } finally {
-        input.value = "" // Reset input for next use
-        setUiBusy(false) // Ensure UI is always reset
-    }
-}
-
-async function decryptAndLoadFolder(dirHandle, manifestHandle) {
-    const manifestFile = await manifestHandle.getFile()
-    const manifestBuffer = await manifestFile.arrayBuffer()
-    const manifestContent = new TextDecoder().decode(manifestBuffer)
-    const manifestWrapper = JSON.parse(manifestContent)
-
-    if (manifestWrapper.encryptionType === "password") {
-        const password = prompt("Enter the password for this encrypted folder:")
-        if (!password) throw new Error("Password not provided.")
-
-        const salt = base64ToBuffer(manifestWrapper.salt)
-        const iv = base64ToBuffer(manifestWrapper.iv)
-        const payload = base64ToBuffer(manifestWrapper.payload)
-
-        const key = await deriveKeyFromPassword(password, salt)
-        const decryptedPayload = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, payload)
-        const pathManifest = JSON.parse(new TextDecoder().decode(decryptedPayload))
-
-        const decryptedFiles = {}
-        for (const originalPath in pathManifest) {
-            const uuid = pathManifest[originalPath]
-            if (uuid === null) continue
-
-            const fileHandle = await dirHandle.getFileHandle(uuid)
-            const file = await fileHandle.getFile()
-            const encryptedBufferWithIv = await file.arrayBuffer()
-
-            const fileIv = encryptedBufferWithIv.slice(0, 12)
-            const encryptedData = encryptedBufferWithIv.slice(12)
-
-            const decryptedBuffer = await crypto.subtle.decrypt({ name: "AES-GCM", iv: fileIv }, key, encryptedData)
-            decryptedFiles[originalPath] = { buffer: decryptedBuffer, type: getMimeType(originalPath) || "application/octet-stream" }
-        }
-        return decryptedFiles
-    } else if (manifestWrapper.encryptionType === "rsa") {
-        // Re-read the raw file for the RSA decryption function
-        const rawManifestBuffer = await manifestFile.arrayBuffer()
-        return await decryptFolder(dirHandle, rawManifestBuffer)
-    } else {
-        throw new Error("Unknown encryption type in manifest.enc")
-    }
-}
-
-// Decrypts a folder that was encrypted using the public key method.
-async function decryptFolder(dirHandle, encryptedManifestBuffer) {
-    const privateKeyJwkString = localStorage.getItem("pk")
-    if (!privateKeyJwkString) {
-        throw new Error("Decryption failed: Private key not found in this browser's localStorage.")
-    }
-    const privateKeyJwk = JSON.parse(privateKeyJwkString)
-    const privateKey = await crypto.subtle.importKey("jwk", privateKeyJwk, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["decrypt"])
-
-    const decryptedManifestBuffer = await decryptBufferWithPrivateKey(privateKey, encryptedManifestBuffer)
-    const manifestObject = JSON.parse(new TextDecoder().decode(decryptedManifestBuffer))
-    const pathManifest = manifestObject.paths
-
-    const decryptedFiles = {}
-    for (const originalPath in pathManifest) {
-        const uuid = pathManifest[originalPath]
-        if (uuid === null) continue
-        try {
-            const fileHandle = await dirHandle.getFileHandle(uuid)
-            const file = await fileHandle.getFile()
-            const encryptedBuffer = await file.arrayBuffer()
-            const decryptedBuffer = await decryptBufferWithPrivateKey(privateKey, encryptedBuffer)
-            decryptedFiles[originalPath] = {
-                buffer: decryptedBuffer,
-                type: getMimeType(originalPath) || "application/octet-stream"
-            }
-        } catch (e) {
-            console.error(`Failed to find or decrypt file for path: ${originalPath}`, e)
-        }
-    }
-    console.log("Folder decryption complete.")
-    return decryptedFiles
-}
-
-// Recursively reads all files from a directory handle and returns them as a map.
-async function getFilesRecursively(dirHandle, path = "") {
-    const files = {}
-    for await (const entry of dirHandle.values()) {
-        const newPath = path ? `${path}/${entry.name}` : entry.name
-        if (entry.kind === "file") {
-            const file = await entry.getFile()
-
-            if (file.size <= CHUNK_SIZE) {
-                files[newPath] = {
-                    buffer: await file.arrayBuffer(), // Load ArrayBuffer for small files
-                    type: getMimeType(newPath) || file.type
-                }
-            } else {
-                files[newPath] = file
-            }
-        } else if (entry.kind === "directory") {
-            Object.assign(files, await getFilesRecursively(entry, newPath))
-        }
-    }
-    return files
-}
-
-async function scanFilesRecursively(dirHandle, path = "") {
-    const fileMap = {}
-    for await (const entry of dirHandle.values()) {
-        const newPath = path ? `${path}/${entry.name}` : entry.name
-        if (entry.kind === "file") {
-            fileMap[newPath] = await entry.getFile()
-        } else if (entry.kind === "directory") {
-            fileMap[newPath] = null
-            Object.assign(fileMap, await scanFilesRecursively(entry, newPath))
-        }
-    }
-    return fileMap
-}
-
-async function syncAndOpenFile() {
-    if (!folderName || !dirHandle) return alert("Upload a folder first.")
-
-    // Keep the UI locked so the user doesn't close the tab while waiting
-    setUiBusy(true)
-    if (changes.length > 0) {
-        await performSyncToDb()
-        await invalidateCacheAndWait(folderName)
-    }
-    console.log("Opening file...")
-    openFile(folderName)
-}
-
-async function performSyncToDb() {
-    console.log(`Processing ${changes.length} changes for "${folderName}"...`)
-    const db = await getDb()
-    let updateCount = 0
-
-    const operations = []
-    for (const change of changes) {
-        const path = change.relativePathComponents.join("/")
-        try {
-            switch (change.type) {
-                case "created":
-                case "modified":
-                    var fileHandle = await getHandleFromPath(dirHandle, path)
-                    if (fileHandle?.kind === "file") {
-                        const file = await fileHandle.getFile()
-                        operations.push({ type: "put", path, file })
-                    }
-                    break
-                case "deleted":
-                    operations.push({ type: "delete", path })
-                    break
-                case "moved":
-                    const oldPath = change.relativePathMovedFrom.join("/")
-                    var fileHandle = await getHandleFromPath(dirHandle, path)
-                    if (fileHandle?.kind === "file") {
-                        const file = await fileHandle.getFile()
-                        operations.push({ type: "move", oldPath, path, file })
-                    }
-                    break
-            }
-        } catch (e) {
-            console.warn(`Skipping sync for path "${path}": ${e.message}`)
-        }
-    }
-
-    for (const op of operations) {
-        if (op.type === "put") {
-            await deleteFileByPathAndChunks(db, folderName, op.path)
-            if (op.file.size > CHUNK_SIZE) {
-                await streamFileToDb(db, folderName, op.path, op.file)
-            } else {
-                const buffer = await op.file.arrayBuffer()
-                const addTx = db.transaction(FILES_SN, "readwrite")
-                addTx.objectStore(FILES_SN).put({
-                    folderName: folderName,
-                    path: op.path,
-                    buffer: new Blob([buffer]),
-                    type: getMimeType(op.path) || op.file.type,
-                    lookupPath: `${folderName}/${op.path}`
-                })
-                await promisifyTransaction(addTx)
-            }
-            updateCount++
-        } else if (op.type === "delete") {
-            await deleteFileByPathAndChunks(db, folderName, op.path)
-            updateCount++
-        } else if (op.type === "move") {
-            await deleteFileByPathAndChunks(db, folderName, op.oldPath)
-            if (op.file.size > CHUNK_SIZE) {
-                await streamFileToDb(db, folderName, op.path, op.file)
-            } else {
-                const buffer = await op.file.arrayBuffer()
-                const addTx = db.transaction(FILES_SN, "readwrite")
-                addTx.objectStore(FILES_SN).put({
-                    folderName: folderName,
-                    path: op.path,
-                    buffer: new Blob([buffer]),
-                    type: getMimeType(op.path) || op.file.type,
-                    lookupPath: `${folderName}/${op.path}`
-                })
-                await promisifyTransaction(addTx)
-            }
-            updateCount++
-        }
+        } catch (e) { console.warn("Observer failed:", e) }
     }
 
     changes.length = 0
-    return updateCount
+
+    document.getElementById("folderName").value = ""
+    document.getElementById("openFolderName").value = name
+    await listFolders()
+}
+
+async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
+    const password = prompt("Enter password to decrypt this folder:")
+    if (!password) throw new Error("Password required for decryption.")
+
+    const manifestFile = await manifestHandle.getFile()
+    const saltBase64 = await manifestFile.text()
+
+    // Check if valid base64, otherwise might be json
+    let salt
+    try {
+        salt = base64ToBuffer(saltBase64.trim())
+    } catch (e) {
+        throw new Error("Invalid manifest format")
+    }
+
+    const key = await deriveKeyFromPassword(password, salt)
+    const progressElem = document.getElementById("progress")
+    const updateProgress = createProgressThrottle(progressElem)
+
+    async function process(src, dst) {
+        for await (const entry of src.values()) {
+            if (entry.name === "manifest.enc") continue // Skip manifest
+
+            if (entry.kind === "file") {
+                updateProgress(`Decrypting: ${entry.name}`)
+                const file = await entry.getFile()
+                const data = await file.arrayBuffer()
+
+                // Extract IV (first 12 bytes) and Content
+                const iv = data.slice(0, 12)
+                const ciphertext = data.slice(12)
+
+                try {
+                    const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ciphertext)
+                    const fh = await dst.getFileHandle(entry.name, { create: true })
+                    const w = await fh.createWritable()
+                    await w.write(decrypted)
+                    await w.close()
+                } catch (e) {
+                    console.error(`Failed to decrypt ${entry.name}`, e)
+                }
+            } else if (entry.kind === "directory") {
+                const newDst = await dst.getDirectoryHandle(entry.name, { create: true })
+                await process(entry, newDst)
+            }
+        }
+    }
+
+    await process(srcHandle, destDir)
+    progressElem.textContent = ""
+}
+
+async function processFileListAndStore(name, fileList) {
+    const progressElem = document.getElementById("progress")
+    const updateProgress = createProgressThrottle(progressElem)
+
+    try {
+        if (!fileList.length) return
+        const root = await navigator.storage.getDirectory()
+        const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX, { create: true })
+
+        try {
+            await rfsRoot.removeEntry(name, { recursive: true })
+            // Yield to ensure the handle deletion propagates
+            await new Promise(r => setTimeout(r, 50))
+        } catch (e) {
+            if (e.name !== "NotFoundError") console.warn("RemoveEntry warning:", e)
+        }
+
+        const folderHandle = await rfsRoot.getDirectoryHandle(name, { create: true })
+
+        let basePath = ""
+        if (fileList.length > 0 && fileList[0].webkitRelativePath && fileList[0].webkitRelativePath.includes("/")) {
+            basePath = fileList[0].webkitRelativePath.split("/")[0] + "/"
+        }
+
+        let lastYieldTime = Date.now()
+
+        for (let i = 0; i < fileList.length; i++) {
+            const file = fileList[i]
+            let path = file.webkitRelativePath || file.name
+            if (basePath && path.startsWith(basePath)) path = path.substring(basePath.length)
+            if (!path) continue
+
+            updateProgress(`Processing ${path}`)
+
+            if (Date.now() - lastYieldTime > 100) {
+                await new Promise(r => setTimeout(r, 0))
+                lastYieldTime = Date.now()
+            }
+
+            await writeStreamToOpfs(folderHandle, path, file.stream())
+        }
+
+        await updateRegistryEntry(name, { encryptionType: null })
+
+        document.getElementById("folderName").value = ""
+        document.getElementById("openFolderName").value = name
+        await listFolders()
+    } catch (e) {
+        console.error(e)
+        alert("Error: " + e.message)
+    } finally {
+        progressElem.textContent = ""
+    }
+}
+
+async function processAndStoreFolderStreaming(name, srcHandle) {
+    const progressElem = document.getElementById("progress")
+    const updateProgress = createProgressThrottle(progressElem)
+
+    const root = await navigator.storage.getDirectory()
+    const rfs = await root.getDirectoryHandle(RFS_PREFIX, { create: true })
+    try { await rfs.removeEntry(name, { recursive: true }) } catch (e) { }
+    const destRoot = await rfs.getDirectoryHandle(name, { create: true })
+
+    updateProgress("Scanning files...")
+    const files = [] // { entry, pathParts }
+    const dirs = []  // pathParts (array of strings)
+
+    async function scan(dir, pathParts) {
+        for await (const entry of dir.values()) {
+            if (entry.kind === "file") {
+                files.push({ entry, pathParts })
+            } else if (entry.kind === "directory") {
+                const newPath = [...pathParts, entry.name]
+                dirs.push(newPath)
+                await scan(entry, newPath)
+            }
+        }
+    }
+    await scan(srcHandle, [])
+
+    updateProgress(`Creating ${dirs.length} folders...`)
+    for (const parts of dirs) {
+        let curr = destRoot
+        for (const p of parts) curr = await curr.getDirectoryHandle(p, { create: true })
+    }
+
+    updateProgress(`Uploading ${files.length} files...`)
+    let completed = 0
+    const total = files.length
+
+    // The worker function picks the next file from the index
+    let fileIdx = 0
+    async function worker() {
+        while (fileIdx < total) {
+            const i = fileIdx++
+            const { entry, pathParts } = files[i]
+
+            // Navigate to folder (should exist now)
+            let dir = destRoot
+            for (const p of pathParts) dir = await dir.getDirectoryHandle(p)
+
+            const file = await entry.getFile()
+            const dstFile = await dir.getFileHandle(entry.name, { create: true })
+            const w = await dstFile.createWritable()
+            await file.stream().pipeTo(w)
+
+            if (++completed % 10 === 0) updateProgress(`Uploading: ${Math.round((completed / total) * 100)}%`)
+        }
+    }
+
+    // Run 6 concurrent workers
+    await Promise.all(Array(6).fill(null).map(worker))
+
+    await updateRegistryEntry(name, { encryptionType: null })
+    progressElem.textContent = ""
+
+    // UI Cleanup
+    document.getElementById("folderName").value = ""
+    document.getElementById("openFolderName").value = name
+    await listFolders()
+}
+
+async function writeStreamToOpfs(parentHandle, path, stream) {
+    const parts = path.split("/")
+    const fileName = parts.pop()
+
+    try {
+        let currentDir = parentHandle
+        // Traverse/Create subdirectories
+        for (const part of parts) {
+            currentDir = await currentDir.getDirectoryHandle(part, { create: true })
+        }
+
+        const fileHandle = await currentDir.getFileHandle(fileName, { create: true })
+        const writable = await fileHandle.createWritable()
+        await stream.pipeTo(writable)
+    } catch (e) {
+        // Retry once for InvalidStateError (Stale handle)
+        if (e.name === "InvalidStateError") {
+            console.warn("Retrying write due to stale handle:", path)
+            await new Promise(r => setTimeout(r, 50)) // Wait for state to settle
+
+            // Re-traverse from parent
+            let retryDir = parentHandle
+            for (const part of parts) {
+                retryDir = await retryDir.getDirectoryHandle(part, { create: true })
+            }
+            const retryFile = await retryDir.getFileHandle(fileName, { create: true })
+            const retryWritable = await retryFile.createWritable()
+            await stream.pipeTo(retryWritable)
+            return
+        }
+        throw e
+    }
 }
 
 async function listFolders() {
-    if (isListingFolders) {
-        return
-    }
-
+    if (isListingFolders) return
     isListingFolders = true
+    const folderList = document.getElementById("folderList")
+
     try {
-        const db = await getDb()
-        const transaction = db.transaction(FOLDERS_SN, "readonly")
-        const store = transaction.objectStore(FOLDERS_SN)
-        const allFolders = await promisifyRequest(store.getAll())
-
-        const folderList = document.getElementById("folderList")
-        folderList.innerHTML = ""
-
+        const registry = await getRegistry()
+        folderList.textContent = ""
         const fragment = document.createDocumentFragment()
-        allFolders.sort((a, b) => a.id.localeCompare(b.id))
 
-        allFolders.forEach(folder => {
+        const names = Object.keys(registry).sort()
+        names.forEach(name => {
+            const meta = registry[name]
             const li = document.createElement("li")
-            li.textContent = folder.encryptionType === "pdf" ? `[Locked] ${folder.id}` : folder.id
+            li.textContent = meta.encryptionType === "password" ? `[Locked] ${name}` : name
             fragment.appendChild(li)
         })
         folderList.appendChild(fragment)
     } catch (e) {
-        console.error("Failed to list folders:", e)
-        const folderList = document.getElementById("folderList")
-        folderList.textContent = "Error loading folders ):"
+        console.error("List failed:", e)
     } finally {
         isListingFolders = false
     }
@@ -490,872 +345,360 @@ async function listFolders() {
 
 async function deleteFolder(folderNameToDelete, skipConfirm = false) {
     const folderName = folderNameToDelete || document.getElementById("deleteFolderName").value.trim()
-    if (!folderName) {
-        alert("Please enter the name of the folder to delete.")
-        return
-    }
-    if (!skipConfirm && !confirm(`Are you sure you want to remove the folder "${folderName}"?`)) return
+    if (!folderName) return alert("Enter folder name!")
+    if (!skipConfirm && !confirm(`Remove "${folderName}"?`)) return
 
+    const progressElem = document.getElementById("progress")
+    progressElem.textContent = "Deleting..."
     setUiBusy(true)
     try {
-        const db = await getDb()
-        const storesToUse = [FOLDERS_SN]
-        // Defensively check if the other stores exist before adding them to the transaction
-        if (db.objectStoreNames.contains(FILES_SN)) {
-            storesToUse.push(FILES_SN)
-        }
-        if (db.objectStoreNames.contains("FileChunks")) {
-            storesToUse.push("FileChunks")
-        }
+        const root = await navigator.storage.getDirectory()
+        try {
+            const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX)
+            await rfsRoot.removeEntry(folderName, { recursive: true })
+        } catch (e) { }
 
-        const transaction = db.transaction(storesToUse, "readwrite")
-        const folderStore = transaction.objectStore(FOLDERS_SN)
-        folderStore.delete(folderName)
-
-        // Only attempt to delete files if the Files store and its index actually exist.
-        if (db.objectStoreNames.contains(FILES_SN)) {
-            const fileStore = transaction.objectStore(FILES_SN)
-            if (fileStore.indexNames.contains("lookup")) {
-                const chunkStore = transaction.objectStore("FileChunks")
-                const lookupIndex = fileStore.index("lookup")
-                const chunkIndex = chunkStore.index("by_file")
-
-                const folderFileRange = IDBKeyRange.bound(folderName + "/", folderName + "/\uffff")
-                const filesToDelete = await promisifyRequest(lookupIndex.getAll(folderFileRange))
-
-                for (const file of filesToDelete) {
-                    const fileId = file.id
-                    if (file.size && file.size > 0) {
-                        const chunkKeys = await promisifyRequest(chunkIndex.getAllKeys(IDBKeyRange.only(fileId)))
-                        for (const chunkKey of chunkKeys) {
-                            chunkStore.delete(chunkKey)
-                        }
-                    }
-                    fileStore.delete(fileId)
-                }
-            }
-        }
-
-        await promisifyTransaction(transaction)
-        console.log(`Folder "${folderName}" deleted successfully.`)
-        if (!folderNameToDelete) {
-            document.getElementById("deleteFolderName").value = ""
-        }
-        await listFolders() // Refresh UI
+        await updateRegistryEntry(folderName, null)
+        if (!folderNameToDelete) document.getElementById("deleteFolderName").value = ""
+        await listFolders()
     } catch (e) {
-        console.error("Delete folder error:", e)
-        alert("An error occurred during deletion: " + e.message)
+        alert("Delete failed: " + e.message)
     } finally {
+        progressElem.textContent = ""
         if (!skipConfirm) setUiBusy(false)
     }
-}
-
-// A helper function to concatenate two ArrayBuffers.
-function concatBuffers(buffer1, buffer2) {
-    const tmp = new Uint8Array(buffer1.byteLength + buffer2.byteLength)
-    tmp.set(new Uint8Array(buffer1), 0)
-    tmp.set(new Uint8Array(buffer2), buffer1.byteLength)
-    return tmp.buffer
-}
-
-function invalidateCacheAndWait(folderName) {
-    return new Promise((resolve, reject) => {
-        const controller = navigator.serviceWorker.controller
-        if (!controller) {
-            console.warn("No SW controller, skipping wait.")
-            resolve()
-            return
-        }
-
-        console.log("Waiting for SW to invalidate cache...")
-        // Keep UI busy to prevent user leaving/closing tab
-        setUiBusy(true)
-
-        // Set a timeout so we don't hang forever
-        const timeout = setTimeout(() => {
-            controller.removeEventListener("message", messageListener)
-            setUiBusy(false)
-            reject(new Error("Service worker cache invalidation timed out."))
-        }, 4000)
-
-        // Define listener for the reply
-        const messageListener = e => {
-            if (e.data.type === "CACHE_INVALIDATED" && e.data.folderName === folderName) {
-                clearTimeout(timeout)
-                controller.removeEventListener("message", messageListener)
-                console.log("Confimation received: Cache invalidated.")
-                resolve()
-            }
-        }
-
-        // Send command
-        navigator.serviceWorker.addEventListener("message", messageListener)
-        controller.postMessage({ type: "INVALIDATE_CACHE", folderName: folderName })
-    })
-}
-
-/**
- * Determines the MIME type of a file based on its extension.
- * @param {string} filePath The path to the file.
- * @returns {string | undefined} The MIME type or undefined if not found.
- */
-function getMimeType(filePath) {
-    const ext = filePath.split(".").pop().toLowerCase()
-    const mimeTypes = {
-        // Web Text/Markup
-        "html": "text/html", "htm": "text/html", "css": "text/css",
-        "js": "application/javascript", "mjs": "application/javascript",
-        "json": "application/json", "xml": "application/xml",
-        "txt": "text/plain", "md": "text/markdown", "csv": "text/csv",
-        "php": "text/html", "appcache": "text/cache-manifest",
-        "xhtml": "application/xhtml+xml",
-
-        // Images
-        "ico": "image/x-icon", "bmp": "image/bmp", "gif": "image/gif",
-        "jpeg": "image/jpeg", "jpg": "image/jpeg", "png": "image/png",
-        "svg": "image/svg+xml", "tif": "image/tiff", "tiff": "image/tiff",
-        "webp": "image/webp", "avif": "image/avif",
-
-        // Audio
-        "mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg",
-        "weba": "audio/webm", "mid": "audio/midi",
-
-        // Video
-        "mp4": "video/mp4", "webm": "video/webm", "mpeg": "video/mpeg",
-        "ogv": "video/ogg", "3gp": "video/3gpp", "avi": "video/x-msvideo",
-
-        // Documents & Other Apps
-        "pdf": "application/pdf", "rtf": "application/rtf",
-        "ogg": "application/ogg", // Generic OGG container
-
-        // Archives/Compressed
-        "zip": "application/zip", "gz": "application/gzip",
-        "rar": "application/vnd.rar", "tar": "application/x-tar",
-        "7z": "application/x-7z-compressed",
-
-        // Fonts
-        "woff": "font/woff", "woff2": "font/woff2", "ttf": "font/ttf",
-        "otf": "font/otf", "eot": "application/vnd.ms-fontobject",
-
-        // WebAssembly
-        "wasm": "application/wasm"
-    }
-    return mimeTypes[ext]
-}
-
-// Retrieves a file or directory handle from a given root directory and a relative path.
-async function getHandleFromPath(rootDirHandle, path) {
-    const pathParts = path.split("/").filter(p => p)
-    let currentHandle = rootDirHandle
-    for (let i = 0; i < pathParts.length; i++) {
-        const part = pathParts[i]
-        try {
-            if (i === pathParts.length - 1) {
-                // If it's the last part of the path, it's a file.
-                currentHandle = await currentHandle.getFileHandle(part)
-            } else {
-                // Otherwise, it's a directory.
-                currentHandle = await currentHandle.getDirectoryHandle(part)
-            }
-        } catch (e) {
-            // Return null if any part of the path is not found.
-            return null
-        }
-    }
-    return currentHandle
-}
-
-// A helper function to convert an ArrayBuffer to a Base64 string.
-function bufferToBase64(buffer) {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader()
-        reader.readAsDataURL(new Blob([buffer]))
-        reader.onload = () => {
-            const base64String = reader.result.split(",", 2)[1]
-            resolve(base64String)
-        }
-        reader.onerror = (error) => {
-            reject(error)
-        }
-    })
-}
-
-// A helper function to convert a Base64 string to an ArrayBuffer.
-function base64ToBuffer(base64) {
-    const binaryString = atob(base64)
-    const len = binaryString.length
-    const bytes = new Uint8Array(len)
-    for (let i = 0; i < len; i++) {
-        bytes[i] = binaryString.charCodeAt(i)
-    }
-    return bytes.buffer
-}
-
-async function processAndStoreFolder(name, files, encryptionType = null) {
-    if (!name) {
-        alert("Please enter a name for the folder.")
-        setUiBusy(false)
-        return
-    }
-
-    console.log(`Processing ${Object.keys(files).length} files for folder "${name}"...`)
-    const db = await getDb()
-
-    // First, clear any old version of this folder
-    await deleteFolder(name, true)
-
-    const largeFilesToStream = []
-    const smallFileEntries = []
-
-    for (const path in files) {
-        const fileData = files[path]
-        if (fileData instanceof File && fileData.size > CHUNK_SIZE) {
-            largeFilesToStream.push({ path, fileData })
-        } else if (fileData) {
-            smallFileEntries.push({ path, fileData })
-        }
-    }
-
-    if (smallFileEntries.length > 0) {
-        const transaction = db.transaction([FILES_SN], "readwrite")
-        const fileStore = transaction.objectStore(FILES_SN)
-        for (const entry of smallFileEntries) {
-            const { path, fileData } = entry
-            const buffer = await (fileData.buffer ? fileData.buffer : fileData.arrayBuffer())
-            const type = fileData.type || getMimeType(path)
-
-            fileStore.put({
-                folderName: name,
-                path: path,
-                buffer: new Blob([buffer]),
-                type: type,
-                lookupPath: `${name}/${path}`
-            })
-        }
-        await promisifyTransaction(transaction)
-    }
-
-    for (const largeFile of largeFilesToStream) {
-        await streamFileToDb(db, name, largeFile.path, largeFile.fileData)
-    }
-
-    // Save the folder metadata
-    const folderTransaction = db.transaction([FOLDERS_SN], "readwrite")
-    await promisifyRequest(folderTransaction.objectStore(FOLDERS_SN).put({ id: name, lastModified: new Date(), encryptionType }))
-    await promisifyTransaction(folderTransaction)
-
-    // Notify the service worker to invalidate its cache for this folder
-    if (navigator.serviceWorker.controller) {
-        navigator.serviceWorker.controller.postMessage({ type: "INVALIDATE_CACHE", folderName: name })
-    }
-
-    console.log(`Folder "${name}" stored successfully`)
-    document.getElementById("folderName").value = ""
-    document.getElementById("openFolderName").value = name
-    await listFolders()
 }
 
 async function openFile(overrideFolderName) {
     const folderName = overrideFolderName || document.getElementById("openFolderName").value.trim()
     const fileName = document.getElementById("fileName").value.trim()
+    if (!folderName) return alert("Provide a folder name.")
 
-    if (!folderName) {
-        alert("Please provide a folder name.")
-        return
-    }
-
-    const db = await getDb()
-    const folderData = await db.transaction(FOLDERS_SN).objectStore(FOLDERS_SN).get(folderName)
-
-    if (!folderData) {
-        alert(`Folder "${folderName}" not found.`)
-        return
-    }
-
-    // Set the UI to a busy state before starting any long-running operations.
     setUiBusy(true)
     try {
-        const regexRules = document.getElementById("regex").value.trim()
-        const customHeaders = document.getElementById("headers").value.trim()
+        const registry = await getRegistry()
+        const meta = registry[folderName]
+        if (!meta) return alert("Folder not found.")
 
-        if (regexRules || customHeaders) {
-            try {
-                await invalidateCacheAndWait(folderName)
-            } catch (err) {
-                console.error("Cache invalidation failed before opening file:", err)
-                alert("Could not clear cache before applying rules. You may see stale content.")
-            }
+        const rules = document.getElementById("regex").value.trim()
+        const headers = document.getElementById("headers").value.trim()
+
+        if (meta.rules !== rules || meta.headers !== headers) {
+            await updateRegistryEntry(folderName, { rules, headers })
         }
 
-        const isEncrypted = folderData.encryptionType === "pdf"
-        let decryptionKey = null
-
-        if (isEncrypted) {
-            const password = prompt(`Enter password for folder "${folderName}":`)
-            if (!password) return
-
-            try {
-                const transaction = db.transaction(FILES_SN, "readonly")
-                const fileStore = transaction.objectStore(FILES_SN)
-                const fileIndex = fileStore.index("lookup")
-                const metadataFileRecord = await promisifyRequest(fileIndex.get(`${folderName}/.metadata`))
-
-                if (!metadataFileRecord) throw new Error("Encryption metadata is missing.")
-
-                const saltBuffer = await metadataFileRecord.buffer.arrayBuffer()
-                const salt = new Uint8Array(saltBuffer)
-                decryptionKey = await deriveKeyFromPassword(password, salt)
-            } catch (e) {
-                console.error("Decryption failed:", e)
-                alert("Decryption failed. Please check the folder name and password.")
-                return
-            }
+        let key = null
+        if (meta.encryptionType === "password") {
+            const password = prompt(`Enter password for "${folderName}":`)
+            if (!password) return setUiBusy(false)
+            key = await deriveKeyFromPassword(password, base64ToBuffer(meta.salt))
         }
 
-        const requestId = crypto.randomUUID()
+        const sw = await waitForController()
+
+        await new Promise(resolve => {
+            const channel = new MessageChannel()
+            channel.port1.onmessage = () => resolve()
+
+            sw.postMessage({
+                type: "SET_RULES",
+                rules,
+                headers,
+                key
+            }, [channel.port2])
+        })
+
+        window.open(`n/${encodeURIComponent(folderName)}/${fileName.split("/").map(encodeURIComponent).join("/")}`, "_blank")
+
+    } catch (e) {
+        alert("Error: " + e)
+    } finally {
+        setUiBusy(false)
+    }
+}
+
+async function createDownloadStream(filename) {
+    if (window.showSaveFilePicker) {
         try {
-            await new Promise((resolve, reject) => {
-                const controller = navigator.serviceWorker.controller
-                if (!controller) {
-                    return reject(new Error("Service Worker not active."))
-                }
+            const handle = await window.showSaveFilePicker({ suggestedName: filename })
+            return await handle.createWritable()
+        } catch (err) {
+            if (err.name === "AbortError") return
+            console.warn("Native File System API failed, falling back to memory buffer:", err)
+        }
+    }
 
-                const timeout = setTimeout(() => {
-                    reject(new Error("Service Worker acknowledgment timed out."))
-                }, 4000)
+    const chunks = []
+    let totalSize = 0
+    return new WritableStream({
+        write(chunk) {
+            // chunk is usually Uint8Array, String, or Blob
+            chunks.push(chunk)
 
-                const messageListener = e => {
-                    if (e.data.type === "RULES_READY" && e.data.requestId === requestId) {
-                        clearTimeout(timeout)
-                        navigator.serviceWorker.removeEventListener("message", messageListener)
-                        resolve()
+            // Optional: Track size for debugging or limits
+            if (chunk.byteLength) totalSize += chunk.byteLength
+        },
+        close() {
+            if (chunks.length === 0) return
+
+            // Combine all chunks into a single Blob
+            const blob = new Blob(chunks, { type: "application/octet-stream" })
+            const url = URL.createObjectURL(blob)
+
+            // Create invisible link and trigger download
+            const a = document.createElement("a")
+            a.style.display = "none"
+            a.href = url
+            a.download = filename
+
+            document.body.appendChild(a)
+            a.click()
+
+            // Cleanup
+            // We use a small timeout to ensure the download starts before revoking
+            setTimeout(() => {
+                document.body.removeChild(a)
+                window.URL.revokeObjectURL(url)
+                chunks.length = 0 // Free memory explicitly
+            }, 500)
+        },
+        abort(reason) {
+            console.error("Stream download aborted:", reason)
+            chunks.length = 0
+        }
+    })
+}
+
+async function exportData() {
+    if (!window.CBOR) return alert("cbor-x is missing!")
+
+    let key, salt
+    let encrypt = true
+    const pass = prompt("Enter a password (or leave blank for no encryption):").trim()
+    if (pass.length === 0) encrypt = false
+
+    salt = crypto.getRandomValues(new Uint8Array(16))
+    key = await deriveKeyFromPassword(pass, salt)
+
+    setUiBusy(true)
+    const progressElem = document.getElementById("progress")
+    const updateProgress = createProgressThrottle(progressElem)
+
+    try {
+        const fileWritable = await createDownloadStream(encrypt ? "result.enc" : "result.tar.gz")
+        let outputStream
+
+        if (encrypt) {
+            const fileWriter = fileWritable.getWriter()
+
+            // Write Header
+            await fileWriter.write(new TextEncoder().encode("RFS_ENC\0"))
+            await fileWriter.write(salt)
+            outputStream = new ChunkedEncryptionStream(fileWriter, key)
+        } else {
+            outputStream = fileWritable
+        }
+
+        const gzip = new CompressionStream("gzip")
+        const gzipPromise = gzip.readable.pipeTo(outputStream)
+        const tarWriter = gzip.writable.getWriter()
+        const write = async (d) => await tarWriter.write(d)
+
+        const writeTarEntry = async (name, dataBytes) => {
+            await write(createTarHeader(name, dataBytes.byteLength))
+            await write(dataBytes)
+            const remainder = dataBytes.byteLength % 512
+            if (remainder > 0) await write(new Uint8Array(512 - remainder))
+        }
+
+        const writeTarStream = async (name, size, readableStream) => {
+            await write(createTarHeader(name, size))
+            let bytesWritten = 0
+            const reader = readableStream.getReader()
+            while (true) {
+                const { done, value } = await reader.read()
+                if (done) break
+                await write(value)
+                bytesWritten += value.byteLength
+            }
+            const remainder = bytesWritten % 512
+            if (remainder > 0) await write(new Uint8Array(512 - remainder))
+        }
+
+        updateProgress("Exporting Metadata...")
+
+        const metadata = {
+            ls: document.getElementById("c2").checked ? { ...localStorage } : {},
+            ss: document.getElementById("c7").checked ? getSessionStorageExport() : {},
+            cookies: typeof getCookiesAsObject === 'function' && document.getElementById("c1").checked ? getCookiesAsObject() : {},
+            reg: document.getElementById("c4").checked ? await getRegistry() : {},
+        }
+
+        await writeTarEntry("runtimefs_system/metadata.json", new TextEncoder().encode(JSON.stringify(metadata, null, 2)))
+
+        if (document.getElementById("c3").checked) await streamIndexedDBToWriter(updateProgress, writeTarEntry)
+        if (document.getElementById("c6").checked) await streamCacheStorageToWriter(updateProgress, writeTarEntry)
+
+        if (document.getElementById("c5").checked) {
+            const root = await navigator.storage.getDirectory()
+            const processDir = async (handle, prefix) => {
+                for await (const entry of handle.values()) {
+                    if (entry.name === SYSTEM_FILE) continue
+                    const path = prefix ? `${prefix}/${entry.name}` : entry.name
+                    if (entry.kind === "file") {
+                        updateProgress(path)
+                        const file = await entry.getFile()
+                        await writeTarStream(path, file.size, file.stream())
+                    } else {
+                        await processDir(entry, path)
                     }
                 }
-                navigator.serviceWorker.addEventListener("message", messageListener)
+            }
+            await processDir(root, "")
+        }
 
-                controller.postMessage({
-                    type: "SET_RULES",
-                    requestId: requestId,
-                    rules: regexRules,
-                    headers: customHeaders,
-                    key: decryptionKey
-                })
+        await write(new Uint8Array(1024)) // Write Tar Footer
+        await tarWriter.close()           // Close GZIP input
+        await gzipPromise                 // Wait for GZIP -> Output pipe to finish
+
+    } catch (e) {
+        console.error(e)
+        alert("Export error: " + e.message)
+    } finally {
+        setUiBusy(false)
+        progressElem.textContent = ""
+    }
+}
+
+async function streamIndexedDBToWriter(updateProgress, writeFunc) {
+    if (!window.indexedDB || !indexedDB.databases) return
+    const dbs = await indexedDB.databases()
+
+    // Helper to process Blobs for CBOR
+    const prepareForCbor = async (item) => {
+        if (item instanceof Blob) {
+            return { __rfs_blob: true, type: item.type, data: new Uint8Array(await item.arrayBuffer()) }
+        }
+        if (ArrayBuffer.isView(item) || item instanceof ArrayBuffer) return item
+        if (Array.isArray(item)) return Promise.all(item.map(prepareForCbor))
+        if (item && typeof item === "object" && item.constructor === Object) {
+            const newItem = {}
+            for (const k in item) newItem[k] = await prepareForCbor(item[k])
+            return newItem
+        }
+        return item
+    }
+
+    for (const { name: dbName } of dbs) {
+        if (!dbName) continue
+        if (dbName === "FileCacheDB") continue // Skip internal browser DBs
+        updateProgress(`Exporting DB: ${dbName}`)
+
+        try {
+            const db = await new Promise((res, rej) => {
+                const r = indexedDB.open(dbName)
+                r.onsuccess = () => res(r.result)
+                r.onerror = () => rej(r.error)
             })
-        } catch (err) {
-            alert(`Error preparing to open file: ${err.message}`)
-            return
-        }
 
-        const encodedFolderName = encodeURIComponent(folderName)
-        const encodedFilePath = fileName.split("/").map(segment => encodeURIComponent(segment)).join("/")
-        const url = `n/${encodedFolderName}/${encodedFilePath}`
-        window.open(url, "_blank")
-    } finally {
-        // This block is guaranteed to run, ensuring the UI is always re-enabled.
-        setUiBusy(false)
-    }
-}
+            const storeNames = Array.from(db.objectStoreNames)
 
-async function syncFiles() {
-    if (!folderName || !dirHandle) {
-        alert("Please upload a folder first to enable syncing.")
-        return
-    }
-
-    if (changes.length === 0) {
-        alert("No changes detected to sync.")
-        return
-    }
-
-    setUiBusy(true)
-    console.log("Starting file synchronization...")
-    try {
-        const updateCount = await performSyncToDb()
-        if (updateCount > 0) {
-            await invalidateCacheAndWait(folderName)
-            alert(`Sync complete. ${updateCount} change(s) processed.`)
-        } else {
-            alert("Sync complete. No changes needed to be applied.")
-        }
-        console.log("Sync process finished.")
-    } catch (err) {
-        console.error("Sync failed:", err)
-        alert("An error occurred during sync: " + err.message)
-    } finally {
-        setUiBusy(false)
-    }
-}
-
-async function storeBufferToDb(db, folderName, path, buffer, fileType) {
-    if (buffer.byteLength < CHUNK_SIZE) {
-        const transaction = db.transaction([FILES_SN], "readwrite")
-        // Storing a flattened object now
-        await promisifyRequest(transaction.objectStore(FILES_SN).add({ folderName, path, buffer: buffer, type: fileType }))
-        await promisifyTransaction(transaction)
-    } else {
-        let fileId
-        const metadataTransaction = db.transaction([FILES_SN], "readwrite")
-        fileId = await promisifyRequest(metadataTransaction.objectStore(FILES_SN).add({ folderName, path, type: fileType, size: buffer.byteLength }))
-        await promisifyTransaction(metadataTransaction)
-
-        for (let i = 0; i < buffer.byteLength; i += CHUNK_SIZE) {
-            const chunkTransaction = db.transaction(["FileChunks"], "readwrite")
-            const chunk = buffer.slice(i, Math.min(i + CHUNK_SIZE, buffer.byteLength))
-            await promisifyRequest(chunkTransaction.objectStore("FileChunks").add({ fileId, index: i / CHUNK_SIZE, data: chunk }))
-            await promisifyTransaction(chunkTransaction)
-        }
-    }
-}
-
-async function clearAndFillDatabase(dbName, dbData) {
-    await new Promise((resolve, reject) => {
-        const delRequest = indexedDB.deleteDatabase(dbName)
-        delRequest.onerror = e => reject(new Error(`Could not delete database: ${dbName}. Error: ${e.target.error}`))
-        delRequest.onblocked = () => reject(new Error(`Import failed: Database "${dbName}" is open in another tab. Please close it and try again.`))
-        delRequest.onsuccess = () => resolve()
-    })
-
-    const db = await new Promise((resolve, reject) => {
-        const request = indexedDB.open(dbName, dbData.version)
-        request.onerror = e => reject(new Error(`Could not open database: ${dbName}. Error: ${e.target.error}`))
-        request.onupgradeneeded = e => {
-            const dbHandle = e.target.result
-            for (const storeName in dbData.stores) {
-                const { schema } = dbData.stores[storeName]
-                const storeHandle = dbHandle.createObjectStore(storeName, { keyPath: schema.keyPath, autoIncrement: schema.autoIncrement })
-                schema.indexes?.forEach(idx => {
-                    storeHandle.createIndex(idx.name, idx.keyPath, { unique: idx.unique, multiEntry: idx.multiEntry })
+            const schema = {
+                dbName,
+                version: db.version,
+                stores: storeNames.map(name => {
+                    const store = db.transaction(name).objectStore(name)
+                    const indexes = Array.from(store.indexNames).map(idxName => {
+                        const idx = store.index(idxName)
+                        return { name: idx.name, keyPath: idx.keyPath, unique: idx.unique, multiEntry: idx.multiEntry }
+                    })
+                    return { name, keyPath: store.keyPath, autoIncrement: store.autoIncrement, indexes }
                 })
             }
-        }
-        request.onsuccess = e => resolve(e.target.result)
-    })
+            await writeFunc(`__IDB_SCHEMA__/${dbName}`, CBOR.encode(schema))
 
-    const idMap = new Map()
+            // Actually export with snapshots!
+            for (const storeName of storeNames) {
+                let lastKey = null
+                let hasMore = true
+                let chunkId = 0
 
-    // Special pre-processing ONLY for FileCacheDB's auto-incrementing stores
-    if (dbName === DBN && dbData.stores[FILES_SN]) {
-        const filesStoreInfo = dbData.stores[FILES_SN]
-        const filesTx = db.transaction([FILES_SN], "readwrite")
-        const filesStore = filesTx.objectStore(FILES_SN)
-        for (const record of filesStoreInfo.data) {
-            const oldId = record.key
-            let value = record.value
-            delete value.id
-            const addRequest = filesStore.add(value)
-            const newId = await promisifyRequest(addRequest)
-            idMap.set(oldId, newId)
-        }
-        await promisifyTransaction(filesTx)
-    }
+                while (hasMore) {
+                    // Open a short-lived transaction just to grab a batch
+                    const { batch, nextKey, completed } = await new Promise((resolve, reject) => {
+                        const tx = db.transaction(storeName, "readonly")
+                        const store = tx.objectStore(storeName)
+                        // Resume from lastKey if we have one
+                        const range = lastKey !== null ? IDBKeyRange.lowerBound(lastKey, true) : null
+                        const req = store.openCursor(range)
 
-    const storeNamesToRestore = Object.keys(dbData.stores).filter(name => {
-        // Skip stores that were handled in the special block above
-        return !(dbName === DBN && name === FILES_SN)
-    })
+                        const currentBatch = []
 
-    if (storeNamesToRestore.length > 0) {
-        const transaction = db.transaction(storeNamesToRestore, "readwrite")
-        for (const storeName of storeNamesToRestore) {
-            const storeInfo = dbData.stores[storeName]
-            const store = transaction.objectStore(storeName)
-
-            for (const record of storeInfo.data) {
-                let valueToPut = record.value
-
-                if (dbName === DBN && storeName === "FileChunks") {
-                    const newFileId = idMap.get(valueToPut.fileId)
-                    if (newFileId == null) continue // Skip orphaned chunks
-                    valueToPut.fileId = newFileId
-                }
-
-                // Convert any ArrayBuffers in FileCacheDB back to Blobs
-                if (dbName === DBN && storeName === FILES_SN && valueToPut.buffer instanceof ArrayBuffer) {
-                    valueToPut.buffer = new Blob([valueToPut.buffer])
-                }
-
-                // This is the universal put logic
-                if (store.keyPath) {
-                    // For stores with in-line keys (like Folders, Rules, etc)
-                    store.put(valueToPut)
-                } else {
-                    // For stores with out-of-line keys
-                    store.put(valueToPut, record.key)
-                }
-            }
-        }
-        await promisifyTransaction(transaction)
-    }
-
-    db.close()
-}
-
-async function storeInMemoryFilesToDb(db, name, files) {
-    const transaction = db.transaction([FILES_SN], "readwrite")
-    const fileStore = transaction.objectStore(FILES_SN)
-    const promises = []
-    for (const path in files) {
-        const fileData = files[path]
-        const fileRecord = {
-            folderName: name,
-            path: path,
-            content: { buffer: fileData.buffer, type: fileData.type }
-        }
-        promises.push(promisifyRequest(fileStore.put(fileRecord)))
-    }
-    await Promise.all(promises)
-    await promisifyTransaction(transaction)
-}
-
-async function streamFileToDb(db, folderName, path, file) {
-    const metaTx = db.transaction([FILES_SN], "readwrite")
-    const fileStore = metaTx.objectStore(FILES_SN)
-    const fileMetadata = {
-        folderName,
-        path,
-        type: getMimeType(path) || file.type,
-        size: file.size,
-        lookupPath: `${folderName}/${path}`
-    }
-    const fileId = await promisifyRequest(fileStore.add(fileMetadata))
-    await promisifyTransaction(metaTx)
-
-    // Now, process the chunks in batches for performance.
-    const reader = file.stream().getReader()
-    let chunkIndex = 0
-    let chunkBatch = []
-
-    while (true) {
-        const { done, value } = await reader.read()
-        if (value) {
-            chunkBatch.push({ fileId, index: chunkIndex++, data: value })
-        }
-
-        if ((chunkBatch.length >= BATCH_SIZE || done) && chunkBatch.length > 0) {
-            const chunkTx = db.transaction(["FileChunks"], "readwrite")
-            const chunkStore = chunkTx.objectStore("FileChunks")
-            for (const chunk of chunkBatch) {
-                chunkStore.add(chunk)
-            }
-            await promisifyTransaction(chunkTx)
-            chunkBatch = []
-        }
-
-        if (done) {
-            break // Exit the loop once the file stream is exhausted.
-        }
-    }
-}
-
-async function deleteFileByPathAndChunks(db, folderName, path) {
-    const fullPath = `${folderName}/${path}`
-    const transaction = db.transaction([FILES_SN, "FileChunks"], "readwrite")
-    const fileStore = transaction.objectStore(FILES_SN)
-    const chunkStore = transaction.objectStore("FileChunks")
-    const lookupIndex = fileStore.index("lookup")
-    const chunkIndex = chunkStore.index("by_file")
-
-    const record = await promisifyRequest(lookupIndex.get(fullPath))
-    if (record?.id) {
-        const chunkKeys = await promisifyRequest(chunkIndex.getAllKeys(IDBKeyRange.only(record.id)))
-        for (const key of chunkKeys) {
-            chunkStore.delete(key)
-        }
-        fileStore.delete(record.id)
-    }
-
-    return promisifyTransaction(transaction)
-}
-
-/**
- * Gathers all application data (IndexedDB, localStorage, cookies), optionally
- * encrypts it, and presents a download link to the user.
- */
-// In main.js
-
-/**
- * Gathers all application data (IndexedDB, localStorage, cookies), optionally
- * encrypts it, and presents a download link to the user
- */
-async function exportData() {
-    const password = prompt("Enter an optional password to encrypt the export leave blank for a plaintext export:")
-    setUiBusy(true)
-
-    try {
-        const dataToExport = {
-            localStorage: {},
-            indexedDB: {},
-            cookies: ""
-        }
-
-        if (document.getElementById("c2").checked) {
-            for (let i = 0; i < localStorage.length; i++) {
-                const key = localStorage.key(i)
-                if (key !== "pk") {
-                    dataToExport.localStorage[key] = localStorage.getItem(key)
-                }
-            }
-        }
-
-        if (document.getElementById("c1").checked) {
-            dataToExport.cookies = document.cookie
-        }
-
-        const exportRuntimeFS = document.getElementById("c4").checked
-        const exportIndexedDB = document.getElementById("c3").checked
-        if (exportRuntimeFS || exportIndexedDB) {
-            const allDbs = await indexedDB.databases()
-
-            const dbProcessingPromises = allDbs.map(async (dbInfo) => {
-                const dbName = dbInfo.name
-                if (!exportRuntimeFS && dbName === DBN) return null
-                if (exportRuntimeFS && !exportIndexedDB && dbName !== DBN) return null
-
-                try {
-                    const db = await new Promise((resolve, reject) => {
-                        const request = indexedDB.open(dbName)
-                        request.onsuccess = () => resolve(request.result)
-                        request.onerror = e => reject(new Error(`Could not open db: ${dbName}`))
+                        req.onsuccess = (e) => {
+                            const cursor = e.target.result
+                            if (cursor) {
+                                currentBatch.push({ k: cursor.key, v: cursor.value })
+                                // Limit batch to 200 items to prevent memory issues
+                                if (currentBatch.length >= 200) {
+                                    resolve({ batch: currentBatch, nextKey: cursor.key, completed: false })
+                                    return
+                                }
+                                cursor.continue()
+                            } else {
+                                // End of store
+                                resolve({ batch: currentBatch, nextKey: null, completed: true })
+                            }
+                        }
+                        req.onerror = () => reject(req.error)
                     })
 
-                    const dbExport = { version: db.version, stores: {} }
-                    const storeNames = Array.from(db.objectStoreNames)
+                    // Process and write the batch asynchronously
+                    // The transaction is already closed here, so awaiting is safe.
+                    if (batch.length > 0) {
+                        const processedBatch = await Promise.all(batch.map(async (r) => {
+                            return { k: r.k, v: await prepareForCbor(r.v) }
+                        }))
 
-                    if (storeNames.length > 0) {
-                        const transaction = db.transaction(storeNames, "readonly")
-                        const storeProcessingPromises = storeNames.map(async (storeName) => {
-                            const store = transaction.objectStore(storeName)
-                            const indexes = Array.from(store.indexNames).map(name => {
-                                const index = store.index(name)
-                                return { name: index.name, keyPath: index.keyPath, unique: index.unique, multiEntry: index.multiEntry }
-                            })
-
-                            const recordsWithKeys = await new Promise((resolve, reject) => {
-                                const cursorReq = store.openCursor()
-                                const allRecords = []
-                                cursorReq.onerror = e => reject(e.target.error)
-                                cursorReq.onsuccess = e => {
-                                    const cursor = e.target.result
-                                    if (cursor) {
-                                        allRecords.push({ key: cursor.key, value: cursor.value })
-                                        cursor.continue()
-                                    } else {
-                                        resolve(allRecords)
-                                    }
-                                }
-                            })
-
-                            if (dbName === DBN && storeName === FILES_SN) {
-                                const recordsWithBlobs = recordsWithKeys.filter(r => r.value.buffer instanceof Blob)
-                                if (recordsWithBlobs.length > 0) {
-                                    console.log(`Found ${recordsWithBlobs.length} file records with Blobs to process...`)
-                                    const MAX_BATCH_SIZE_BYTES = 128 * 1024 * 1024 // 128MB
-                                    let currentBatch = []
-                                    let currentBatchSizeBytes = 0
-                                    let batchNum = 1
-
-                                    for (const recordItem of recordsWithBlobs) {
-                                        const recordSize = recordItem.value.buffer.size
-                                        if (currentBatch.length > 0 && (currentBatchSizeBytes + recordSize) > MAX_BATCH_SIZE_BYTES) {
-                                            console.log(`Processing batch #${batchNum}: ${currentBatch.length} files, ~${(currentBatchSizeBytes / 1024 / 1024).toFixed(2)} MB`)
-                                            const conversionPromises = currentBatch.map(async (item) => {
-                                                const buffer = await item.value.buffer.arrayBuffer()
-                                                item.value.buffer = buffer // Modify the object directly
-                                            })
-                                            await Promise.all(conversionPromises)
-                                            currentBatch = []
-                                            currentBatchSizeBytes = 0
-                                            batchNum++
-                                        }
-                                        currentBatch.push(recordItem)
-                                        currentBatchSizeBytes += recordSize
-                                    }
-
-                                    if (currentBatch.length > 0) {
-                                        console.log(`Processing final batch #${batchNum}: ${currentBatch.length} files, ~${(currentBatchSizeBytes / 1024 / 1024).toFixed(2)} MB`)
-                                        const conversionPromises = currentBatch.map(async (item) => {
-                                            const buffer = await item.value.buffer.arrayBuffer()
-                                            item.value.buffer = buffer // Modify the object directly
-                                        })
-                                        await Promise.all(conversionPromises)
-                                    }
-                                }
-                            }
-
-                            return [storeName, {
-                                schema: { keyPath: store.keyPath, autoIncrement: store.autoIncrement, indexes },
-                                data: recordsWithKeys
-                            }]
-                        })
-
-                        const processedStoresArray = await Promise.all(storeProcessingPromises)
-                        for (const [storeName, storeData] of processedStoresArray) {
-                            dbExport.stores[storeName] = storeData
-                        }
+                        const chunkData = CBOR.encode({ db: dbName, st: storeName, d: processedBatch })
+                        // Virtual filename: __IDB_DATA__/dbName/storeName/chunkId
+                        await writeFunc(`__IDB_DATA__/${dbName}/${storeName}/${chunkId++}`, chunkData)
                     }
 
-                    db.close()
-                    return [dbName, dbExport]
-                } catch (e) {
-                    console.warn(`Could not export database "${dbName}" Skipping Reason: ${e.name} - ${e.message}`)
-                    return null
-                }
-            })
-
-            const processedDbsArray = (await Promise.all(dbProcessingPromises)).filter(Boolean)
-            for (const [dbName, dbExport] of processedDbsArray) {
-                dataToExport.indexedDB[dbName] = dbExport
-            }
-        }
-
-        const encoded = CBOR.encode(dataToExport)
-        let finalBuffer = password ? CBOR.encode(await encryptPayload(encoded, password)) : encoded
-
-        if (window.showSaveFilePicker) {
-            try {
-                const handle = await window.showSaveFilePicker({
-                    suggestedName: "result.cbor",
-                    types: [{
-                        description: "CBOR File",
-                        accept: { "application/octet-stream": [".cbor"] },
-                    }],
-                })
-                const writable = await handle.createWritable()
-                await writable.write(finalBuffer)
-                await writable.close()
-                console.log("Data export complete!")
-            } catch (err) {
-                if (err.name !== "AbortError") {
-                    console.error("Could not save file with File System Access API, falling back:", err)
-                    createAndDisplayDownloadLink(finalBuffer, document.getElementById("c3").parentElement, "result.cbor")
+                    lastKey = nextKey
+                    hasMore = !completed
                 }
             }
-        } else {
-            createAndDisplayDownloadLink(finalBuffer, document.getElementById("c3").parentElement, "result.cbor")
-        }
+            db.close()
 
-        console.log("Data export prepared")
-    } catch (e) {
-        console.error("Export failed:", e)
-        alert("An error occurred during export: " + (e.message || e.name))
-    } finally {
-        setUiBusy(false)
+        } catch (e) {
+            console.warn(`Failed to export DB ${dbName}`, e)
+        }
     }
 }
 
-// Helper for encryption to keep the main function cleaner
-async function encryptPayload(payload, password) {
-    const salt = crypto.getRandomValues(new Uint8Array(16))
-    const iv = crypto.getRandomValues(new Uint8Array(12))
-    const key = await deriveKeyFromPassword(password, salt)
-    const encryptedBuffer = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, payload)
-    return { type: "FS-EE", s: salt, iv: iv, p: new Uint8Array(encryptedBuffer) }
+function getCookiesAsObject() {
+    return document.cookie.split(';').reduce((res, c) => {
+        const [key, val] = c.trim().split('=').map(decodeURIComponent)
+        if (key) res[key] = val
+        return res
+    }, {})
 }
 
-async function getServiceWorkerController() {
-    const registration = await navigator.serviceWorker.ready
-    return registration.active
+function restoreCookies(cookieObj) {
+    if (!cookieObj) return
+    const expires = new Date(Date.now() + 86400 * 365 * 1000).toUTCString()
+    for (const [key, value] of Object.entries(cookieObj)) {
+        document.cookie = `${key}=${value}; expires=${expires}; path=/; SameSite=Lax`
+    }
 }
 
 async function importData() {
     const input = document.createElement("input")
     input.type = "file"
-    input.click()
+    input.addEventListener("cancel", () => setUiBusy(false))
+    input.addEventListener("change", e => { if (e.target.files[0]) startImport(e.target.files[0]) })
     setUiBusy(true)
-
-    input.oncancel = () => setUiBusy(false)
-
-    input.onchange = async e => {
-        let data = null // Hoist data to be accessible in the finally block
-        try {
-            const file = e.target.files[0]
-            if (!file) {
-                setUiBusy(false)
-                return
-            }
-
-            // Close all DB connections before proceeding to avoid a deadlock
-            const controller = navigator.serviceWorker.controller
-            if (controller) {
-                await new Promise((resolve, reject) => {
-                    const timeout = setTimeout(() => reject(new Error("SW ack for import prep timed out.")), 5000)
-                    const messageListener = msgEvent => {
-                        if (msgEvent.data.type === "IMPORT_READY") {
-                            navigator.serviceWorker.removeEventListener("message", messageListener)
-                            clearTimeout(timeout)
-                            resolve()
-                        }
-                    }
-                    navigator.serviceWorker.addEventListener("message", messageListener)
-                    controller.postMessage({ type: "PREPARE_FOR_IMPORT" })
-                })
-            }
-            if (dbPromise) {
-                const db = await dbPromise
-                db.close()
-                dbPromise = null
-            }
-
-            if (navigator.storage && navigator.storage.estimate) {
-                const estimate = await navigator.storage.estimate()
-                const availableSpace = estimate.quota - estimate.usage
-                if (file.size > availableSpace) {
-                    throw new Error("Import failed: The file size is larger than available browser storage.")
-                }
-            }
-
-            const buffer = await file.arrayBuffer()
-            data = CBOR.decodeMultiple(new Uint8Array(buffer))[0]
-
-            if (!data) {
-                throw new Error("Import file is empty or not a valid CBOR file.")
-            }
-
-            if (data.type === "FS-EE") {
-                const password = prompt("This data is encrypted. Please enter the password:")
-                if (!password) {
-                    setUiBusy(false)
-                    return
-                }
-                const key = await deriveKeyFromPassword(password, data.s)
-                let decryptedPayload
-                try {
-                    decryptedPayload = await crypto.subtle.decrypt({ name: "AES-GCM", iv: data.iv }, key, data.p)
-                } catch (err) {
-                    throw new Error("Decryption failed. The password may be incorrect.")
-                }
-
-                data = CBOR.decode(new Uint8Array(decryptedPayload))
-                if (!data) {
-                    throw new Error("Decrypted payload is empty or invalid.")
-                }
-            }
-
-            data = normalizeToArrayBuffers(data)
-
-            if (data.localStorage) {
-                Object.keys(data.localStorage).forEach(key => {
-                    if (key !== "pk") localStorage.setItem(key, data.localStorage[key])
-                })
-            }
-
-            if (data.indexedDB) {
-                for (const dbName in data.indexedDB) {
-                    const dbData = data.indexedDB[dbName]
-                    await clearAndFillDatabase(dbName, dbData)
-                }
-            }
-
-            await listFolders()
-            alert("Import complete! You may need to reload the page for all changes to take effect.")
-        } catch (error) {
-            console.error("Import failed:", error)
-            alert(`An error occurred during import: ${error.message || error.name}`)
-        } finally {
-            data = null
-            setUiBusy(false)
-        }
-    }
+    input.click()
 }
 
 // Crucial for saving memory!
@@ -1385,312 +728,795 @@ function normalizeToArrayBuffers(data) {
     return data
 }
 
-/**
- * Creates an empty IndexedDB database with a specific version number.
- * This is used to handle edge cases like Emscripten's /idbfs-test.
- * @param {string} dbName The name of the database to create.
- * @param {number} version The version number for the new database.
- * @returns {Promise<void>}
- */
-async function createEmptyDatabase(dbName, version) {
-    console.log(`Creating special-case empty database: "${dbName}" version ${version}`)
-
-    // Ensure any old version is completely gone.
-    await new Promise((resolve, reject) => {
-        const delRequest = indexedDB.deleteDatabase(dbName)
-        delRequest.onerror = e => reject(new Error(`Could not delete database: ${dbName}`))
-        delRequest.onblocked = () => reject(new Error(`Import failed: Database "${dbName}" is open in another tab.`))
-        delRequest.onsuccess = () => resolve()
-    })
-
-    return new Promise((resolve, reject) => {
-        const request = indexedDB.open(dbName, version)
-        request.onerror = e => reject(new Error(`Could not create empty database: ${dbName}`))
-        request.onupgradeneeded = e => {
-            // The event itself creates the database, no action needed inside.
+async function prepareForCbor(item) {
+    if (item instanceof Blob) {
+        return {
+            __rfs_blob: true,
+            type: item.type,
+            data: normalizeToArrayBuffers(new Uint8Array(await item.arrayBuffer())) // memory stuff
         }
-        request.onsuccess = e => {
-            e.target.result.close()
-            resolve()
-        }
-    })
+    }
+    // Deep normalization for existing arrays/views
+    return normalizeToArrayBuffers(item)
 }
 
-async function createAndDisplayDownloadLink(buffer, parentElement, filename) {
-    const blob = new Blob([buffer], { type: "application/octet-stream" })
-    const url = URL.createObjectURL(blob)
+function getSessionStorageExport() {
+    return { ...sessionStorage }
+}
 
-    const a = document.createElement("a")
-    a.style.display = "none"
-    a.href = url
-    a.download = filename
-    a.textContent = "Download export!"
-    a.style.color = "#ccc"
-    a.style.display = "block"
-    a.style.padding = "8px"
-    a.style.border = "1px solid #15e264"
-    a.style.borderRadius = "5px"
-    a.style.textAlign = "center"
-    a.style.marginBottom = "5px"
+function restoreSessionStorage(data) {
+    if (!data) return
+    sessionStorage.clear()
+    for (const [k, v] of Object.entries(data)) {
+        sessionStorage.setItem(k, v)
+    }
+}
 
-    // Revoke the object URL and hide both elements after click
-    a.addEventListener("click", async function (e) {
-        if (window.showSaveFilePicker) {
-            e.preventDefault()
-            // Try one more time; this time any SecurityErrors should be solved
-            try {
-                const handle = await window.showSaveFilePicker({
-                    suggestedName: "result.cbor",
-                    types: [{
-                        description: "CBOR File",
-                        accept: { "application/octet-stream": [".cbor"] },
-                    }]
-                })
-                const writable = await handle.createWritable()
-                await writable.write(buffer)
-                await writable.close()
-                console.log("Data export complete!")
-                setTimeout(function () {
-                    URL.revokeObjectURL(url)
-                    parentElement.removeChild(a)
-                }, 200)
-                return
-            } catch (err) {
-                if (err.name === "AbortError") {
-                    setTimeout(function () {
-                        URL.revokeObjectURL(url)
-                        parentElement.removeChild(a)
-                    }, 200)
-                    return
-                }
-                console.error("Could not save file with File System Access API, falling back to normal download:", err)
+// CACHE STORAGE (Async & Heavy)
+async function streamCacheStorageToWriter(updateProgress, writeFunc) {
+    if (!window.caches) return
+    const keys = await caches.keys()
+
+    for (const cacheName of keys) {
+        if (cacheName === "fc") continue // Don't export the app itself
+
+        updateProgress(`Exporting Cache: ${cacheName}`)
+        const cache = await caches.open(cacheName)
+        const requests = await cache.keys()
+
+        for (const req of requests) {
+            const res = await cache.match(req)
+            if (!res) continue
+
+            const blob = await res.blob()
+            const headers = {}
+            res.headers.forEach((v, k) => headers[k] = v)
+
+            const meta = {
+                url: req.url,
+                status: res.status,
+                statusText: res.statusText,
+                headers: headers,
+                type: blob.type
             }
-            // Save picker failed, save normally
-            a.href = url
-            a.download = filename
-            a.click()
-            return
+
+            // Use CBOR to pack metadata + binary body
+            const safeName = encodeURIComponent(cacheName)
+            const safeUrlHash = btoa(req.url).slice(0, 50).replace(/\//g, '_')
+
+            const entryData = CBOR.encode({
+                meta,
+                data: normalizeToArrayBuffers(new Uint8Array(await blob.arrayBuffer()))
+            })
+
+            await writeFunc(`__CACHE__/${safeName}/${safeUrlHash}`, entryData)
+        }
+    }
+}
+
+async function restoreCacheStorage(cacheName, cborData) {
+    const { meta, data } = cborData
+    const cache = await caches.open(decodeURIComponent(cacheName))
+
+    const init = {
+        status: meta.status,
+        statusText: meta.statusText,
+        headers: meta.headers
+    }
+
+    const blob = new Blob([data], { type: meta.type })
+    await cache.put(meta.url, new Response(blob, init))
+}
+
+async function startImport(file) {
+    if (!window.CBOR) return alert("cbor-x is missing!")
+    setUiBusy(true)
+    const progressElem = document.getElementById("progress")
+    const updateProgress = createProgressThrottle(progressElem)
+    if (navigator.serviceWorker.controller) navigator.serviceWorker.controller.postMessage({ type: "PREPARE_FOR_IMPORT" })
+
+    const restoreFromCbor = (item) => {
+        if (!item || typeof item !== 'object') return item
+        if (item.__rfs_blob && item.data) return new Blob([item.data], { type: item.type })
+        if (ArrayBuffer.isView(item) || item instanceof ArrayBuffer) return item
+        if (Array.isArray(item)) return item.map(restoreFromCbor)
+        if (item.constructor === Object) {
+            const newItem = {}
+            for (const k in item) newItem[k] = restoreFromCbor(item[k])
+            return newItem
+        }
+        return item
+    }
+
+    try {
+        // Read header signature
+        const headerBuffer = await file.slice(0, 8).arrayBuffer()
+        const headerBytes = new Uint8Array(headerBuffer)
+
+        const isEncrypted = headerBytes[0] === 0x52 && headerBytes[1] === 0x46 &&
+            headerBytes[2] === 0x53 && headerBytes[3] === 0x5F
+
+        let inputStream
+
+        if (isEncrypted) {
+            const pass = prompt("This backup is encrypted. Enter password:")
+            if (!pass) throw new Error("Password required")
+
+            const salt = await file.slice(8, 24).arrayBuffer()
+            const key = await deriveKeyFromPassword(pass, salt)
+
+            const rawReader = file.slice(24).stream().getReader()
+            let leftover = new Uint8Array(0)
+
+            const readExact = async (n) => {
+                while (leftover.length < n) {
+                    const { done, value } = await rawReader.read()
+                    if (done) return null
+                    const t = new Uint8Array(leftover.length + value.length)
+                    t.set(leftover)
+                    t.set(value, leftover.length)
+                    leftover = t
+                }
+                const res = leftover.slice(0, n)
+                leftover = leftover.slice(n)
+                return res
+            }
+
+            const decryptStream = new ReadableStream({
+                async pull(controller) {
+                    try {
+                        const header = await readExact(16)
+                        if (!header) return controller.close()
+                        const iv = header.slice(0, 12)
+                        const len = new DataView(header.buffer, header.byteOffset, header.byteLength).getUint32(12, true)
+                        const cipher = await readExact(len)
+                        if (!cipher) return controller.error("Unexpected EOF")
+
+                        try {
+                            const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, cipher)
+                            controller.enqueue(new Uint8Array(plain))
+                        } catch (e) {
+                            controller.error("Decryption failed (wrong password?)")
+                        }
+                    } catch (e) { controller.error(e) }
+                }
+            })
+
+            inputStream = decryptStream.pipeThrough(new DecompressionStream("gzip"))
+
+        } else if (headerBytes[0] === 0x1F && headerBytes[1] === 0x8B) {
+            inputStream = file.stream().pipeThrough(new DecompressionStream("gzip"))
+        } else {
+            inputStream = file.stream()
         }
 
-        setTimeout(function () {
-            URL.revokeObjectURL(url)
-            parentElement.removeChild(a)
-        }, 200)
-    })
+        const reader = inputStream.getReader()
+        let buffer = new Uint8Array(0)
 
-    parentElement.appendChild(a)
+        // Helper: Ensure buffer has at least N bytes
+        async function ensureBuffer(n) {
+            while (buffer.length < n) {
+                const { done, value } = await reader.read()
+                if (done) return false
+                // Optimization: Don't just concat, check if we can avoid alloc
+                const t = new Uint8Array(buffer.length + value.length)
+                t.set(buffer)
+                t.set(value, buffer.length)
+                buffer = t
+            }
+            return true
+        }
+
+        // Helper: consume N bytes from front of buffer
+        function consume(n) {
+            const res = buffer.slice(0, n)
+            buffer = buffer.slice(n)
+            return res
+        }
+
+        const root = await navigator.storage.getDirectory()
+        const dbCache = {}
+
+        updateProgress("Reading Archive...")
+
+        while (true) {
+            if (!(await ensureBuffer(512))) break // End of stream or partial block
+
+            const headerBlock = consume(512)
+            const header = parseTarHeader(headerBlock)
+
+            // If invalid header (or zero block), stop
+            if (!header) break
+
+            const size = header.size
+            const padding = (512 - (size % 512)) % 512
+
+            let path = header.name
+            if (path.startsWith("./")) path = path.slice(2)
+            while (path.startsWith("/")) path = path.slice(1)
+
+            // Handling File Content
+            // FIX: For large files, we shouldn't accumulate `chunkData` in memory
+            // However, since we need to support Import of JSON/CBOR which requires parsing,
+            // we have to check the path type.
+
+            const isSystemFile = path === "runtimefs_system/metadata.json" ||
+                path.startsWith("__CACHE__/") ||
+                path.startsWith("__IDB_SCHEMA__/") ||
+                path.startsWith("__IDB_DATA__/")
+
+            if (isSystemFile) {
+                // For system files, we MUST read into memory to parse
+                if (!(await ensureBuffer(size))) throw new Error("Unexpected EOF in system file")
+                const chunkData = consume(size)
+
+                // ... Process System File (Identical logic to original) ...
+                if (path === "runtimefs_system/metadata.json") {
+                    try {
+                        const metadata = JSON.parse(new TextDecoder().decode(chunkData))
+                        if (metadata.ls) Object.assign(localStorage, metadata.ls)
+                        if (metadata.ss) restoreSessionStorage(metadata.ss)
+                        if (metadata.cookies) restoreCookies(metadata.cookies)
+                        if (metadata.reg) await saveRegistry(metadata.reg)
+                    } catch (e) { console.warn("Metadata corruption", e) }
+                }
+                else if (path.startsWith("__CACHE__/")) {
+                    const parts = path.split("/")
+                    if (parts.length >= 3) {
+                        const cacheName = parts[1]
+                        const cbor = CBOR.decode(chunkData)
+                        updateProgress(`Restoring Cache: ${decodeURIComponent(cacheName)}`)
+                        await restoreCacheStorage(cacheName, cbor)
+                    }
+                }
+                else if (path.startsWith("__IDB_SCHEMA__/")) {
+                    const schema = CBOR.decode(chunkData)
+                    updateProgress(`Restoring Schema: ${schema.dbName}`)
+                    try {
+                        await new Promise(r => { const q = indexedDB.deleteDatabase(schema.dbName); q.onsuccess = r; q.onerror = r })
+                        await new Promise((resolve, reject) => {
+                            const openReq = indexedDB.open(schema.dbName, schema.version)
+                            openReq.onupgradeneeded = (e) => {
+                                const db = e.target.result
+                                for (const s of schema.stores) {
+                                    if (!db.objectStoreNames.contains(s.name)) {
+                                        const store = db.createObjectStore(s.name, { keyPath: s.keyPath, autoIncrement: s.autoIncrement })
+                                        s.indexes.forEach(idx => store.createIndex(idx.name, idx.keyPath, { unique: idx.unique, multiEntry: idx.multiEntry }))
+                                    }
+                                }
+                            }
+                            openReq.onsuccess = (e) => { e.target.result.close(); resolve() }
+                            openReq.onerror = reject
+                        })
+                    } catch (e) { console.warn("Schema restore failed", e) }
+                }
+                else if (path.startsWith("__IDB_DATA__/")) {
+                    const dataObj = restoreFromCbor(CBOR.decode(chunkData))
+                    const { db: dbName, st: storeName, d: records } = dataObj
+                    try {
+                        if (!dbCache[dbName]) {
+                            dbCache[dbName] = await new Promise((res, rej) => {
+                                const r = indexedDB.open(dbName)
+                                r.onsuccess = () => res(r.result); r.onerror = rej
+                            })
+                        }
+                        const db = dbCache[dbName]
+                        const tx = db.transaction(storeName, "readwrite")
+                        const store = tx.objectStore(storeName)
+                        await Promise.all(records.map(r => {
+                            return new Promise((res) => {
+                                try {
+                                    const req = store.put(r.v, store.keyPath ? undefined : r.k)
+                                    req.onsuccess = res; req.onerror = res
+                                } catch (e) { res() }
+                            })
+                        }))
+                    } catch (e) { console.warn("IDB Data write failed", e) }
+                }
+
+            } else if (header.type === '0' || header.type === '\0') {
+                // Standard File: Stream DIRECTLY to OPFS
+                updateProgress(path)
+                const parts = path.split("/").map(p => p.trim()).filter(p => p && p !== "." && p !== "..")
+
+                if (parts.length > 0) {
+                    const name = parts.pop()
+                    try {
+                        let dir = root
+                        for (const p of parts) dir = await dir.getDirectoryHandle(p, { create: true })
+                        const fh = await dir.getFileHandle(name, { create: true })
+                        const writable = await fh.createWritable()
+
+                        // Stream 'size' bytes from buffer/reader to writable
+                        let remaining = size
+
+                        // 1. Flush existing buffer
+                        if (buffer.length > 0) {
+                            const toWrite = Math.min(buffer.length, remaining)
+                            await writable.write(buffer.slice(0, toWrite))
+                            buffer = buffer.slice(toWrite)
+                            remaining -= toWrite
+                        }
+
+                        // 2. Pipe directly from reader if more needed
+                        while (remaining > 0) {
+                            const { done, value } = await reader.read()
+                            if (done) throw new Error("Unexpected EOF writing file")
+
+                            if (value.byteLength <= remaining) {
+                                await writable.write(value)
+                                remaining -= value.byteLength
+                            } else {
+                                // Chunk is larger than file remaining; split it
+                                await writable.write(value.slice(0, remaining))
+                                // Put remainder back into buffer
+                                buffer = value.slice(remaining)
+                                remaining = 0
+                            }
+                        }
+                        await writable.close()
+                    } catch (e) { console.error(`Failed to write ${path}`, e) }
+                } else {
+                    // Consuming without writing (unknown file)
+                    let remaining = size
+                    while (remaining > 0) {
+                        if (buffer.length > 0) {
+                            const take = Math.min(buffer.length, remaining)
+                            buffer = buffer.slice(take)
+                            remaining -= take
+                        } else {
+                            const { done, value } = await reader.read()
+                            if (done) break
+                            // Add to buffer, let loop handle slicing
+                            buffer = value
+                        }
+                    }
+                }
+            }
+
+            if (padding > 0) {
+                await ensureBuffer(padding)
+                consume(padding)
+            }
+        }
+
+        Object.values(dbCache).forEach(db => db.close())
+        alert("Import complete!")
+        await listFolders()
+    } catch (e) {
+        console.error(e)
+        alert("Import failed: " + e.message)
+    } finally {
+        setUiBusy(false)
+        progressElem.textContent = ""
+    }
 }
 
-// Derives a cryptographic key from a password using PBKDF2 (600k iterations is decent; this is meant for lower-end devices)
-async function deriveKeyFromPassword(password, salt, iterations = 600000) {
-    const encoder = new TextEncoder()
-    const passwordBuffer = encoder.encode(password)
-    // Import the password as a base key.
-    const baseKey = await crypto.subtle.importKey("raw", passwordBuffer, { name: "PBKDF2" }, false, ["deriveKey"])
-    // Derive a 256-bit AES-GCM key.
-    return await crypto.subtle.deriveKey({ name: "PBKDF2", salt: salt, iterations: iterations, hash: "SHA-256" }, baseKey, { name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"])
+// AAAAAAAHH
+/**
+ * Creates a 512-byte USTAR tar header.
+ */
+function createTarHeader(filename, size, isDir = false) {
+    const buffer = new Uint8Array(512)
+    const enc = new TextEncoder()
+
+    // 1. Safe Filename Splitting
+    let prefix = "", name = filename
+    if (filename.length > 100) {
+        // We need a slash that results in:
+        // - prefix.length <= 155
+        // - name.length <= 100
+        // Search range: [Max allowed start for name, Max allowed end for prefix]
+        // Name must start at index >= length - 101 (so remainder is <= 100)
+        const minSplitIndex = Math.max(0, filename.length - 101)
+        const maxSplitIndex = Math.min(filename.length, 155)
+
+        // Find the last slash within the safe range
+        const splitIndex = filename.lastIndexOf("/", maxSplitIndex)
+
+        if (splitIndex >= minSplitIndex) {
+            prefix = filename.substring(0, splitIndex)
+            name = filename.substring(splitIndex + 1)
+        } else {
+            // Fallback: Hard truncate (warn in console in real app)
+            name = filename.substring(filename.length - 100)
+        }
+    }
+
+    // Helper to write string to buffer
+    const writeStr = (str, offset, len) => {
+        // Enforce null termination within the length if short enough
+        let bytes = enc.encode(str)
+        if (bytes.length > len) bytes = bytes.subarray(0, len)
+        buffer.set(bytes, offset)
+    }
+
+    // 2. Write Fields
+    writeStr(name, 0, 100)                          // Name
+    writeOctal(buffer, 0o664, 100, 8)               // Mode
+    writeOctal(buffer, 0, 108, 8)                   // UID
+    writeOctal(buffer, 0, 116, 8)                   // GID
+    writeOctal(buffer, size, 124, 12)               // Size
+    // Mtime: Current time or 0
+    writeOctal(buffer, Math.floor(Date.now() / 1000), 136, 12);
+
+    // Checksum placeholder (8 spaces) for calculation
+    buffer.set(enc.encode("        "), 148);
+
+    buffer[156] = isDir ? 53 : 48                   // Type (0='0', 5='5')
+    writeStr("ustar\0", 257, 6)                     // Magic
+    writeStr("00", 263, 2)                          // Version
+    if (prefix) writeStr(prefix, 345, 155)          // Prefix
+
+    // 3. Calculate Checksum
+    let checksum = 0
+    for (let i = 0; i < 512; i++) checksum += buffer[i]
+
+    // 4. Write Checksum (Strict USTAR: 6 digits + NULL + SPACE)
+    // Note: Standard says "six octal digits followed by a null and a space"
+    const checksumStr = checksum.toString(8).padStart(6, '0') + "\u0000 "
+    buffer.set(enc.encode(checksumStr), 148)
+
+    return buffer
 }
 
-// Uploads a folder and encrypts it with a user-provided password.
-async function uploadAndEncryptWithPassword() {
-    const folderNameInput = document.getElementById("encryptFolderName")
-    const name = folderNameInput.value.trim()
-    const password = prompt("Enter a secure password:")
+function parseTarHeader(buffer) {
+    const dec = new TextDecoder()
+
+    // Helper to read null-terminated string
+    const readStr = (offset, len) => {
+        let idx = -1
+        // Scan for null terminator first
+        for (let i = 0; i < len; i++) {
+            if (buffer[offset + i] === 0) {
+                idx = i
+                break
+            }
+        }
+        const end = (idx === -1) ? len : idx
+        return dec.decode(buffer.subarray(offset, offset + end)).trim()
+    }
+
+    const name = readStr(0, 100)
+    const prefix = readStr(345, 155)
+    const sizeStr = readStr(124, 12)
+    const size = parseInt(sizeStr, 8)
+    const type = String.fromCharCode(buffer[156])
+
+    // Check for empty block
+    if (!name && isNaN(size) && buffer[0] === 0) return null
+
+    let fullPath = prefix ? `${prefix}/${name}` : name
+    return { name: fullPath, size: isNaN(size) ? 0 : size, type }
+}
+
+/**
+ * Writes a number as an octal string to the buffer.
+ * Standard behavior: Zero-padded, terminated by Space or Null (we use Null).
+ */
+function writeOctal(buffer, value, offset, len) {
+    // We use len-1 for digits and the last byte for null termination.
+    // This satisfies standard requirements for numeric fields.
+    const str = value.toString(8).padStart(len - 1, '0')
+    const enc = new TextEncoder()
+    buffer.set(enc.encode(str), offset)
+    // The last byte (buffer[offset + len - 1]) is already 0 (from new Uint8Array)
+}
+
+function createProgressThrottle(element) {
+    let lastTime = 0
+    return async function (text) {
+        const now = Date.now()
+        if (now - lastTime > 100) {
+            lastTime = now
+            element.textContent = text
+            await new Promise(r => setTimeout(r, 0))
+        }
+    }
+}
+
+function base64ToBuffer(base64) {
+    const bin = atob(base64)
+    const len = bin.length
+    const bytes = new Uint8Array(len)
+    for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i)
+    return bytes.buffer
+}
+
+function bufferToBase64(buffer) {
+    let binary = ""
+    const bytes = new Uint8Array(buffer)
+    const len = bytes.byteLength
+    for (let i = 0; i < len; i++) binary += String.fromCharCode(bytes[i])
+    return btoa(binary)
+}
+
+async function deriveKeyFromPassword(password, salt) {
+    const enc = new TextEncoder()
+    const base = await crypto.subtle.importKey("raw", enc.encode(password), { name: "PBKDF2" }, false, ["deriveKey"])
+    return await crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: 600000, hash: "SHA-256" }, base, { name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"])
+}
+
+async function writeEncryptedChunk(writer, key, chunk) {
+    const iv = crypto.getRandomValues(new Uint8Array(12))
+    const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, chunk)
+
+    // Write IV
+    await writer.write(iv)
+
+    // Write Length of Ciphertext (uint32)
+    const lenBuf = new ArrayBuffer(4)
+    new DataView(lenBuf).setUint32(0, ciphertext.byteLength, true) // Little endian
+    await writer.write(new Uint8Array(lenBuf))
+
+    // Write Ciphertext
+    await writer.write(new Uint8Array(ciphertext))
+}
+
+// Chunks data into ~1MB blocks to keep memory low during encryption
+class ChunkedEncryptionStream extends WritableStream {
+    constructor(underlyingWriter, key) {
+        let buffer = new Uint8Array(0)
+        const CHUNK_SIZE = 1024 * 1024 // 1MB
+
+        super({
+            async write(chunk) {
+                // Append new chunk to buffer
+                const newBuffer = new Uint8Array(buffer.length + chunk.length)
+                newBuffer.set(buffer)
+                newBuffer.set(chunk, buffer.length)
+                buffer = newBuffer
+
+                // Flush full chunks
+                while (buffer.length >= CHUNK_SIZE) {
+                    const slice = buffer.slice(0, CHUNK_SIZE)
+                    buffer = buffer.slice(CHUNK_SIZE)
+                    await writeEncryptedChunk(underlyingWriter, key, slice)
+                }
+            },
+            async close() {
+                // Flush remaining
+                if (buffer.length > 0) {
+                    await writeEncryptedChunk(underlyingWriter, key, buffer)
+                }
+                await underlyingWriter.close()
+            }
+        })
+    }
+}
+
+// Fallback upload (manual selection)
+async function uploadFolderFallback(event) {
+    const name = document.getElementById("folderName").value.trim()
+    const input = event.target
+    if (!input.files.length) {
+        setUiBusy(false)
+        return
+    }
+    await processFileListAndStore(name, input.files)
+    input.value = ""
+    setUiBusy(false)
+}
+
+// Sync Logic
+async function syncFiles() {
+    if (!folderName || !dirHandle) return alert("Upload a folder first.")
     setUiBusy(true)
+    if (changes.length > 0) {
+        await performSyncToOpfs()
+        alert("Sync complete.")
+    } else {
+        alert("No changes detected.")
+    }
+    setUiBusy(false)
+}
+
+async function syncAndOpenFile() {
+    if (!folderName || !dirHandle) return alert("Upload a folder first.")
+    setUiBusy(true)
+    if (changes.length > 0) await performSyncToOpfs()
+    openFile(folderName)
+}
+
+async function performSyncToOpfs() {
+    console.log(`Syncing ${changes.length} changes...`)
+    const root = await navigator.storage.getDirectory()
+    const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX)
+    const folderHandle = await rfsRoot.getDirectoryHandle(folderName)
+
+    for (const change of changes) {
+        const pathArr = change.relativePathComponents
+        if (!pathArr) continue
+
+        const fileName = pathArr[pathArr.length - 1]
+        const dirPath = pathArr.slice(0, -1)
+        const pathStr = pathArr.join("/")
+
+        try {
+            if (change.type === "deleted") {
+                let cur = folderHandle
+                try {
+                    for (const p of dirPath) cur = await cur.getDirectoryHandle(p)
+                    await cur.removeEntry(fileName)
+                } catch (e) {
+                    // Ignore if already gone
+                }
+            } else if (change.type === "modified" || change.type === "created") {
+                let srcHandle = dirHandle
+                try {
+                    for (const p of pathArr) {
+                        if (p === fileName && p === pathArr[pathArr.length - 1]) {
+                            srcHandle = await srcHandle.getFileHandle(p)
+                        } else {
+                            srcHandle = await srcHandle.getDirectoryHandle(p)
+                        }
+                    }
+                } catch (e) {
+                    console.warn(`Could not find source file for sync: ${pathStr}`)
+                    continue
+                }
+
+                if (srcHandle.kind === "file") {
+                    const f = await srcHandle.getFile()
+                    await writeStreamToOpfs(folderHandle, pathStr, f.stream())
+                }
+            }
+        } catch (e) {
+            console.warn(`Sync failed for ${pathStr}`, e)
+        }
+    }
+    changes.length = 0
+}
+
+// Encrypt Folder Logic
+async function uploadAndEncryptWithPassword() {
+    const name = document.getElementById("encryptFolderName").value.trim()
+    const password = prompt("Password:")
+    if (!name || !password) return
+
+    setUiBusy(true)
+    const progressElem = document.getElementById("progress")
+    const updateProgress = createProgressThrottle(progressElem)
+
     try {
-        const localDirHandle = await window.showDirectoryPicker({ mode: "read" })
-        dirHandle = localDirHandle
-        folderName = name
-        const files = await getFilesRecursively(localDirHandle)
+        const localDir = await window.showDirectoryPicker({ mode: "read" })
+        const root = await navigator.storage.getDirectory()
+        const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX, { create: true })
+        try { await rfsRoot.removeEntry(name, { recursive: true }) } catch (e) { }
+        const destDir = await rfsRoot.getDirectoryHandle(name, { create: true })
+
         const salt = crypto.getRandomValues(new Uint8Array(16))
         const key = await deriveKeyFromPassword(password, salt)
 
-        for (const path in files) {
-            const file = files[path]
-            const iv = crypto.getRandomValues(new Uint8Array(12))
-            const encryptedBuffer = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, key, file.buffer)
-            file.buffer = concatBuffers(iv.buffer, encryptedBuffer)
+        async function processHandle(src, dst) {
+            for await (const entry of src.values()) {
+                if (entry.kind === "file") {
+                    updateProgress(`Encrypting: ${entry.name}`)
+                    const file = await entry.getFile()
+                    const iv = crypto.getRandomValues(new Uint8Array(12))
+                    const buf = await file.arrayBuffer()
+                    const enc = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, buf)
+                    const fh = await dst.getFileHandle(entry.name, { create: true })
+                    const w = await fh.createWritable()
+                    await w.write(iv)
+                    await w.write(enc)
+                    await w.close()
+                } else {
+                    const nextDst = await dst.getDirectoryHandle(entry.name, { create: true })
+                    await processHandle(entry, nextDst)
+                }
+            }
         }
-        files[".metadata"] = { buffer: new Blob([salt.buffer]), type: "application/octet-stream" }
+        await processHandle(localDir, destDir)
 
-        await processAndStoreFolder(name, files, "pdf")
+        await updateRegistryEntry(name, { encryptionType: "password", salt: bufferToBase64(salt) })
 
-        console.log(`Folder "${name}" encrypted and stored successfully.`)
-        folderNameInput.value = ""
-    } catch (err) {
-        if (err.name !== "AbortError") {
-            console.error("Password encryption error:", err)
-            alert("An error occurred during encryption: " + err.message)
-        }
+        document.getElementById("encryptFolderName").value = ""
+        await listFolders()
+    } catch (e) {
+        if (e.name !== "AbortError") alert("Error: " + e.message)
     } finally {
         setUiBusy(false)
+        progressElem.textContent = ""
     }
 }
 
-async function encryptAndSaveFolderWithPassword() {
-    const password = prompt("After entering a password, first select the folder you want to encrypt, then another folder (ideally empty) to encrypt the data to. Enter a secure password:")
-    if (!password) return
-
-    try {
-        setUiBusy(true)
-        const sourceDirHandle = await window.showDirectoryPicker({ mode: "read" })
-        const destDirHandle = await window.showDirectoryPicker({ mode: "readwrite" })
-
-        // Derive the master key from the password.
-        const salt = crypto.getRandomValues(new Uint8Array(16))
-        const key = await deriveKeyFromPassword(password, salt) // Your existing helper is perfect.
-
-        const fileMap = await scanFilesRecursively(sourceDirHandle)
-        const pathManifest = {}
-
-        // Encrypt each file and save it with a UUID name.
-        for (const originalPath in fileMap) {
-            if (fileMap[originalPath] === null) continue // Skip directories.
-            const uuid = crypto.randomUUID()
-            pathManifest[originalPath] = uuid
-            const fileBuffer = await fileMap[originalPath].arrayBuffer()
-
-            const iv = crypto.getRandomValues(new Uint8Array(12))
-            const encryptedContent = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, fileBuffer)
-
-            // Prepend the IV to the encrypted buffer for storage.
-            const finalBuffer = concatBuffers(iv.buffer, encryptedContent)
-
-            const newFileHandle = await destDirHandle.getFileHandle(uuid, { create: true })
-            const writable = await newFileHandle.createWritable()
-            await writable.write(finalBuffer)
-            await writable.close()
-        }
-
-        // Create and encrypt the manifest payload.
-        const manifestString = JSON.stringify(pathManifest)
-        const manifestBuffer = new TextEncoder().encode(manifestString)
-        const manifestIv = crypto.getRandomValues(new Uint8Array(12))
-        const encryptedManifestPayload = await crypto.subtle.encrypt({ name: "AES-GCM", iv: manifestIv }, key, manifestBuffer)
-
-        // Create the final manifest.enc file content.
-        const manifestFileObject = {
-            encryptionType: "password",
-            salt: await bufferToBase64(salt),
-            iv: await bufferToBase64(manifestIv),
-            payload: await bufferToBase64(new Uint8Array(encryptedManifestPayload))
-        }
-
-        const manifestFileHandle = await destDirHandle.getFileHandle("manifest.enc", { create: true })
-        const manifestWritable = await manifestFileHandle.createWritable()
-        await manifestWritable.write(JSON.stringify(manifestFileObject))
-        await manifestWritable.close()
-
-        alert(`Folder successfully encrypted and saved in "${destDirHandle.name}".`)
-    } catch (err) {
-        if (err.name !== "AbortError") {
-            alert("An error occurred during encryption: " + err.message)
-        }
-    } finally {
-        setUiBusy(false)
-    }
-}
-
-function initializeApp() {
-    document.getElementById("folderName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), currentlyBusy || uploadFolder()))
-    document.getElementById("openFolderName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), currentlyBusy || openFile()))
-    document.getElementById("fileName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), currentlyBusy || openFile()))
-    document.getElementById("deleteFolderName").addEventListener("keydown", e => e.key === "Enter" && (e.preventDefault(), currentlyBusy || deleteFolder()))
-    document.getElementById("folderUploadFallbackInput").addEventListener("change", uploadFolderFallback)
-    document.getElementById("folderUploadFallbackInput").addEventListener("cancel", () => setUiBusy(false))
-    document.body.addEventListener("dragover", e => { e.preventDefault(), document.body.style.backgroundColor = "#385b7e" })
-    document.body.addEventListener("dragleave", () => { document.body.style.backgroundColor = "" })
-    document.body.addEventListener("drop", async e => {
-        e.preventDefault()
-        document.body.style.backgroundColor = ""
-        const files = e.dataTransfer.files
-        if (!files || files.length === 0) return alert("No files were dropped.")
-        let defaultFolderName = ""
-        if (files[0].webkitRelativePath) {
-            defaultFolderName = files[0].webkitRelativePath.split("/")[0]
-        } else {
-            return alert("Please drop a folder, not individual files.")
-        }
-        const name = prompt("Please enter a name for the folder:", defaultFolderName)
-        if (name === null) return
-        setUiBusy(true)
-        try {
-            await processFileListAndStore(name.trim(), files)
-        } catch (err) {
-            console.error("Drag-and-drop error:", err)
-            alert("An error occurred during drop: " + err.message)
-        } finally {
-            setUiBusy(false)
-        }
-    })
-
-    // Initial folder list load
-    getDb().then(() => listFolders())
-}
-
+// Initialize
 document.addEventListener("DOMContentLoaded", () => {
-    initializeApp()
-
-    if ("serviceWorker" in navigator) {
-        let refreshing = false
-        // This listener handles reloading the page when a new service worker takes control
-        navigator.serviceWorker.addEventListener("controllerchange", () => {
-            if (refreshing) return
-            refreshing = true
-            window.location.reload()
-        })
+    function setupServiceWorkerListeners() {
+        if (!("serviceWorker" in navigator)) return
 
         navigator.serviceWorker.register("./sw.js").then(reg => {
-            // This event fires when a new version of the service worker is found
+            // Check for updates
             reg.addEventListener("updatefound", () => {
                 const newWorker = reg.installing
                 newWorker.addEventListener("statechange", () => {
                     if (newWorker.state === "installed" && navigator.serviceWorker.controller) {
-                        console.log("A new version is available! The page will reload automatically.")
+                        // New version installed, reload to activate it
+                        console.log("New version available. Reloading...")
+                        location.reload()
                     }
                 })
             })
 
-            // Check if a service worker is active but not controlling the page
-            // This is the state after a force reload (Shift+Refresh)
-            navigator.serviceWorker.ready.then(registration => {
-                if (!navigator.serviceWorker.controller && registration.active) {
-                    console.log("Service worker is active but not controlling the page. Reloading to fix...")
-                    window.location.reload()
-                }
-            })
+            if (reg.active && !navigator.serviceWorker.controller) {
+                console.log("SW active but not controlling. Waiting for claim...")
+            }
 
-        }).catch(err => {
-            console.error("Service Worker registration failed:", err)
-            alert("The application could not start correctly. Please try reloading the page.")
+        }).catch(console.error)
+
+        navigator.serviceWorker.addEventListener("message", async (event) => {
+            if (event.data && event.data.type === "SW_READY") {
+                console.log("SW: Ready signal received.")
+                await listFolders()
+            }
+            if (event.data && event.data.type === "INVALIDATE_CACHE") {
+                await listFolders()
+            }
         })
-    } else {
-        alert("Service Workers are not supported in this browser. The application will not work.")
-        console.error("Service Workers not supported.")
     }
 
-    const regexTextarea = document.getElementById("regex")
-    const headersTextarea = document.getElementById("headers")
+    // Event Listeners
+    document.getElementById("folderName").addEventListener("keydown", e => e.key === "Enter" && !currentlyBusy && uploadFolder())
+    document.getElementById("openFolderName").addEventListener("keydown", e => e.key === "Enter" && !currentlyBusy && openFile())
+    document.getElementById("fileName").addEventListener("keydown", e => e.key === "Enter" && !currentlyBusy && openFile())
+    document.getElementById("deleteFolderName").addEventListener("keydown", e => e.key === "Enter" && !currentlyBusy && deleteFolder())
+    document.getElementById("folderUploadFallbackInput").addEventListener("change", uploadFolderFallback)
 
-    // Load saved values on startup
-    try {
-        regexTextarea.value = localStorage.getItem("fsRegex") || ""
-        headersTextarea.value = localStorage.getItem("fsHeaders") || ""
-    } catch (e) {
-        console.warn(e)
-    }
+    const dragZone = document.body
+    dragZone.addEventListener("dragover", e => { e.preventDefault(); dragZone.style.backgroundColor = "#385b7e" })
+    dragZone.addEventListener("dragleave", () => { dragZone.style.backgroundColor = "" })
+    dragZone.addEventListener("drop", async e => {
+        e.preventDefault(); dragZone.style.backgroundColor = ""
+        const items = [...e.dataTransfer.items].filter(i => i.kind === "file")
+        if (!items.length) return
 
-    setTimeout(() => {
-        try {
-            // Save values on input
-            regexTextarea.addEventListener("input", () => {
-                localStorage.setItem("fsRegex", regexTextarea.value)
-            })
-            headersTextarea.addEventListener("input", () => {
-                localStorage.setItem("fsHeaders", headersTextarea.value)
-            })
-        } catch (e) {
-            console.warn("Could not load saved rules from localStorage:", e)
+        const first = items[0].getAsFile()
+        if (items.length === 1 && first) {
+            if (confirm(`Import "${first.name}"?`)) startImport(first)
+            return
         }
-    }, 0)
+
+        const entry = items[0].webkitGetAsEntry()
+        if (entry.isDirectory) {
+            const name = prompt("Please choose a folder name:", entry.name)
+            if (name) {
+                setUiBusy(true)
+                // Need manual scan for DnD entry
+                const scan = async (ent, p) => {
+                    if (ent.isFile) {
+                        const f = await new Promise((res, rej) => ent.file(res, rej))
+                        Object.defineProperty(f, "webkitRelativePath", { value: p + f.name })
+                        return [f]
+                    } else if (ent.isDirectory) {
+                        const r = ent.createReader()
+                        let files = []
+                        let batch
+                        do {
+                            batch = await new Promise((res, rej) => r.readEntries(res, rej))
+                            for (const c of batch) files.push(...await scan(c, p + ent.name + "/"))
+                        } while (batch.length > 0)
+                        return files
+                    }
+                }
+                const files = await scan(entry, "")
+                await processFileListAndStore(name, files)
+            }
+        }
+    })
+
+    setupServiceWorkerListeners()
+    listFolders()
+
+    // Restore textareas
+    const rT = document.getElementById("regex")
+    const hT = document.getElementById("headers")
+    if (rT) {
+        rT.value = localStorage.getItem("fsRegex") || ""
+        rT.addEventListener("input", () => localStorage.setItem("fsRegex", rT.value))
+    }
+    if (hT) {
+        hT.value = localStorage.getItem("fsHeaders") || ""
+        hT.addEventListener("input", () => localStorage.setItem("fsHeaders", hT.value))
+    }
 })

@@ -168,13 +168,17 @@
                 <strong>Import / Export:</strong><br>
                 <button onclick="importData()">Import Data...</button>
                 <hr>
-                <button onclick="exportData()">Export Data...</button><br>
+                <button onclick="exportData()">Export Data...</button>
+                <div id="progress"></div>
             </div>
             <div>
                 <input type="checkbox" id="c1"><label for="c1">Cookies</label><br>
                 <input type="checkbox" id="c2" checked><label for="c2">localStorage</label><br>
                 <input type="checkbox" id="c3" checked><label for="c3">IndexedDB</label><br>
                 <input type="checkbox" id="c4" checked><label for="c4">RuntimeFS</label><br>
+                <input type="checkbox" id="c5" checked><label for="c5">OPFS</label><br>
+                <input type="checkbox" id="c6"><label for="c6">Cache Storage</label><br>
+                <input type="checkbox" id="c7"><label for="c7">Session Storage</label><br>
             </div>
         </div>
     </fieldset>
@@ -183,6 +187,7 @@
         <legend>
             <h2>Advanced</h2>
         </legend>
+        
         <h3>Regex Replacement</h3>
         Spaces required; might be slow with very large files.
         <ul>
@@ -202,13 +207,12 @@
         <textarea id="headers" rows="5" cols="40" placeholder="Enter headers here..."></textarea>
         <hr>
         <h3>Encrypt Folders</h3>
-        You can encrypt a folder to a bunch of files (will not work in all browsers).
+        You can encrypt a folder into a bunch of files (will not work in all browsers).
         <br><br>
         <label for="encryptFolderName">Folder Name:</label>
         <input type="text" id="encryptFolderName" placeholder="Enter a name...">
         <br>
         <button onclick="uploadAndEncryptWithPassword()">Password Encrypt Folder (stays in browser)</button>
-        <button onclick="encryptAndSaveFolderWithPassword()">Password Encrypt Folder (exports locally)</button>
     </fieldset>
 </body>
 

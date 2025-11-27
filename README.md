@@ -4,10 +4,10 @@ View the [working demo](https://runtimefs.netlify.app/)!
 
 RuntimeFS is a no-nonsense `OPFS` and `ServiceWorker` file-system, served in your browser. It allows you to open HTML projects, use some encryption techniques, and comes with **full offline** and **complete .tar.gz or encrypted data export** functionality that no other tool has!
 
-Imagine an offline localhost, in your browser with no server-based storage of files. It saves all files and data locally, and can easily be integrated within an existing website too (the code is under the MIT License, and only around 50KB).
+Imagine an offline localhost, in your browser with no server-based storage of files. It saves all files and data locally, and can easily be integrated within an existing website too (the code is MIT Licensed, and only around 100KB).
 
 After initial page load, RuntimeFS no longer needs internet connection to function.
-RuntimeFS has been tested in Chromium, Safari, Firefox (although File System API features are Chromium-exclusive).
+RuntimeFS has been tested in Chromium, Firefox, and Safari (although File System API features are Chromium-exclusive).
 
 If you are hosting this, you can minify the JavaScript files first with a tool like https://jscompress.com/.
 
@@ -21,7 +21,7 @@ If you are hosting this, you can minify the JavaScript files first with a tool l
 | **Export (including encryption)** | ✅ Stream to Disk | ⚠️ RAM Only (crashes if too big) | ⚠️ RAM Only (crashes if too big) |
 
 ## Notes
-Do note that many projects might not work; projects that use **synchronous** AJAX requests (commonly done with JQuery's `$.ajax({type: "GET", url: "...", async: false })`) will not work due to fundamental ServiceWorker limitations. (This type of request is also being phased out from browsers gradually; I've tried getting this working with `Atomics` and web workers but it sadly isn't possible to fix at all.)
+Do note that many projects might not work; projects that use **synchronous** AJAX requests (commonly done with JQuery's `$.ajax({type: "GET", url: "...", async: false })`) will not work due to fundamental ServiceWorker limitations. (This type of request is also being phased out from browsers gradually; I've tried getting this working with `Atomics` and web workers but it sadly isn't fixable.)
 
 Additionally, file names are case-sensitive. Using the tool in Incognito will probably fail due to restrictions on memory or ServiceWorker.
 

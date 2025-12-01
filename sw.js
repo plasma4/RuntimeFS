@@ -230,9 +230,10 @@ function getMimeType(filePath) {
 self.addEventListener("fetch", e => {
     const { request, clientId } = e
     const url = new URL(request.url)
+    const cleanUrl = url.origin + url.pathname
 
     // 1. Internal App Shell
-    if (FULL_APP_SHELL_URLS.includes(request.url)) {
+    if (FULL_APP_SHELL_URLS.includes(cleanUrl)) {
         e.respondWith((async () => {
             const cached = await caches.match(request)
             return cached || fetch(request)

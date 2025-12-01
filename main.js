@@ -1027,10 +1027,9 @@ async function startImport(file) {
                         const fh = await dir.getFileHandle(name, { create: true })
                         const writable = await fh.createWritable()
 
-                        // Stream 'size' bytes from buffer/reader to writable
                         let remaining = size
 
-                        // 1. Flush existing buffer
+                        // Flush existing buffer
                         if (buffer.length > 0) {
                             const toWrite = Math.min(buffer.length, remaining)
                             await writable.write(buffer.slice(0, toWrite))
@@ -1038,7 +1037,7 @@ async function startImport(file) {
                             remaining -= toWrite
                         }
 
-                        // 2. Pipe directly from reader if more needed
+                        // Pipe directly from reader if more needed
                         while (remaining > 0) {
                             const { done, value } = await reader.read()
                             if (done) throw new Error("Unexpected EOF writing file")

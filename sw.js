@@ -1,12 +1,12 @@
-// A single variable to hold data for the very next navigation request.
-let pendingNavData = null
-// A single map to store session data (rules, keys) for each client tab.
+let pendingNavData = null // for next navigation request
 const clientSessionStore = new Map()
+const handleCache = new Map()
 
 const RFS_PREFIX = "rfs"
 const SYSTEM_FILE = "rfs_system.json"
 const CACHE_NAME = "fc"
-const APP_SHELL_FILES = ["./", "./index.html", "./main.js", "./cbor-x.js"]
+const APP_SHELL_FILES = ["./", "./index.html", "./main.js", "./cbor-x.js"] // If you're using .php for some reason, or are merging cbor-x and main.js into one for compression, make sure to change this!
+const NETWORK_ALLOWLIST_PREFIXES = [] // Allow bypass of VFS if needed
 const FULL_APP_SHELL_URLS = APP_SHELL_FILES.map(file => new URL(file, self.location.href).href)
 
 const STORE_ENTRY_TTL = 30000 // 30 seconds
@@ -15,6 +15,12 @@ const virtualPathPrefix = basePath + "n/"
 
 // Cache for the system.json registry to avoid disk reads on every request
 let registryCache = null
+
+let _opfsRoot = null
+async function getOpfsRoot() {
+    if (!_opfsRoot) _opfsRoot = await navigator.storage.getDirectory()
+    return _opfsRoot
+}
 
 function cleanupExpiredStores() {
     const now = Date.now()
@@ -91,7 +97,7 @@ function applyRegexRules(filePath, fileBuffer, fileType, compiledRules) {
 async function getRegistry() {
     if (registryCache) return registryCache
     try {
-        const root = await navigator.storage.getDirectory()
+        const root = await getOpfsRoot()
         const handle = await root.getFileHandle(SYSTEM_FILE)
         const file = await handle.getFile()
         registryCache = JSON.parse(await file.text())
@@ -99,6 +105,24 @@ async function getRegistry() {
         registryCache = {}
     }
     return registryCache
+}
+
+async function getCachedFileHandle(root, folderName, subDir, fileName) {
+    const cacheKey = `${folderName}/${subDir}/${fileName}`
+    if (handleCache.has(cacheKey)) return handleCache.get(cacheKey)
+
+    try {
+        // Root -> RFS -> FolderName -> SubDir -> FileName
+        const rfs = await root.getDirectoryHandle(RFS_PREFIX)
+        const folder = await rfs.getDirectoryHandle(folderName)
+        const dir = await folder.getDirectoryHandle(subDir)
+        const file = await dir.getFileHandle(fileName)
+
+        handleCache.set(cacheKey, file)
+        return file
+    } catch (e) {
+        return null
+    }
 }
 
 self.addEventListener("install", async function () {
@@ -116,7 +140,7 @@ self.addEventListener("activate", e => {
     e.waitUntil((async function () {
         await self.clients.claim()
         registryCache = null
-        try { await navigator.storage.getDirectory() } catch (err) { }
+        try { await getOpfsRoot() } catch (err) { }
         const allClients = await self.clients.matchAll({ includeUncontrolled: true })
         for (const client of allClients) client.postMessage({ type: "SW_READY" })
     })())
@@ -143,10 +167,7 @@ self.addEventListener("message", e => {
                 if (key) s.key = key
                 clientSessionStore.set(clientId, s)
             }
-
-            // Important: Reply to unlock main.js
-            if (e.ports && e.ports[0]) e.ports[0].postMessage("ACK")
-
+            if (e.ports && e.ports[0]) e.ports[0].postMessage("OK") // any message string works here
             setTimeout(() => {
                 if (pendingNavData && pendingNavData.key === key) pendingNavData = null
             }, 5000)
@@ -154,6 +175,7 @@ self.addEventListener("message", e => {
 
         case "INVALIDATE_CACHE":
             registryCache = null
+            handleCache.clear()
             e.waitUntil((async function () {
                 const allClients = await self.clients.matchAll({ includeUncontrolled: true })
                 for (const client of allClients) {
@@ -168,6 +190,7 @@ self.addEventListener("message", e => {
             break
     }
 })
+
 
 function parseCustomHeaders(rulesString) {
     if (!rulesString || !rulesString.trim()) return []
@@ -208,20 +231,35 @@ function applyCustomHeaders(baseHeaders, filePath, rulesString) {
 function getMimeType(filePath) {
     const ext = filePath.split(".").pop().toLowerCase()
     const mimeTypes = {
+        // Text or code
         "html": "text/html", "htm": "text/html", "css": "text/css",
-        "js": "application/javascript", "mjs": "application/javascript",
-        "json": "application/json", "xml": "application/xml",
+        "js": "text/javascript", "mjs": "text/javascript", "jsx": "text/javascript",
+        "ts": "text/javascript", "tsx": "text/javascript", // Browsers treat TS as text source
+        "json": "application/json", "jsonld": "application/ld+json",
+        "xml": "application/xml", "svg": "image/svg+xml",
         "txt": "text/plain", "md": "text/markdown", "csv": "text/csv",
-        "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
-        "webp": "image/webp", "svg": "image/svg+xml", "ico": "image/x-icon",
-        "mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg",
-        "mp4": "video/mp4", "webm": "video/webm", "wasm": "application/wasm",
-        "pdf": "application/pdf", "zip": "application/zip",
-        // Mono / .NET
-        "dll": "application/octet-stream",
-        "pdb": "application/octet-stream",
-        "dat": "application/octet-stream",
-        "bin": "application/octet-stream"
+
+        // Images
+        "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "gif": "image/gif", "webp": "image/webp", "ico": "image/x-icon",
+        "avif": "image/avif", "bmp": "image/bmp",
+
+        // Fonts
+        "woff": "font/woff", "woff2": "font/woff2",
+        "ttf": "font/ttf", "otf": "font/otf", "eot": "application/vnd.ms-fontobject",
+
+        // Media
+        "mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg", "m4a": "audio/mp4",
+        "mp4": "video/mp4", "webm": "video/webm", "ogv": "video/ogg",
+        "vtt": "text/vtt",
+
+        // Binary stuff
+        "wasm": "application/wasm",
+        "pdf": "application/pdf",
+        "zip": "application/zip", "rar": "application/x-rar-compressed",
+        "7z": "application/x-7z-compressed", "tar": "application/x-tar",
+        "gz": "application/gzip",
+        "bin": "application/octet-stream", "dat": "application/octet-stream"
     }
     return mimeTypes[ext] || "application/octet-stream"
 }
@@ -230,9 +268,47 @@ function getMimeType(filePath) {
 self.addEventListener("fetch", e => {
     const { request, clientId } = e
     const url = new URL(request.url)
+    if (NETWORK_ALLOWLIST_PREFIXES.some(prefix => url.pathname.startsWith(prefix))) {
+        // Allow pure network request
+        return
+    }
+
     const cleanUrl = url.origin + url.pathname
 
-    // 1. Internal App Shell
+    // find virtual folder request
+    let virtualReferrerPath = null
+    if (request.referrer && url.origin === self.location.origin) {
+        try {
+            const refUrl = new URL(request.referrer)
+            if (refUrl.pathname.startsWith(virtualPathPrefix)) {
+                const pathParts = refUrl.pathname.substring(virtualPathPrefix.length).split("/")
+                if (pathParts.length > 0 && pathParts[0]) {
+                    virtualReferrerPath = pathParts[0]
+                }
+            }
+        } catch (err) { }
+    }
+
+    if (virtualReferrerPath && !url.pathname.startsWith(virtualPathPrefix)) {
+        const newVirtualUrl = `${self.location.origin}${virtualPathPrefix}${virtualReferrerPath}${url.pathname}`
+
+        e.respondWith((async () => {
+            // Create a fake request for the virtual path
+            const newReq = new Request(newVirtualUrl, request)
+
+            const response = await generateResponseForVirtualFile(newReq)
+
+            if (response.status !== 404) return response
+            if (FULL_APP_SHELL_URLS.includes(cleanUrl)) {
+                const cache = await caches.match(request)
+                return cache || fetch(request)
+            }
+
+            return response // 404
+        })())
+        return
+    }
+
     if (FULL_APP_SHELL_URLS.includes(cleanUrl)) {
         e.respondWith((async () => {
             const cached = await caches.match(request)
@@ -241,12 +317,10 @@ self.addEventListener("fetch", e => {
         return
     }
 
-    // 2. Virtual File Requests (e.g. /n/Folder/...)
     if (url.pathname.startsWith(virtualPathPrefix)) {
         let session = clientSessionStore.get(clientId)
         if (!session && pendingNavData) session = pendingNavData
 
-        // Persist session on navigation
         if (request.mode === "navigate" && pendingNavData) {
             clientSessionStore.set(clientId, { ...pendingNavData, timestamp: Date.now() })
             setTimeout(() => { if (pendingNavData === session) pendingNavData = null }, 2000)
@@ -256,26 +330,105 @@ self.addEventListener("fetch", e => {
         return
     }
 
-    // 3. Fallback for Relative Virtual Fetches
-    // Fixes cases where /mscorlib.dll is requested instead of /n/Celeste/mscorlib.dll
-    if (request.referrer && url.origin === self.location.origin) {
-        try {
-            const referrerUrl = new URL(request.referrer)
-            if (referrerUrl.pathname.startsWith(virtualPathPrefix)) {
-                // Check if this is arguably a sub-resource request meant for the virtual folder
-                const pathParts = referrerUrl.pathname.substring(virtualPathPrefix.length).split("/")
-                const folderName = pathParts[0]
-                const newVirtualUrl = `${self.location.origin}/n/${folderName}${url.pathname}`
-
-                e.respondWith(fetch(newVirtualUrl))
-                return
-            }
-        } catch (err) { }
-    }
-
-    // 5. Standard Network Fetch
     e.respondWith(fetch(request))
 })
+
+async function handleEncryptedRequest(opfsRoot, folderName, filePath, key, request) {
+    try {
+        const rfs = await opfsRoot.getDirectoryHandle(RFS_PREFIX)
+        const folderHandle = await rfs.getDirectoryHandle(folderName)
+
+        const manifestHandle = await folderHandle.getFileHandle("manifest.enc")
+        const manifestFile = await manifestHandle.getFile()
+        const manifestBuf = await manifestFile.arrayBuffer()
+
+        const iv = manifestBuf.slice(16, 28)
+        const encData = manifestBuf.slice(28)
+
+        let manifest
+        try {
+            const dec = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, encData)
+            manifest = JSON.parse(new TextDecoder().decode(dec))
+        } catch (e) { return new Response("Decryption Failed (Bad Password?)", { status: 403 }) }
+
+        const fileMeta = manifest[filePath] || manifest[filePath + "/index.html"]
+        if (!fileMeta) return new Response("File not found (Encrypted)", { status: 404 })
+
+        const rawFileHandle = await getCachedFileHandle(opfsRoot, folderName, "content", fileMeta.id)
+        if (!rawFileHandle) return new Response("File missing!", { status: 404 })
+        const rawFile = await rawFileHandle.getFile()
+
+        const rangeHeader = request.headers.get("Range")
+        const totalSize = fileMeta.size
+
+        let start = 0
+        let end = totalSize - 1
+
+        if (rangeHeader) {
+            const parts = rangeHeader.replace(/bytes=/, "").split("-")
+            start = parseInt(parts[0], 10)
+            if (parts[1]) end = parseInt(parts[1], 10)
+        }
+
+        if (start >= totalSize) return new Response(null, { status: 416, headers: { "Content-Range": `bytes */${totalSize}` } })
+
+        const startChunk = Math.floor(start / CHUNK_SIZE)
+        const endChunk = Math.floor(end / CHUNK_SIZE)
+
+        // Create a ReadableStream to stream decrypted chunks
+        const stream = new ReadableStream({
+            async start(controller) {
+                try {
+                    for (let i = startChunk; i <= endChunk; i++) {
+                        const isLast = (i * CHUNK_SIZE + CHUNK_SIZE) >= totalSize
+                        const remainder = totalSize % CHUNK_SIZE
+                        const plainChunkSize = isLast ? (remainder === 0 ? CHUNK_SIZE : remainder) : CHUNK_SIZE
+
+                        const rawOffset = i * (12 + CHUNK_SIZE + 16)
+
+                        const slicedBlob = rawFile.slice(rawOffset, rawOffset + encChunkSize)
+                        const buf = await slicedBlob.arrayBuffer()
+
+                        if (buf.byteLength === 0) break
+
+                        const chunkIv = buf.slice(0, 12)
+                        const chunkCipher = buf.slice(12)
+
+                        const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: chunkIv }, key, chunkCipher)
+
+                        let data = new Uint8Array(plain)
+
+                        if (i === startChunk) chunkStartRel = start % CHUNK_SIZE
+                        if (i === endChunk) chunkEndRel = (end % CHUNK_SIZE) + 1
+                        if (i === endChunk && end % CHUNK_SIZE === 0 && end !== 0) chunkEndRel = data.byteLength // Wrap case?
+
+                        const globalChunkStart = i * CHUNK_SIZE
+                        const sliceA = Math.max(0, start - globalChunkStart)
+                        const sliceB = Math.min(data.byteLength, (end + 1) - globalChunkStart)
+
+                        controller.enqueue(data.slice(sliceA, sliceB))
+                    }
+                    controller.close()
+                } catch (e) {
+                    controller.error(e)
+                }
+            }
+        })
+
+        const headers = {
+            "Content-Type": fileMeta.type || "application/octet-stream",
+            "Content-Length": (end - start) + 1,
+            "Content-Range": `bytes ${start}-${end}/${totalSize}`,
+            "Cache-Control": "no-store",
+            "Accept-Ranges": "bytes"
+        }
+
+        return new Response(stream, { status: 206, headers })
+    } catch (e) {
+        console.error("Encrypted handler error", e)
+        return new Response("Crypto Error", { status: 500 })
+    }
+}
 
 async function generateResponseForVirtualFile(request, session) {
     try {
@@ -285,7 +438,7 @@ async function generateResponseForVirtualFile(request, session) {
         const isFirefox = typeof InternalError !== "undefined"
         if (isFirefox && mode === "navigate" && !url.searchParams.has("boot")) {
             url.searchParams.set("boot", "1")
-            return new Response(`<!DOCTYPE html><script>location.replace("${url.href}");</script>`, {
+            return new Response(`<!DOCTYPE html><script>location.replace("${url.href}")</script>`, {
                 headers: { "Content-Type": "text/html" }
             })
         }
@@ -304,7 +457,7 @@ async function generateResponseForVirtualFile(request, session) {
 
         let root, registry
         try {
-            root = await navigator.storage.getDirectory()
+            root = await getOpfsRoot()
             registry = await getRegistry()
         } catch (e) {
             return new Response("System error: OPFS inaccessible", { status: 500 })
@@ -314,21 +467,34 @@ async function generateResponseForVirtualFile(request, session) {
 
         async function getFileHandle(dir, name, path) {
             try {
-                const parts = [RFS_PREFIX, name, ...path.split("/")]
+                const pathParts = path.split("/").map(p => {
+                    try { return decodeURIComponent(p) } catch (e) { return p }
+                }).filter(p => p && p.trim() !== "")
+
+                const parts = [RFS_PREFIX, name, ...pathParts]
+
                 let curr = dir
                 for (let i = 0; i < parts.length - 1; i++) {
                     curr = await curr.getDirectoryHandle(parts[i])
                 }
+
+                // Get the final file
                 return await curr.getFileHandle(parts[parts.length - 1])
             } catch (e) { return null }
         }
 
         let handle = await getFileHandle(root, folderName, relativePath)
 
+        // If file not found and this is a navigation (top-level), try falling back to index.html
         if (!handle && mode === "navigate") {
-            handle = await getFileHandle(root, folderName, "index.html")
-            if (handle) relativePath = "index.html"
-        } else if (!handle) {
+            const indexHandle = await getFileHandle(root, folderName, "index.html")
+            if (indexHandle) {
+                handle = indexHandle
+                relativePath = "index.html"
+            }
+        }
+
+        if (!handle) {
             return new Response("File not found", { status: 404 })
         }
 
@@ -345,20 +511,12 @@ async function generateResponseForVirtualFile(request, session) {
 
         const isEncrypted = folderData.encryptionType === "password"
         const hasRegex = compiledRules && compiledRules.length > 0
-
-        const isTooLarge = totalSize > 20 * 1024 * 1024
-        const needsProcessing = (isEncrypted || hasRegex) && !isTooLarge
-
-        if (isEncrypted && isTooLarge) {
-            return new Response("File too large to decrypt in browser", { status: 413 })
-        }
+        const needsProcessing = (isEncrypted || hasRegex)
 
         const baseHeaders = {
             "Content-Type": contentType,
             "Cache-Control": "no-store",
-            "Accept-Ranges": "bytes",
-            "Cross-Origin-Embedder-Policy": "require-corp",
-            "Cross-Origin-Opener-Policy": "same-origin"
+            "Accept-Ranges": "bytes"
         }
 
         const finalHeaders = applyCustomHeaders(baseHeaders, relativePath, session.headers || folderData.headers)
@@ -390,16 +548,9 @@ async function generateResponseForVirtualFile(request, session) {
 
         let buffer = await file.arrayBuffer()
 
-        if (isEncrypted) {
-            const key = session.key
-            if (!key) return new Response("Key required: Session lost!", { status: 403 })
-            try {
-                const iv = buffer.slice(0, 12)
-                const data = buffer.slice(12)
-                buffer = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data)
-            } catch (e) {
-                return new Response("Decryption failed", { status: 500 })
-            }
+        if (folderData.encryptionType === "password") {
+            if (!session.key) return new Response("Session locked. Reload from Main.", { status: 403 })
+            return await handleEncryptedRequest(root, folderName, relativePath, session.key, request)
         }
 
         if (hasRegex) {

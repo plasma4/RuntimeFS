@@ -42,6 +42,10 @@
             margin-bottom: 1em;
         }
 
+        input[type=text] {
+            width: 175px;
+        }
+
         input[type=checkbox] {
             cursor: pointer;
         }
@@ -144,9 +148,9 @@
         <label for="openFolderName">Folder to Open:</label>
         <input type="text" id="openFolderName" placeholder="Enter folder name...">
         <label for="fileName" placeholder="File name...">File:</label>
-        <input type="text" id="fileName" value="index.html">
+        <input type="text" id="fileName" placeholder="index.html (optional)">
         <button onclick="openFile()">Open</button>
-        <button onclick="syncAndOpenFile()">Sync Folder & Open</button>
+        <button onclick="syncAndOpenFile()">Sync and Open</button>
     </fieldset>
 
     <fieldset>
@@ -207,12 +211,12 @@
         <textarea id="headers" rows="5" cols="40" placeholder="Enter headers here..."></textarea>
         <hr>
         <h3>Encrypt Folders</h3>
-        You can encrypt a folder into a bunch of files (will not work in all browsers).
+        You can encrypt a folder into a bunch of files.
         <br><br>
         <label for="encryptFolderName">Folder Name:</label>
         <input type="text" id="encryptFolderName" placeholder="Enter a name...">
         <br>
-        <button onclick="uploadAndEncryptWithPassword()">Password Encrypt Folder (stays in browser)</button>
+        <button onclick="uploadAndEncryptWithPassword()">Password Encrypt Folder (in-browser)</button>
     </fieldset>
 </body>
 

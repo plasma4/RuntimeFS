@@ -1,10 +1,17 @@
 const RFS_PREFIX = "rfs"
 const SYSTEM_FILE = "rfs_system.json"
+const CHUNK_SIZE = 1024 * 1024 * 4
 
 let isListingFolders = false
 let currentlyBusy = false
 let folderName, dirHandle, observer
 let changes = []
+
+let _opfsRoot = null
+async function getOpfsRoot() {
+    if (!_opfsRoot) _opfsRoot = await navigator.storage.getDirectory()
+    return _opfsRoot
+}
 
 function setUiBusy(isBusy) {
     currentlyBusy = isBusy
@@ -22,7 +29,7 @@ async function waitForController() {
 
 async function getRegistry() {
     try {
-        const root = await navigator.storage.getDirectory()
+        const root = await getOpfsRoot()
         const handle = await root.getFileHandle(SYSTEM_FILE)
         const file = await handle.getFile()
         return JSON.parse(await file.text())
@@ -32,7 +39,7 @@ async function getRegistry() {
 }
 
 async function saveRegistry(registry) {
-    const root = await navigator.storage.getDirectory()
+    const root = await getOpfsRoot()
     const handle = await root.getFileHandle(SYSTEM_FILE, { create: true })
     const writable = await handle.createWritable()
     await writable.write(JSON.stringify(registry))
@@ -80,7 +87,7 @@ async function processFolderSelection(name, handle) {
     try {
         const encManifest = await handle.getFileHandle("manifest.enc")
         console.log("Encrypted folder detected.")
-        const root = await navigator.storage.getDirectory()
+        const root = await getOpfsRoot()
         const rfs = await root.getDirectoryHandle(RFS_PREFIX, { create: true })
         try { await rfs.removeEntry(name, { recursive: true }) } catch (e) { }
 
@@ -167,7 +174,7 @@ async function processFileListAndStore(name, fileList) {
 
     try {
         if (!fileList.length) return
-        const root = await navigator.storage.getDirectory()
+        const root = await getOpfsRoot()
         const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX, { create: true })
 
         try {
@@ -220,14 +227,14 @@ async function processAndStoreFolderStreaming(name, srcHandle) {
     const progressElem = document.getElementById("progress")
     const updateProgress = createProgressThrottle(progressElem)
 
-    const root = await navigator.storage.getDirectory()
+    const root = await getOpfsRoot()
     const rfs = await root.getDirectoryHandle(RFS_PREFIX, { create: true })
     try { await rfs.removeEntry(name, { recursive: true }) } catch (e) { }
     const destRoot = await rfs.getDirectoryHandle(name, { create: true })
 
     updateProgress("Scanning files...")
     const files = [] // { entry, pathParts }
-    const dirs = []  // pathParts (array of strings)
+    const dirs = [] // pathParts (array of strings)
 
     async function scan(dir, pathParts) {
         for await (const entry of dir.values()) {
@@ -352,7 +359,7 @@ async function deleteFolder(folderNameToDelete, skipConfirm = false) {
     progressElem.textContent = "Deleting..."
     setUiBusy(true)
     try {
-        const root = await navigator.storage.getDirectory()
+        const root = await getOpfsRoot()
         try {
             const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX)
             await rfsRoot.removeEntry(folderName, { recursive: true })
@@ -530,17 +537,15 @@ async function exportData() {
         const metadata = {
             ls: document.getElementById("c2").checked ? { ...localStorage } : {},
             ss: document.getElementById("c7").checked ? getSessionStorageExport() : {},
-            cookies: typeof getCookiesAsObject === 'function' && document.getElementById("c1").checked ? getCookiesAsObject() : {},
+            cookies: typeof getCookiesAsObject === "function" && document.getElementById("c1").checked ? getCookiesAsObject() : {},
             reg: document.getElementById("c4").checked ? await getRegistry() : {},
         }
 
         await writeTarEntry("runtimefs_system/metadata.json", new TextEncoder().encode(JSON.stringify(metadata, null, 2)))
-
         if (document.getElementById("c3").checked) await streamIndexedDBToWriter(updateProgress, writeTarEntry)
         if (document.getElementById("c6").checked) await streamCacheStorageToWriter(updateProgress, writeTarEntry)
-
         if (document.getElementById("c5").checked) {
-            const root = await navigator.storage.getDirectory()
+            const root = await getOpfsRoot()
             const processDir = async (handle, prefix) => {
                 for await (const entry of handle.values()) {
                     if (entry.name === SYSTEM_FILE) continue
@@ -558,8 +563,8 @@ async function exportData() {
         }
 
         await write(new Uint8Array(1024)) // Write Tar Footer
-        await tarWriter.close()           // Close GZIP input
-        await gzipPromise                 // Wait for GZIP -> Output pipe to finish
+        await tarWriter.close() // Close GZIP input
+        await gzipPromise // Wait for GZIP -> Output pipe to finish
 
     } catch (e) {
         console.error(e)
@@ -677,8 +682,8 @@ async function streamIndexedDBToWriter(updateProgress, writeFunc) {
 }
 
 function getCookiesAsObject() {
-    return document.cookie.split(';').reduce((res, c) => {
-        const [key, val] = c.trim().split('=').map(decodeURIComponent)
+    return document.cookie.split(";").reduce((res, c) => {
+        const [key, val] = c.trim().split("=").map(decodeURIComponent)
         if (key) res[key] = val
         return res
     }, {})
@@ -782,7 +787,7 @@ async function streamCacheStorageToWriter(updateProgress, writeFunc) {
 
             // Use CBOR to pack metadata + binary body
             const safeName = encodeURIComponent(cacheName)
-            const safeUrlHash = btoa(req.url).slice(0, 50).replace(/\//g, '_')
+            const safeUrlHash = btoa(req.url).slice(0, 50).replace(/\//g, "_")
 
             const entryData = CBOR.encode({
                 meta,
@@ -816,7 +821,7 @@ async function startImport(file) {
     if (navigator.serviceWorker.controller) navigator.serviceWorker.controller.postMessage({ type: "PREPARE_FOR_IMPORT" })
 
     const restoreFromCbor = (item) => {
-        if (!item || typeof item !== 'object') return item
+        if (!item || typeof item !== "object") return item
         if (item.__rfs_blob && item.data) return new Blob([item.data], { type: item.type })
         if (ArrayBuffer.isView(item) || item instanceof ArrayBuffer) return item
         if (Array.isArray(item)) return item.map(restoreFromCbor)
@@ -914,7 +919,7 @@ async function startImport(file) {
             return res
         }
 
-        const root = await navigator.storage.getDirectory()
+        const root = await getOpfsRoot()
         const dbCache = {}
 
         updateProgress("Reading Archive...")
@@ -935,11 +940,6 @@ async function startImport(file) {
             if (path.startsWith("./")) path = path.slice(2)
             while (path.startsWith("/")) path = path.slice(1)
 
-            // Handling File Content
-            // FIX: For large files, we shouldn't accumulate `chunkData` in memory
-            // However, since we need to support Import of JSON/CBOR which requires parsing,
-            // we have to check the path type.
-
             const isSystemFile = path === "runtimefs_system/metadata.json" ||
                 path.startsWith("__CACHE__/") ||
                 path.startsWith("__IDB_SCHEMA__/") ||
@@ -950,7 +950,6 @@ async function startImport(file) {
                 if (!(await ensureBuffer(size))) throw new Error("Unexpected EOF in system file")
                 const chunkData = consume(size)
 
-                // ... Process System File (Identical logic to original) ...
                 if (path === "runtimefs_system/metadata.json") {
                     try {
                         const metadata = JSON.parse(new TextDecoder().decode(chunkData))
@@ -958,7 +957,7 @@ async function startImport(file) {
                         if (metadata.ss) restoreSessionStorage(metadata.ss)
                         if (metadata.cookies) restoreCookies(metadata.cookies)
                         if (metadata.reg) await saveRegistry(metadata.reg)
-                    } catch (e) { console.warn("Metadata corruption", e) }
+                    } catch (e) { console.warn("Metadata corruption!", e) }
                 }
                 else if (path.startsWith("__CACHE__/")) {
                     const parts = path.split("/")
@@ -1014,7 +1013,7 @@ async function startImport(file) {
                     } catch (e) { console.warn("IDB Data write failed", e) }
                 }
 
-            } else if (header.type === '0' || header.type === '\0') {
+            } else if (header.type === "0" || header.type === "\0") {
                 // Standard File: Stream DIRECTLY to OPFS
                 updateProgress(path)
                 const parts = path.split("/").map(p => p.trim()).filter(p => p && p !== "." && p !== "..")
@@ -1099,62 +1098,48 @@ function createTarHeader(filename, size, isDir = false) {
     const buffer = new Uint8Array(512)
     const enc = new TextEncoder()
 
-    // 1. Safe Filename Splitting
     let prefix = "", name = filename
     if (filename.length > 100) {
-        // We need a slash that results in:
-        // - prefix.length <= 155
-        // - name.length <= 100
-        // Search range: [Max allowed start for name, Max allowed end for prefix]
-        // Name must start at index >= length - 101 (so remainder is <= 100)
         const minSplitIndex = Math.max(0, filename.length - 101)
         const maxSplitIndex = Math.min(filename.length, 155)
-
-        // Find the last slash within the safe range
         const splitIndex = filename.lastIndexOf("/", maxSplitIndex)
-
         if (splitIndex >= minSplitIndex) {
             prefix = filename.substring(0, splitIndex)
             name = filename.substring(splitIndex + 1)
         } else {
-            // Fallback: Hard truncate (warn in console in real app)
             name = filename.substring(filename.length - 100)
         }
     }
 
-    // Helper to write string to buffer
     const writeStr = (str, offset, len) => {
-        // Enforce null termination within the length if short enough
         let bytes = enc.encode(str)
         if (bytes.length > len) bytes = bytes.subarray(0, len)
         buffer.set(bytes, offset)
     }
 
-    // 2. Write Fields
-    writeStr(name, 0, 100)                          // Name
-    writeOctal(buffer, 0o664, 100, 8)               // Mode
-    writeOctal(buffer, 0, 108, 8)                   // UID
-    writeOctal(buffer, 0, 116, 8)                   // GID
-    writeOctal(buffer, size, 124, 12)               // Size
-    // Mtime: Current time or 0
-    writeOctal(buffer, Math.floor(Date.now() / 1000), 136, 12);
+    // Write Standard Fields
+    writeStr(name, 0, 100)
+    writeOctal(buffer, 0o664, 100, 8)
+    writeOctal(buffer, 0, 108, 8)
+    writeOctal(buffer, 0, 116, 8)
+    writeOctal(buffer, size, 124, 12)
+    writeOctal(buffer, Math.floor(Date.now() / 1000), 136, 12)
 
-    // Checksum placeholder (8 spaces) for calculation
-    buffer.set(enc.encode("        "), 148);
+    buffer[156] = isDir ? 53 : 48
+    writeStr("ustar\0", 257, 6)
+    writeStr("00", 263, 2)
+    if (prefix) writeStr(prefix, 345, 155)
 
-    buffer[156] = isDir ? 53 : 48                   // Type (0='0', 5='5')
-    writeStr("ustar\0", 257, 6)                     // Magic
-    writeStr("00", 263, 2)                          // Version
-    if (prefix) writeStr(prefix, 345, 155)          // Prefix
+    for (let i = 148; i < 156; i++) buffer[i] = 32
 
-    // 3. Calculate Checksum
     let checksum = 0
     for (let i = 0; i < 512; i++) checksum += buffer[i]
 
-    // 4. Write Checksum (Strict USTAR: 6 digits + NULL + SPACE)
-    // Note: Standard says "six octal digits followed by a null and a space"
-    const checksumStr = checksum.toString(8).padStart(6, '0') + "\u0000 "
-    buffer.set(enc.encode(checksumStr), 148)
+    // Write Checksum: 6 octal digits + Null + Space
+    const checksumStr = checksum.toString(8).padStart(6, "0")
+    writeStr(checksumStr, 148, 6)
+    buffer[154] = 0 // Null
+    buffer[155] = 32 // Space
 
     return buffer
 }
@@ -1194,12 +1179,9 @@ function parseTarHeader(buffer) {
  * Standard behavior: Zero-padded, terminated by Space or Null (we use Null).
  */
 function writeOctal(buffer, value, offset, len) {
-    // We use len-1 for digits and the last byte for null termination.
-    // This satisfies standard requirements for numeric fields.
-    const str = value.toString(8).padStart(len - 1, '0')
+    const str = value.toString(8).padStart(len - 1, "0")
     const enc = new TextEncoder()
     buffer.set(enc.encode(str), offset)
-    // The last byte (buffer[offset + len - 1]) is already 0 (from new Uint8Array)
 }
 
 function createProgressThrottle(element) {
@@ -1252,11 +1234,10 @@ async function writeEncryptedChunk(writer, key, chunk) {
     await writer.write(new Uint8Array(ciphertext))
 }
 
-// Chunks data into ~1MB blocks to keep memory low during encryption
+// Chunks data into ~4MB blocks to keep memory low during encryption
 class ChunkedEncryptionStream extends WritableStream {
     constructor(underlyingWriter, key) {
         let buffer = new Uint8Array(0)
-        const CHUNK_SIZE = 1024 * 1024 // 1MB
 
         super({
             async write(chunk) {
@@ -1319,7 +1300,7 @@ async function syncAndOpenFile() {
 
 async function performSyncToOpfs() {
     console.log(`Syncing ${changes.length} changes...`)
-    const root = await navigator.storage.getDirectory()
+    const root = await getOpfsRoot()
     const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX)
     const folderHandle = await rfsRoot.getDirectoryHandle(folderName)
 
@@ -1379,41 +1360,90 @@ async function uploadAndEncryptWithPassword() {
 
     try {
         const localDir = await window.showDirectoryPicker({ mode: "read" })
-        const root = await navigator.storage.getDirectory()
+        const root = await getOpfsRoot()
         const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX, { create: true })
+
+        // Clean old folder
         try { await rfsRoot.removeEntry(name, { recursive: true }) } catch (e) { }
         const destDir = await rfsRoot.getDirectoryHandle(name, { create: true })
+        // Create a "content" subfolder for the obfuscated blobs
+        const contentDir = await destDir.getDirectoryHandle("content", { create: true })
 
         const salt = crypto.getRandomValues(new Uint8Array(16))
         const key = await deriveKeyFromPassword(password, salt)
 
-        async function processHandle(src, dst) {
+        // Metadata Store: Maps virtual paths to { id, size, type }
+        const manifestData = {}
+
+        async function processHandle(src, relativePath) {
             for await (const entry of src.values()) {
+                const entryPath = relativePath ? `${relativePath}/${entry.name}` : entry.name
+
                 if (entry.kind === "file") {
-                    updateProgress(`Encrypting: ${entry.name}`)
+                    updateProgress(`Encrypting: ${entryPath}`)
+
+                    const fileId = crypto.randomUUID()
                     const file = await entry.getFile()
-                    const iv = crypto.getRandomValues(new Uint8Array(12))
-                    const buf = await file.arrayBuffer()
-                    const enc = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, buf)
-                    const fh = await dst.getFileHandle(entry.name, { create: true })
-                    const w = await fh.createWritable()
-                    await w.write(iv)
-                    await w.write(enc)
-                    await w.close()
+                    const size = file.size
+
+                    // Store metadata entry
+                    manifestData[entryPath] = {
+                        id: fileId,
+                        size: size,
+                        type: file.type
+                    }
+
+                    // Encrypt Content in Chunks
+                    const destFileHandle = await contentDir.getFileHandle(fileId, { create: true })
+                    const writable = await destFileHandle.createWritable()
+
+                    const buffer = await file.arrayBuffer()
+                    const totalChunks = Math.ceil(size / CHUNK_SIZE)
+
+                    for (let i = 0; i < totalChunks; i++) {
+                        const start = i * CHUNK_SIZE
+                        const end = Math.min(start + CHUNK_SIZE, size)
+                        const chunk = buffer.slice(start, end)
+
+                        const iv = crypto.getRandomValues(new Uint8Array(12))
+                        const encryptedChunk = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, chunk)
+
+                        // Format: [IV (12)][Ciphertext]
+                        await writable.write(iv)
+                        await writable.write(new Uint8Array(encryptedChunk))
+                    }
+                    await writable.close()
+
                 } else {
-                    const nextDst = await dst.getDirectoryHandle(entry.name, { create: true })
-                    await processHandle(entry, nextDst)
+                    await processHandle(entry, entryPath)
                 }
             }
         }
-        await processHandle(localDir, destDir)
+
+        await processHandle(localDir, "")
+
+        // Encrypt and Save Manifest
+        updateProgress("Saving Manifest...")
+        const manifestJson = JSON.stringify(manifestData)
+        const manifestBuffer = new TextEncoder().encode(manifestJson)
+        const manifestIv = crypto.getRandomValues(new Uint8Array(12))
+        const encManifest = await crypto.subtle.encrypt({ name: "AES-GCM", iv: manifestIv }, key, manifestBuffer)
+
+        const manifestHandle = await destDir.getFileHandle("manifest.enc", { create: true })
+        const mw = await manifestHandle.createWritable()
+        // Format: [Salt (16)][IV (12)][EncryptedManifest]
+        await mw.write(salt)
+        await mw.write(manifestIv)
+        await mw.write(new Uint8Array(encManifest))
+        await mw.close()
 
         await updateRegistryEntry(name, { encryptionType: "password", salt: bufferToBase64(salt) })
-
         document.getElementById("encryptFolderName").value = ""
         await listFolders()
+
     } catch (e) {
-        if (e.name !== "AbortError") alert("Error: " + e.message)
+        alert("Error: " + e.message)
+        console.error(e)
     } finally {
         setUiBusy(false)
         progressElem.textContent = ""
@@ -1441,7 +1471,6 @@ document.addEventListener("DOMContentLoaded", () => {
             if (reg.active && !navigator.serviceWorker.controller) {
                 console.log("SW active but not controlling. Waiting for claim...")
             }
-
         }).catch(console.error)
 
         navigator.serviceWorker.addEventListener("message", async (event) => {

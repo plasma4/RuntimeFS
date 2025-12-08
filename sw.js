@@ -1,592 +1,755 @@
-let pendingNavData = null // for next navigation request
-const clientSessionStore = new Map()
-const handleCache = new Map()
+let pendingNavData = null; // for next navigation request
+const clientSessionStore = new Map();
+const handleCache = new Map();
 
-const RFS_PREFIX = "rfs"
-const SYSTEM_FILE = "rfs_system.json"
-const CACHE_NAME = "fc"
-const APP_SHELL_FILES = ["./", "./index.html", "./main.js", "./cbor-x.js"] // If you're using .php for some reason, or are merging cbor-x and main.js into one for compression, make sure to change this!
-const NETWORK_ALLOWLIST_PREFIXES = [] // Allow bypass of VFS if needed
-const FULL_APP_SHELL_URLS = APP_SHELL_FILES.map(file => new URL(file, self.location.href).href)
+const RFS_PREFIX = "rfs";
+const SYSTEM_FILE = "rfs_system.json";
+const CACHE_NAME = "fc";
+const APP_SHELL_FILES = ["./", "./index.html", "./main.js", "./cbor-x.js"]; // If you're using .php for some reason, or are merging cbor-x and main.js into one for compression, make sure to change this!
+const NETWORK_ALLOWLIST_PREFIXES = []; // Allow bypass of VFS if needed
+const FULL_APP_SHELL_URLS = APP_SHELL_FILES.map(
+  (file) => new URL(file, self.location.href).href
+);
 
-const STORE_ENTRY_TTL = 30000 // 30 seconds
-const basePath = new URL("./", self.location).pathname
-const virtualPathPrefix = basePath + "n/"
+const STORE_ENTRY_TTL = 30000; // 30 seconds
+const basePath = new URL("./", self.location).pathname;
+const virtualPathPrefix = basePath + "n/";
 
 // Cache for the system.json registry to avoid disk reads on every request
-let registryCache = null
+let registryCache = null;
 
-let _opfsRoot = null
+let _opfsRoot = null;
 async function getOpfsRoot() {
-    if (!_opfsRoot) _opfsRoot = await navigator.storage.getDirectory()
-    return _opfsRoot
+  if (!_opfsRoot) _opfsRoot = await navigator.storage.getDirectory();
+  return _opfsRoot;
 }
 
 function cleanupExpiredStores() {
-    const now = Date.now()
-    for (const [clientId, sessionData] of clientSessionStore.entries()) {
-        if (now - sessionData.timestamp > STORE_ENTRY_TTL) {
-            clientSessionStore.delete(clientId)
-        }
+  const now = Date.now();
+  for (const [clientId, sessionData] of clientSessionStore.entries()) {
+    if (now - sessionData.timestamp > STORE_ENTRY_TTL) {
+      clientSessionStore.delete(clientId);
     }
+  }
 }
 
-setInterval(cleanupExpiredStores, 60000)
+setInterval(cleanupExpiredStores, 60000);
 
 function escapeRegex(string) {
-    return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function compileRules(rulesString) {
-    if (!rulesString || !rulesString.trim()) return []
-    const compiled = []
-    const lines = rulesString.trim().split(/\r?\n/)
+  if (!rulesString || !rulesString.trim()) return [];
+  const compiled = [];
+  const lines = rulesString.trim().split(/\r?\n/);
 
-    for (const line of lines) {
-        const parts = line.split("->")
-        if (parts.length < 2) continue
+  for (const line of lines) {
+    const parts = line.split("->");
+    if (parts.length < 2) continue;
 
-        const matchPart = parts[0].trim()
-        const replacePart = parts.slice(1).join("->").trim()
-        const operatorMatch = matchPart.match(/^(.*?)\s+(\$|\$\$|\|\||\|)\s+(.*)$/s)
+    const matchPart = parts[0].trim();
+    const replacePart = parts.slice(1).join("->").trim();
+    const operatorMatch = matchPart.match(
+      /^(.*?)\s+(\$|\$\$|\|\||\|)\s+(.*)$/s
+    );
 
-        if (!operatorMatch) continue
+    if (!operatorMatch) continue;
 
-        const [, fileMatch, operator, searchPattern] = operatorMatch
-        const fileRegex = new RegExp(fileMatch.trim() === "*" ? ".*" : fileMatch.trim())
+    const [, fileMatch, operator, searchPattern] = operatorMatch;
+    const fileRegex = new RegExp(
+      fileMatch.trim() === "*" ? ".*" : fileMatch.trim()
+    );
 
-        let searchRegex
-        try {
-            switch (operator) {
-                case "|": searchRegex = new RegExp(searchPattern, "g"); break
-                case "$": searchRegex = new RegExp(escapeRegex(searchPattern), "g"); break
-                case "||": searchRegex = new RegExp(searchPattern); break
-                case "$$": searchRegex = new RegExp(escapeRegex(searchPattern)); break
-            }
-        } catch (e) { continue }
-
-        if (searchRegex) compiled.push({ fileRegex, searchRegex, replacePart })
+    let searchRegex;
+    try {
+      switch (operator) {
+        case "|":
+          searchRegex = new RegExp(searchPattern, "g");
+          break;
+        case "$":
+          searchRegex = new RegExp(escapeRegex(searchPattern), "g");
+          break;
+        case "||":
+          searchRegex = new RegExp(searchPattern);
+          break;
+        case "$$":
+          searchRegex = new RegExp(escapeRegex(searchPattern));
+          break;
+      }
+    } catch (e) {
+      continue;
     }
-    return compiled
+
+    if (searchRegex) compiled.push({ fileRegex, searchRegex, replacePart });
+  }
+  return compiled;
 }
 
 function applyRegexRules(filePath, fileBuffer, fileType, compiledRules) {
-    // Optimization: Don't run regex on binaries or huge files
-    if (!/^(text\/|application\/(javascript|json|xml|x-javascript|typescript))/.test(fileType)) return fileBuffer
-    if (fileBuffer.byteLength > 10 * 1024 * 1024) return fileBuffer
+  // Optimization: Don't run regex on binaries or huge files
+  if (
+    !/^(text\/|application\/(javascript|json|xml|x-javascript|typescript))/.test(
+      fileType
+    )
+  )
+    return fileBuffer;
+  if (fileBuffer.byteLength > 10 * 1024 * 1024) return fileBuffer;
 
-    try {
-        let content = new TextDecoder().decode(fileBuffer)
-        let modified = false
+  try {
+    let content = new TextDecoder().decode(fileBuffer);
+    let modified = false;
 
-        for (const rule of compiledRules) {
-            if (rule.fileRegex.test(filePath)) {
-                if (rule.searchRegex.test(content)) {
-                    content = content.replace(rule.searchRegex, rule.replacePart)
-                    modified = true
-                }
-            }
+    for (const rule of compiledRules) {
+      if (rule.fileRegex.test(filePath)) {
+        if (rule.searchRegex.test(content)) {
+          content = content.replace(rule.searchRegex, rule.replacePart);
+          modified = true;
         }
-        return modified ? new TextEncoder().encode(content).buffer : fileBuffer
-    } catch (e) {
-        console.error(`Error applying regex rules to ${filePath}:`, e)
-        return fileBuffer
+      }
     }
+    return modified ? new TextEncoder().encode(content).buffer : fileBuffer;
+  } catch (e) {
+    console.error(`Error applying regex rules to ${filePath}:`, e);
+    return fileBuffer;
+  }
 }
 
 async function getRegistry() {
-    if (registryCache) return registryCache
-    try {
-        const root = await getOpfsRoot()
-        const handle = await root.getFileHandle(SYSTEM_FILE)
-        const file = await handle.getFile()
-        registryCache = JSON.parse(await file.text())
-    } catch (e) {
-        registryCache = {}
-    }
-    return registryCache
+  if (registryCache) return registryCache;
+  try {
+    const root = await getOpfsRoot();
+    const handle = await root.getFileHandle(SYSTEM_FILE);
+    const file = await handle.getFile();
+    registryCache = JSON.parse(await file.text());
+  } catch (e) {
+    registryCache = {};
+  }
+  return registryCache;
 }
 
 async function getCachedFileHandle(root, folderName, subDir, fileName) {
-    const cacheKey = `${folderName}/${subDir}/${fileName}`
-    if (handleCache.has(cacheKey)) return handleCache.get(cacheKey)
+  const cacheKey = `${folderName}/${subDir}/${fileName}`;
+  if (handleCache.has(cacheKey)) return handleCache.get(cacheKey);
 
-    try {
-        // Root -> RFS -> FolderName -> SubDir -> FileName
-        const rfs = await root.getDirectoryHandle(RFS_PREFIX)
-        const folder = await rfs.getDirectoryHandle(folderName)
-        const dir = await folder.getDirectoryHandle(subDir)
-        const file = await dir.getFileHandle(fileName)
+  try {
+    // Root -> RFS -> FolderName -> SubDir -> FileName
+    const rfs = await root.getDirectoryHandle(RFS_PREFIX);
+    const folder = await rfs.getDirectoryHandle(folderName);
+    const dir = await folder.getDirectoryHandle(subDir);
+    const file = await dir.getFileHandle(fileName);
 
-        handleCache.set(cacheKey, file)
-        return file
-    } catch (e) {
-        return null
-    }
+    handleCache.set(cacheKey, file);
+    return file;
+  } catch (e) {
+    return null;
+  }
 }
 
 self.addEventListener("install", async function () {
-    const cache = await caches.open(CACHE_NAME)
-    await Promise.all(APP_SHELL_FILES.map(async (url) => {
-        try {
-            const response = await fetch(url, { cache: "reload" })
-            if (response.ok) await cache.put(url, response)
-        } catch (e) { console.warn("Failed to cache app shell file:", url) }
-    }))
-    await self.skipWaiting()
-})
+  const cache = await caches.open(CACHE_NAME);
+  await Promise.all(
+    APP_SHELL_FILES.map(async (url) => {
+      try {
+        const response = await fetch(url, { cache: "reload" });
+        if (response.ok) await cache.put(url, response);
+      } catch (e) {
+        console.warn("Failed to cache app shell file:", url);
+      }
+    })
+  );
+  await self.skipWaiting();
+});
 
-self.addEventListener("activate", e => {
-    e.waitUntil((async function () {
-        await self.clients.claim()
-        registryCache = null
-        try { await getOpfsRoot() } catch (err) { }
-        const allClients = await self.clients.matchAll({ includeUncontrolled: true })
-        for (const client of allClients) client.postMessage({ type: "SW_READY" })
-    })())
-})
+self.addEventListener("activate", (e) => {
+  e.waitUntil(
+    (async function () {
+      await self.clients.claim();
+      registryCache = null;
+      try {
+        await getOpfsRoot();
+      } catch (err) {}
+      const allClients = await self.clients.matchAll({
+        includeUncontrolled: true,
+      });
+      for (const client of allClients) client.postMessage({ type: "SW_READY" });
+    })()
+  );
+});
 
-self.addEventListener("message", e => {
-    if (!e.data) return
-    const clientId = e.source ? e.source.id : null
+self.addEventListener("message", (e) => {
+  if (!e.data) return;
+  const clientId = e.source ? e.source.id : null;
 
-    switch (e.data.type) {
-        case "SET_RULES":
-            const { rules, headers, key } = e.data
-            const compiledRules = compileRules(rules)
+  switch (e.data.type) {
+    case "SET_RULES":
+      const { rules, headers, key } = e.data;
+      const compiledRules = compileRules(rules);
 
-            // Set data for pending navigation
-            pendingNavData = { rules, compiledRules, headers, key }
+      // Set data for pending navigation
+      pendingNavData = { rules, compiledRules, headers, key };
 
-            // Set data for current client (if any)
-            if (clientId) {
-                const s = clientSessionStore.get(clientId) || {}
-                s.rules = rules
-                s.compiledRules = compiledRules
-                s.headers = headers
-                if (key) s.key = key
-                clientSessionStore.set(clientId, s)
-            }
-            if (e.ports && e.ports[0]) e.ports[0].postMessage("OK") // any message string works here
-            setTimeout(() => {
-                if (pendingNavData && pendingNavData.key === key) pendingNavData = null
-            }, 5000)
-            break
+      // Set data for current client (if any)
+      if (clientId) {
+        const s = clientSessionStore.get(clientId) || {};
+        s.rules = rules;
+        s.compiledRules = compiledRules;
+        s.headers = headers;
+        if (key) s.key = key;
+        clientSessionStore.set(clientId, s);
+      }
+      if (e.ports && e.ports[0]) e.ports[0].postMessage("OK"); // any message string works here
+      setTimeout(() => {
+        if (pendingNavData && pendingNavData.key === key) pendingNavData = null;
+      }, 5000);
+      break;
 
-        case "INVALIDATE_CACHE":
-            registryCache = null
-            handleCache.clear()
-            e.waitUntil((async function () {
-                const allClients = await self.clients.matchAll({ includeUncontrolled: true })
-                for (const client of allClients) {
-                    if (client.id !== clientId) client.postMessage({ type: "INVALIDATE_CACHE", folderName: e.data.folderName })
-                }
-            })())
-            break
+    case "INVALIDATE_CACHE":
+      registryCache = null;
+      handleCache.clear();
+      e.waitUntil(
+        (async function () {
+          const allClients = await self.clients.matchAll({
+            includeUncontrolled: true,
+          });
+          for (const client of allClients) {
+            if (client.id !== clientId)
+              client.postMessage({
+                type: "INVALIDATE_CACHE",
+                folderName: e.data.folderName,
+              });
+          }
+        })()
+      );
+      break;
 
-        case "PREPARE_FOR_IMPORT":
-            registryCache = null
-            if (e.source) e.source.postMessage({ type: "IMPORT_READY" })
-            break
-    }
-})
-
+    case "PREPARE_FOR_IMPORT":
+      registryCache = null;
+      if (e.source) e.source.postMessage({ type: "IMPORT_READY" });
+      break;
+  }
+});
 
 function parseCustomHeaders(rulesString) {
-    if (!rulesString || !rulesString.trim()) return []
-    const rules = []
-    rulesString.trim().split("\n").forEach(line => {
-        line = line.trim()
-        if (line.startsWith("#") || line === "") return
-        const parts = line.split("->")
-        if (parts.length < 2) return
-        const [globPart, ...headerParts] = parts
-        const glob = globPart.trim()
-        const fullHeaderString = headerParts.join("->").trim()
-        const colonIndex = fullHeaderString.indexOf(":")
-        if (colonIndex === -1) return
+  if (!rulesString || !rulesString.trim()) return [];
+  const rules = [];
+  rulesString
+    .trim()
+    .split("\n")
+    .forEach((line) => {
+      line = line.trim();
+      if (line.startsWith("#") || line === "") return;
+      const parts = line.split("->");
+      if (parts.length < 2) return;
+      const [globPart, ...headerParts] = parts;
+      const glob = globPart.trim();
+      const fullHeaderString = headerParts.join("->").trim();
+      const colonIndex = fullHeaderString.indexOf(":");
+      if (colonIndex === -1) return;
 
-        const headerName = fullHeaderString.substring(0, colonIndex).trim()
-        const headerValue = fullHeaderString.substring(colonIndex + 1).trim()
+      const headerName = fullHeaderString.substring(0, colonIndex).trim();
+      const headerValue = fullHeaderString.substring(colonIndex + 1).trim();
 
-        try {
-            const regex = new RegExp("^" + glob.replace(/\./g, "\\.").replace(/\*/g, ".*").replace(/\?/g, ".") + "$")
-            rules.push({ regex, header: headerName, value: headerValue })
-        } catch (e) { }
-    })
-    return rules
+      try {
+        const regex = new RegExp(
+          "^" +
+            glob
+              .replace(/\./g, "\\.")
+              .replace(/\*/g, ".*")
+              .replace(/\?/g, ".") +
+            "$"
+        );
+        rules.push({ regex, header: headerName, value: headerValue });
+      } catch (e) {}
+    });
+  return rules;
 }
 
 function applyCustomHeaders(baseHeaders, filePath, rulesString) {
-    if (!rulesString) return baseHeaders
-    const customHeaderRules = parseCustomHeaders(rulesString)
-    for (const rule of customHeaderRules) {
-        if (rule.regex.test(filePath)) {
-            baseHeaders[rule.header] = rule.value
-        }
+  if (!rulesString) return baseHeaders;
+  const customHeaderRules = parseCustomHeaders(rulesString);
+  for (const rule of customHeaderRules) {
+    if (rule.regex.test(filePath)) {
+      baseHeaders[rule.header] = rule.value;
     }
-    return baseHeaders
+  }
+  return baseHeaders;
 }
 
 function getMimeType(filePath) {
-    const ext = filePath.split(".").pop().toLowerCase()
-    const mimeTypes = {
-        // Text or code
-        "html": "text/html", "htm": "text/html", "css": "text/css",
-        "js": "text/javascript", "mjs": "text/javascript", "jsx": "text/javascript",
-        "ts": "text/javascript", "tsx": "text/javascript", // Browsers treat TS as text source
-        "json": "application/json", "jsonld": "application/ld+json",
-        "xml": "application/xml", "svg": "image/svg+xml",
-        "txt": "text/plain", "md": "text/markdown", "csv": "text/csv",
+  const ext = filePath.split(".").pop().toLowerCase();
+  const mimeTypes = {
+    // Text or code
+    html: "text/html",
+    htm: "text/html",
+    css: "text/css",
+    js: "text/javascript",
+    mjs: "text/javascript",
+    jsx: "text/javascript",
+    ts: "text/javascript",
+    tsx: "text/javascript", // Browsers treat TS as text source
+    json: "application/json",
+    jsonld: "application/ld+json",
+    xml: "application/xml",
+    svg: "image/svg+xml",
+    txt: "text/plain",
+    md: "text/markdown",
+    csv: "text/csv",
 
-        // Images
-        "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
-        "gif": "image/gif", "webp": "image/webp", "ico": "image/x-icon",
-        "avif": "image/avif", "bmp": "image/bmp",
+    // Images
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    gif: "image/gif",
+    webp: "image/webp",
+    ico: "image/x-icon",
+    avif: "image/avif",
+    bmp: "image/bmp",
 
-        // Fonts
-        "woff": "font/woff", "woff2": "font/woff2",
-        "ttf": "font/ttf", "otf": "font/otf", "eot": "application/vnd.ms-fontobject",
+    // Fonts
+    woff: "font/woff",
+    woff2: "font/woff2",
+    ttf: "font/ttf",
+    otf: "font/otf",
+    eot: "application/vnd.ms-fontobject",
 
-        // Media
-        "mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg", "m4a": "audio/mp4",
-        "mp4": "video/mp4", "webm": "video/webm", "ogv": "video/ogg",
-        "vtt": "text/vtt",
+    // Media
+    mp3: "audio/mpeg",
+    wav: "audio/wav",
+    ogg: "audio/ogg",
+    m4a: "audio/mp4",
+    mp4: "video/mp4",
+    webm: "video/webm",
+    ogv: "video/ogg",
+    vtt: "text/vtt",
 
-        // Binary stuff
-        "wasm": "application/wasm",
-        "pdf": "application/pdf",
-        "zip": "application/zip", "rar": "application/x-rar-compressed",
-        "7z": "application/x-7z-compressed", "tar": "application/x-tar",
-        "gz": "application/gzip",
-        "bin": "application/octet-stream", "dat": "application/octet-stream"
-    }
-    return mimeTypes[ext] || "application/octet-stream"
+    // Binary stuff
+    wasm: "application/wasm",
+    pdf: "application/pdf",
+    zip: "application/zip",
+    rar: "application/x-rar-compressed",
+    "7z": "application/x-7z-compressed",
+    tar: "application/x-tar",
+    gz: "application/gzip",
+    bin: "application/octet-stream",
+    dat: "application/octet-stream",
+  };
+  return mimeTypes[ext] || "application/octet-stream";
 }
 
 // FETCH HANDLER
-self.addEventListener("fetch", e => {
-    const { request, clientId } = e
-    const url = new URL(request.url)
-    if (NETWORK_ALLOWLIST_PREFIXES.some(prefix => url.pathname.startsWith(prefix))) {
-        // Allow pure network request
-        return
-    }
+self.addEventListener("fetch", (e) => {
+  const { request, clientId } = e;
+  const url = new URL(request.url);
+  if (
+    NETWORK_ALLOWLIST_PREFIXES.some((prefix) => url.pathname.startsWith(prefix))
+  ) {
+    // Allow pure network request
+    return;
+  }
 
-    const cleanUrl = url.origin + url.pathname
+  const cleanUrl = url.origin + url.pathname;
 
-    // find virtual folder request
-    let virtualReferrerPath = null
-    if (request.referrer && url.origin === self.location.origin) {
-        try {
-            const refUrl = new URL(request.referrer)
-            if (refUrl.pathname.startsWith(virtualPathPrefix)) {
-                const pathParts = refUrl.pathname.substring(virtualPathPrefix.length).split("/")
-                if (pathParts.length > 0 && pathParts[0]) {
-                    virtualReferrerPath = pathParts[0]
-                }
-            }
-        } catch (err) { }
-    }
-
-    if (virtualReferrerPath && !url.pathname.startsWith(virtualPathPrefix)) {
-        const newVirtualUrl = `${self.location.origin}${virtualPathPrefix}${virtualReferrerPath}${url.pathname}`
-
-        e.respondWith((async () => {
-            // Create a fake request for the virtual path
-            const newReq = new Request(newVirtualUrl, request)
-
-            const response = await generateResponseForVirtualFile(newReq)
-
-            if (response.status !== 404) return response
-            if (FULL_APP_SHELL_URLS.includes(cleanUrl)) {
-                const cache = await caches.match(request)
-                return cache || fetch(request)
-            }
-
-            return response // 404
-        })())
-        return
-    }
-
-    if (FULL_APP_SHELL_URLS.includes(cleanUrl)) {
-        e.respondWith((async () => {
-            const cached = await caches.match(request)
-            return cached || fetch(request)
-        })())
-        return
-    }
-
-    if (url.pathname.startsWith(virtualPathPrefix)) {
-        let session = clientSessionStore.get(clientId)
-        if (!session && pendingNavData) session = pendingNavData
-
-        if (request.mode === "navigate" && pendingNavData) {
-            clientSessionStore.set(clientId, { ...pendingNavData, timestamp: Date.now() })
-            setTimeout(() => { if (pendingNavData === session) pendingNavData = null }, 2000)
-        }
-
-        e.respondWith(generateResponseForVirtualFile(request, session))
-        return
-    }
-
-    e.respondWith(fetch(request))
-})
-
-async function handleEncryptedRequest(opfsRoot, folderName, filePath, key, request) {
+  // find virtual folder request
+  let virtualReferrerPath = null;
+  if (request.referrer && url.origin === self.location.origin) {
     try {
-        const rfs = await opfsRoot.getDirectoryHandle(RFS_PREFIX)
-        const folderHandle = await rfs.getDirectoryHandle(folderName)
+      const refUrl = new URL(request.referrer);
+      if (refUrl.pathname.startsWith(virtualPathPrefix)) {
+        const pathParts = refUrl.pathname
+          .substring(virtualPathPrefix.length)
+          .split("/");
+        if (pathParts.length > 0 && pathParts[0]) {
+          virtualReferrerPath = pathParts[0];
+        }
+      }
+    } catch (err) {}
+  }
 
-        const manifestHandle = await folderHandle.getFileHandle("manifest.enc")
-        const manifestFile = await manifestHandle.getFile()
-        const manifestBuf = await manifestFile.arrayBuffer()
+  if (virtualReferrerPath && !url.pathname.startsWith(virtualPathPrefix)) {
+    const newVirtualUrl = `${self.location.origin}${virtualPathPrefix}${virtualReferrerPath}${url.pathname}`;
 
-        const iv = manifestBuf.slice(16, 28)
-        const encData = manifestBuf.slice(28)
+    e.respondWith(
+      (async () => {
+        // Create a fake request for the virtual path
+        const newReq = new Request(newVirtualUrl, request);
 
-        let manifest
-        try {
-            const dec = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, encData)
-            manifest = JSON.parse(new TextDecoder().decode(dec))
-        } catch (e) { return new Response("Decryption Failed (Bad Password?)", { status: 403 }) }
+        const response = await generateResponseForVirtualFile(newReq);
 
-        const fileMeta = manifest[filePath] || manifest[filePath + "/index.html"]
-        if (!fileMeta) return new Response("File not found (Encrypted)", { status: 404 })
-
-        const rawFileHandle = await getCachedFileHandle(opfsRoot, folderName, "content", fileMeta.id)
-        if (!rawFileHandle) return new Response("File missing!", { status: 404 })
-        const rawFile = await rawFileHandle.getFile()
-
-        const rangeHeader = request.headers.get("Range")
-        const totalSize = fileMeta.size
-
-        let start = 0
-        let end = totalSize - 1
-
-        if (rangeHeader) {
-            const parts = rangeHeader.replace(/bytes=/, "").split("-")
-            start = parseInt(parts[0], 10)
-            if (parts[1]) end = parseInt(parts[1], 10)
+        if (response.status !== 404) return response;
+        if (FULL_APP_SHELL_URLS.includes(cleanUrl)) {
+          const cache = await caches.match(request);
+          return cache || fetch(request);
         }
 
-        if (start >= totalSize) return new Response(null, { status: 416, headers: { "Content-Range": `bytes */${totalSize}` } })
+        return response; // 404
+      })()
+    );
+    return;
+  }
 
-        const startChunk = Math.floor(start / CHUNK_SIZE)
-        const endChunk = Math.floor(end / CHUNK_SIZE)
+  if (FULL_APP_SHELL_URLS.includes(cleanUrl)) {
+    e.respondWith(
+      (async () => {
+        const cached = await caches.match(request);
+        return cached || fetch(request);
+      })()
+    );
+    return;
+  }
 
-        // Create a ReadableStream to stream decrypted chunks
-        const stream = new ReadableStream({
-            async start(controller) {
-                try {
-                    for (let i = startChunk; i <= endChunk; i++) {
-                        const isLast = (i * CHUNK_SIZE + CHUNK_SIZE) >= totalSize
-                        const remainder = totalSize % CHUNK_SIZE
-                        const plainChunkSize = isLast ? (remainder === 0 ? CHUNK_SIZE : remainder) : CHUNK_SIZE
+  if (url.pathname.startsWith(virtualPathPrefix)) {
+    let session = clientSessionStore.get(clientId);
+    if (!session && pendingNavData) session = pendingNavData;
 
-                        const rawOffset = i * (12 + CHUNK_SIZE + 16)
-
-                        const slicedBlob = rawFile.slice(rawOffset, rawOffset + encChunkSize)
-                        const buf = await slicedBlob.arrayBuffer()
-
-                        if (buf.byteLength === 0) break
-
-                        const chunkIv = buf.slice(0, 12)
-                        const chunkCipher = buf.slice(12)
-
-                        const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: chunkIv }, key, chunkCipher)
-
-                        let data = new Uint8Array(plain)
-
-                        if (i === startChunk) chunkStartRel = start % CHUNK_SIZE
-                        if (i === endChunk) chunkEndRel = (end % CHUNK_SIZE) + 1
-                        if (i === endChunk && end % CHUNK_SIZE === 0 && end !== 0) chunkEndRel = data.byteLength // Wrap case?
-
-                        const globalChunkStart = i * CHUNK_SIZE
-                        const sliceA = Math.max(0, start - globalChunkStart)
-                        const sliceB = Math.min(data.byteLength, (end + 1) - globalChunkStart)
-
-                        controller.enqueue(data.slice(sliceA, sliceB))
-                    }
-                    controller.close()
-                } catch (e) {
-                    controller.error(e)
-                }
-            }
-        })
-
-        const headers = {
-            "Content-Type": fileMeta.type || "application/octet-stream",
-            "Content-Length": (end - start) + 1,
-            "Content-Range": `bytes ${start}-${end}/${totalSize}`,
-            "Cache-Control": "no-store",
-            "Accept-Ranges": "bytes"
-        }
-
-        return new Response(stream, { status: 206, headers })
-    } catch (e) {
-        console.error("Encrypted handler error", e)
-        return new Response("Crypto Error", { status: 500 })
+    if (request.mode === "navigate" && pendingNavData) {
+      clientSessionStore.set(clientId, {
+        ...pendingNavData,
+        timestamp: Date.now(),
+      });
+      setTimeout(() => {
+        if (pendingNavData === session) pendingNavData = null;
+      }, 2000);
     }
+
+    e.respondWith(generateResponseForVirtualFile(request, session));
+    return;
+  }
+
+  e.respondWith(fetch(request));
+});
+
+async function handleEncryptedRequest(
+  opfsRoot,
+  folderName,
+  filePath,
+  key,
+  request
+) {
+  try {
+    const rfs = await opfsRoot.getDirectoryHandle(RFS_PREFIX);
+    const folderHandle = await rfs.getDirectoryHandle(folderName);
+
+    const manifestHandle = await folderHandle.getFileHandle("manifest.enc");
+    const manifestFile = await manifestHandle.getFile();
+    const manifestBuf = await manifestFile.arrayBuffer();
+
+    const iv = manifestBuf.slice(16, 28);
+    const encData = manifestBuf.slice(28);
+
+    let manifest;
+    try {
+      const dec = await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv },
+        key,
+        encData
+      );
+      manifest = JSON.parse(new TextDecoder().decode(dec));
+    } catch (e) {
+      return new Response("Decryption Failed (Bad Password?)", { status: 403 });
+    }
+
+    const fileMeta = manifest[filePath] || manifest[filePath + "/index.html"];
+    if (!fileMeta)
+      return new Response("File not found (Encrypted)", { status: 404 });
+
+    const rawFileHandle = await getCachedFileHandle(
+      opfsRoot,
+      folderName,
+      "content",
+      fileMeta.id
+    );
+    if (!rawFileHandle) return new Response("File missing!", { status: 404 });
+    const rawFile = await rawFileHandle.getFile();
+
+    const rangeHeader = request.headers.get("Range");
+    const totalSize = fileMeta.size;
+
+    let start = 0;
+    let end = totalSize - 1;
+
+    if (rangeHeader) {
+      const parts = rangeHeader.replace(/bytes=/, "").split("-");
+      start = parseInt(parts[0], 10);
+      if (parts[1]) end = parseInt(parts[1], 10);
+    }
+
+    if (start >= totalSize)
+      return new Response(null, {
+        status: 416,
+        headers: { "Content-Range": `bytes */${totalSize}` },
+      });
+
+    const startChunk = Math.floor(start / CHUNK_SIZE);
+    const endChunk = Math.floor(end / CHUNK_SIZE);
+
+    // Create a ReadableStream to stream decrypted chunks
+    const stream = new ReadableStream({
+      async start(controller) {
+        try {
+          for (let i = startChunk; i <= endChunk; i++) {
+            const isLast = i * CHUNK_SIZE + CHUNK_SIZE >= totalSize;
+            const remainder = totalSize % CHUNK_SIZE;
+            const plainChunkSize = isLast
+              ? remainder === 0
+                ? CHUNK_SIZE
+                : remainder
+              : CHUNK_SIZE;
+
+            const rawOffset = i * (12 + CHUNK_SIZE + 16);
+
+            const slicedBlob = rawFile.slice(
+              rawOffset,
+              rawOffset + encChunkSize
+            );
+            const buf = await slicedBlob.arrayBuffer();
+
+            if (buf.byteLength === 0) break;
+
+            const chunkIv = buf.slice(0, 12);
+            const chunkCipher = buf.slice(12);
+
+            const plain = await crypto.subtle.decrypt(
+              { name: "AES-GCM", iv: chunkIv },
+              key,
+              chunkCipher
+            );
+
+            let data = new Uint8Array(plain);
+
+            if (i === startChunk) chunkStartRel = start % CHUNK_SIZE;
+            if (i === endChunk) chunkEndRel = (end % CHUNK_SIZE) + 1;
+            if (i === endChunk && end % CHUNK_SIZE === 0 && end !== 0)
+              chunkEndRel = data.byteLength; // Wrap case?
+
+            const globalChunkStart = i * CHUNK_SIZE;
+            const sliceA = Math.max(0, start - globalChunkStart);
+            const sliceB = Math.min(
+              data.byteLength,
+              end + 1 - globalChunkStart
+            );
+
+            controller.enqueue(data.slice(sliceA, sliceB));
+          }
+          controller.close();
+        } catch (e) {
+          controller.error(e);
+        }
+      },
+    });
+
+    const headers = {
+      "Content-Type": fileMeta.type || "application/octet-stream",
+      "Content-Length": end - start + 1,
+      "Content-Range": `bytes ${start}-${end}/${totalSize}`,
+      "Cache-Control": "no-store",
+      "Accept-Ranges": "bytes",
+    };
+
+    return new Response(stream, { status: 206, headers });
+  } catch (e) {
+    console.error("Encrypted handler error", e);
+    return new Response("Crypto Error", { status: 500 });
+  }
 }
 
 async function generateResponseForVirtualFile(request, session) {
-    try {
-        const url = new URL(request.url)
-        const { mode } = request
+  try {
+    const url = new URL(request.url);
+    const { mode } = request;
 
-        const isFirefox = typeof InternalError !== "undefined"
-        if (isFirefox && mode === "navigate" && !url.searchParams.has("boot")) {
-            url.searchParams.set("boot", "1")
-            return new Response(`<!DOCTYPE html><script>location.replace("${url.href}")</script>`, {
-                headers: { "Content-Type": "text/html" }
-            })
+    const isFirefox = typeof InternalError !== "undefined";
+    if (isFirefox && mode === "navigate" && !url.searchParams.has("boot")) {
+      url.searchParams.set("boot", "1");
+      return new Response(
+        `<!DOCTYPE html><script>location.replace("${url.href}")</script>`,
+        {
+          headers: { "Content-Type": "text/html" },
         }
-
-        if ((!session || !Object.keys(session).length) && typeof pendingNavData !== "undefined") {
-            session = pendingNavData
-        }
-        session = session || {}
-
-        const virtualPath = url.pathname.substring(virtualPathPrefix.length)
-        const pathParts = virtualPath.split("/").map(p => decodeURIComponent(p))
-        const folderName = pathParts[0]
-        let relativePath = pathParts.slice(1).join("/")
-
-        if (!relativePath || relativePath.endsWith("/")) relativePath += "index.html"
-
-        let root, registry
-        try {
-            root = await getOpfsRoot()
-            registry = await getRegistry()
-        } catch (e) {
-            return new Response("System error: OPFS inaccessible", { status: 500 })
-        }
-
-        const folderData = registry[folderName] || {}
-
-        async function getFileHandle(dir, name, path) {
-            try {
-                const pathParts = path.split("/").map(p => {
-                    try { return decodeURIComponent(p) } catch (e) { return p }
-                }).filter(p => p && p.trim() !== "")
-
-                const parts = [RFS_PREFIX, name, ...pathParts]
-
-                let curr = dir
-                for (let i = 0; i < parts.length - 1; i++) {
-                    curr = await curr.getDirectoryHandle(parts[i])
-                }
-
-                // Get the final file
-                return await curr.getFileHandle(parts[parts.length - 1])
-            } catch (e) { return null }
-        }
-
-        let handle = await getFileHandle(root, folderName, relativePath)
-
-        // If file not found and this is a navigation (top-level), try falling back to index.html
-        if (!handle && mode === "navigate") {
-            const indexHandle = await getFileHandle(root, folderName, "index.html")
-            if (indexHandle) {
-                handle = indexHandle
-                relativePath = "index.html"
-            }
-        }
-
-        if (!handle) {
-            return new Response("File not found", { status: 404 })
-        }
-
-        const file = await handle.getFile()
-        let totalSize = file.size
-
-        let contentType = file.type
-        if (!contentType || contentType === "application/octet-stream") {
-            contentType = getMimeType(relativePath) || "application/octet-stream"
-        }
-
-        let compiledRules = session.compiledRules
-        if (!compiledRules && folderData.rules) compiledRules = compileRules(folderData.rules)
-
-        const isEncrypted = folderData.encryptionType === "password"
-        const hasRegex = compiledRules && compiledRules.length > 0
-        const needsProcessing = (isEncrypted || hasRegex)
-
-        const baseHeaders = {
-            "Content-Type": contentType,
-            "Cache-Control": "no-store",
-            "Accept-Ranges": "bytes"
-        }
-
-        const finalHeaders = applyCustomHeaders(baseHeaders, relativePath, session.headers || folderData.headers)
-
-        if (!needsProcessing) {
-            const rangeHeader = request.headers.get("Range")
-
-            if (rangeHeader) {
-                const parts = rangeHeader.replace(/bytes=/, "").split("-")
-                const start = parseInt(parts[0], 10)
-                const end = parts[1] ? parseInt(parts[1], 10) : totalSize - 1
-
-                if (start >= totalSize || end >= totalSize) {
-                    return new Response(null, { status: 416, headers: { "Content-Range": `bytes */${totalSize}` } })
-                }
-
-                const chunkSize = (end - start) + 1
-                const slicedBlob = file.slice(start, end + 1)
-
-                finalHeaders["Content-Range"] = `bytes ${start}-${end}/${totalSize}`
-                finalHeaders["Content-Length"] = chunkSize
-
-                return new Response(slicedBlob, { status: 206, headers: finalHeaders })
-            }
-
-            finalHeaders["Content-Length"] = totalSize
-            return new Response(file, { headers: finalHeaders })
-        }
-
-        let buffer = await file.arrayBuffer()
-
-        if (folderData.encryptionType === "password") {
-            if (!session.key) return new Response("Session locked. Reload from Main.", { status: 403 })
-            return await handleEncryptedRequest(root, folderName, relativePath, session.key, request)
-        }
-
-        if (hasRegex) {
-            buffer = applyRegexRules(relativePath, buffer, contentType, compiledRules)
-        }
-
-        const processedSize = buffer.byteLength
-        const rangeHeader = request.headers.get("Range")
-
-        if (rangeHeader) {
-            const parts = rangeHeader.replace(/bytes=/, "").split("-")
-            let start = parseInt(parts[0], 10)
-            let end = parts[1] ? parseInt(parts[1], 10) : processedSize - 1
-
-            if (isNaN(start)) start = 0
-            if (isNaN(end)) end = processedSize - 1
-            if (end >= processedSize) end = processedSize - 1
-
-            if (start >= processedSize) {
-                return new Response(null, { status: 416, headers: { "Content-Range": `bytes */${processedSize}` } })
-            }
-
-            const chunkSize = (end - start) + 1
-            const slicedBuffer = buffer.slice(start, end + 1)
-
-            finalHeaders["Content-Range"] = `bytes ${start}-${end}/${processedSize}`
-            finalHeaders["Content-Length"] = chunkSize
-
-            return new Response(slicedBuffer, { status: 206, headers: finalHeaders })
-        }
-
-        finalHeaders["Content-Length"] = processedSize
-        return new Response(buffer, { headers: finalHeaders })
-
-    } catch (e) {
-        console.error("SW error:", e)
-        return new Response("Internal error", { status: 500 })
+      );
     }
+
+    if (
+      (!session || !Object.keys(session).length) &&
+      typeof pendingNavData !== "undefined"
+    ) {
+      session = pendingNavData;
+    }
+    session = session || {};
+
+    const virtualPath = url.pathname.substring(virtualPathPrefix.length);
+    const pathParts = virtualPath.split("/").map((p) => decodeURIComponent(p));
+    const folderName = pathParts[0];
+    let relativePath = pathParts.slice(1).join("/");
+
+    if (!relativePath || relativePath.endsWith("/"))
+      relativePath += "index.html";
+
+    let root, registry;
+    try {
+      root = await getOpfsRoot();
+      registry = await getRegistry();
+    } catch (e) {
+      return new Response("System error: OPFS inaccessible", { status: 500 });
+    }
+
+    const folderData = registry[folderName] || {};
+
+    async function getFileHandle(dir, name, path) {
+      try {
+        const pathParts = path
+          .split("/")
+          .map((p) => {
+            try {
+              return decodeURIComponent(p);
+            } catch (e) {
+              return p;
+            }
+          })
+          .filter((p) => p && p.trim() !== "");
+
+        const parts = [RFS_PREFIX, name, ...pathParts];
+
+        let curr = dir;
+        for (let i = 0; i < parts.length - 1; i++) {
+          curr = await curr.getDirectoryHandle(parts[i]);
+        }
+
+        // Get the final file
+        return await curr.getFileHandle(parts[parts.length - 1]);
+      } catch (e) {
+        return null;
+      }
+    }
+
+    let handle = await getFileHandle(root, folderName, relativePath);
+
+    // If file not found and this is a navigation (top-level), try falling back to index.html
+    if (!handle && mode === "navigate") {
+      const indexHandle = await getFileHandle(root, folderName, "index.html");
+      if (indexHandle) {
+        handle = indexHandle;
+        relativePath = "index.html";
+      }
+    }
+
+    if (!handle) {
+      return new Response("File not found", { status: 404 });
+    }
+
+    const file = await handle.getFile();
+    let totalSize = file.size;
+
+    let contentType = file.type;
+    if (!contentType || contentType === "application/octet-stream") {
+      contentType = getMimeType(relativePath) || "application/octet-stream";
+    }
+
+    let compiledRules = session.compiledRules;
+    if (!compiledRules && folderData.rules)
+      compiledRules = compileRules(folderData.rules);
+
+    const isEncrypted = folderData.encryptionType === "password";
+    const hasRegex = compiledRules && compiledRules.length > 0;
+    const needsProcessing = isEncrypted || hasRegex;
+
+    const baseHeaders = {
+      "Content-Type": contentType,
+      "Cache-Control": "no-store",
+      "Accept-Ranges": "bytes",
+    };
+
+    const finalHeaders = applyCustomHeaders(
+      baseHeaders,
+      relativePath,
+      session.headers || folderData.headers
+    );
+
+    if (!needsProcessing) {
+      const rangeHeader = request.headers.get("Range");
+
+      if (rangeHeader) {
+        const parts = rangeHeader.replace(/bytes=/, "").split("-");
+        const start = parseInt(parts[0], 10);
+        const end = parts[1] ? parseInt(parts[1], 10) : totalSize - 1;
+
+        if (start >= totalSize || end >= totalSize) {
+          return new Response(null, {
+            status: 416,
+            headers: { "Content-Range": `bytes */${totalSize}` },
+          });
+        }
+
+        const chunkSize = end - start + 1;
+        const slicedBlob = file.slice(start, end + 1);
+
+        finalHeaders["Content-Range"] = `bytes ${start}-${end}/${totalSize}`;
+        finalHeaders["Content-Length"] = chunkSize;
+
+        return new Response(slicedBlob, { status: 206, headers: finalHeaders });
+      }
+
+      finalHeaders["Content-Length"] = totalSize;
+      return new Response(file, { headers: finalHeaders });
+    }
+
+    let buffer = await file.arrayBuffer();
+
+    if (folderData.encryptionType === "password") {
+      if (!session.key)
+        return new Response("Session locked. Reload from Main.", {
+          status: 403,
+        });
+      return await handleEncryptedRequest(
+        root,
+        folderName,
+        relativePath,
+        session.key,
+        request
+      );
+    }
+
+    if (hasRegex) {
+      buffer = applyRegexRules(
+        relativePath,
+        buffer,
+        contentType,
+        compiledRules
+      );
+    }
+
+    const processedSize = buffer.byteLength;
+    const rangeHeader = request.headers.get("Range");
+
+    if (rangeHeader) {
+      const parts = rangeHeader.replace(/bytes=/, "").split("-");
+      let start = parseInt(parts[0], 10);
+      let end = parts[1] ? parseInt(parts[1], 10) : processedSize - 1;
+
+      if (isNaN(start)) start = 0;
+      if (isNaN(end)) end = processedSize - 1;
+      if (end >= processedSize) end = processedSize - 1;
+
+      if (start >= processedSize) {
+        return new Response(null, {
+          status: 416,
+          headers: { "Content-Range": `bytes */${processedSize}` },
+        });
+      }
+
+      const chunkSize = end - start + 1;
+      const slicedBuffer = buffer.slice(start, end + 1);
+
+      finalHeaders["Content-Range"] = `bytes ${start}-${end}/${processedSize}`;
+      finalHeaders["Content-Length"] = chunkSize;
+
+      return new Response(slicedBuffer, { status: 206, headers: finalHeaders });
+    }
+
+    finalHeaders["Content-Length"] = processedSize;
+    return new Response(buffer, { headers: finalHeaders });
+  } catch (e) {
+    console.error("SW error:", e);
+    return new Response("Internal error", { status: 500 });
+  }
 }

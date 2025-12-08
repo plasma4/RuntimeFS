@@ -1,6 +1,6 @@
 # RuntimeFS
 ![RuntimeFS explanation](RuntimeFS.png)
-View the [working demo](https://runtimefs.netlify.app/)!
+View the [working demo](https://plasma4.org/projects/runtimefs/)!
 
 RuntimeFS is a no-nonsense `OPFS` and `ServiceWorker` file-system, served in your browser. It allows you to open HTML projects, use some encryption techniques, and comes with **full offline** and **complete .tar.gz or encrypted data export** functionality that no other tool has!
 

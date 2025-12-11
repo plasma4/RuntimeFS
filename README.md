@@ -9,7 +9,7 @@ Imagine an offline localhost, in your browser with no server-based storage of fi
 After initial page load, RuntimeFS no longer needs internet connection to function.
 RuntimeFS has been tested in Chromium, Firefox, and Safari (although File System API features are Chromium-exclusive).
 
-RuntimeFS utilizes [cbor-x](https://github.com/kriszyp/cbor-x) and my own [LittleExport](https://github.com/plasma4/LittleExport) tool. Both are MIT Licensed. (LittleExport is integrated directly into RuntimeFS; no separate license file is required.) Only `main.min.js` and `sw.js` are required for running.
+RuntimeFS utilizes [cbor-x](https://github.com/kriszyp/cbor-x) and my own [LittleExport](https://github.com/plasma4/LittleExport) tool. Both are MIT Licensed. (LittleExport is integrated directly into RuntimeFS; no separate license file is required.) Only `main.min.js` and `sw.min.js` are required for RuntimeFS to work.
 
 Make sure to modify `APP_SHELL_FILES` in `sw.js` if you are changing the file configuration for proper caching. (Code is minified by using [JSCompress](https://jscompress.com/), which uses `UglifyJS` 3 and `babel-minify`.)
 

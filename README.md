@@ -1,6 +1,6 @@
 # RuntimeFS
 ![RuntimeFS explanation](RuntimeFS.png)
-View the [working demo](https://plasma4.org/projects/runtimefs/)!
+View the [working demo](https://plasma4.org/projects/RuntimeFS/)!
 
 RuntimeFS is a no-nonsense `OPFS` and `ServiceWorker` file-system, served in your browser. It allows you to open HTML projects, use some encryption techniques, and comes with **full offline** and **complete .tar.gz or encrypted data export** functionality that no other tool has!
 
@@ -9,10 +9,13 @@ Imagine an offline localhost, in your browser with no server-based storage of fi
 After initial page load, RuntimeFS no longer needs internet connection to function.
 RuntimeFS has been tested in Chromium, Firefox, and Safari (although File System API features are Chromium-exclusive).
 
-If you are hosting this, you can minify the JavaScript files first with a tool like https://jscompress.com/.
+RuntimeFS utilizes [cbor-x](https://github.com/kriszyp/cbor-x) and my own [LittleExport](https://github.com/plasma4/LittleExport) tool. Both are MIT Licensed. (LittleExport is integrated directly into RuntimeFS; no separate license file is required.) Only `main.min.js` and `sw.js` are required for running.
+
+Make sure to modify `APP_SHELL_FILES` in `sw.js` if you are changing the file configuration for proper caching. (Code is minified by using [JSCompress](https://jscompress.com/), which uses `UglifyJS` 3 and `babel-minify`.)
 
 ## Browser Support
-(Safari has to be version 26.0 or above due to [`createWritable`](https://caniuse.com/mdn-api_filesystemfilehandle_createwritable), although I'm unable to verify if anything else is broken on my device.)
+(Safari has to be version 26.0 or above due to [`createWritable`](https://caniuse.com/mdn-api_filesystemfilehandle_createwritable), although I'm unable to verify if anything else is broken on my device for the newest Safari versions.)
+
 (Firefox has a very specific issue involving initially loading JS scripts in `generateResponseForVirtualFile`, so an automatic reload is performed that injects `?boot=1` to the end of the URL.)
 | Feature | 🟢 Chromium | 🟡 Firefox | 🟡 Safari |
 | :--- | :--- | :--- | :--- |
@@ -20,16 +23,20 @@ If you are hosting this, you can minify the JavaScript files first with a tool l
 | **Encryption (folder-based)** | ✅ Yes | ❌ No | ❌ No |
 | **Export (including encryption)** | ✅ Mostly streamed to disk | ⚠️ RAM only (crashes if too big) | ⚠️ RAM only (crashes if too big) |
 
+## URL Persistence & Location Spoofing
+URL Persistence is an informal term that means that websites store data along with URLs. Examples include the Ruffle emulator (in `localStorage`) and Unity (in `IndexedDB`). If you export data from `example.com/v1/` and try to import it to `example.com/v2/` (or to different domains), it probably won't work.
+
+Because of this problem, you must normalize these URL keys during exporting or importing with a mock location object (and replace `document.URL` if needed). See a **standardized** RuntimeFS location spoofer in [LittleExport](https://github.com/plasma4/LittleExport).
+
 ## Notes
 There are also additional (private) variations of RuntimeFS for site hosters and developers, so do reach out to me on Discord (`@1_e0`) if you need a better implementation, encounter issues, or need clarification!
 
 Not all applications will work! Out of the many sites I tested, there were the main reasons why they broke, even with custom headers:
 - The application requests something externally (this might not always break, but sometimes sites are strict!). ServiceWorkers cannot intercept these anyway.
-- Somewhere in the application, sync AJAX is used. (This type of request is also being phased out from browsers gradually; I've tried getting this working with `Atomics` and web workers but it sadly isn't fixable.)
+- Somewhere in the application, sync AJAX is used. There is sadly no simple workaround. (This type of request is also being phased out from browsers gradually; I've tried getting this working with `Atomics` and web workers but it sadly isn't fixable.)
 - The application isn't compiled yet, such as on a Vite GitHub download.
-- The application requests URLs from root (`/`). The current version has some fixes for this but it's not guaranteed to work for everything (or, custom `<base>` elements might actually interfere). This might be fixable with `<base href="/n/FolderName">`.
-- Literal voodoo magic (one example is [Webleste](https://celeste.r58playz.dev/) breaking in the newest version, but an [older version](https://github.com/plasma4/RuntimeFS/tree/e8ed253071cbc53d446b622aa6426e4f5c525e6b) that uses an IndexedDB architecture mysteriously works (or at least gets further?), greatly appreciated if anyone can figure out why).
-- RuntimeFS's regex and header settings are in localStorage (separate from the RuntimeFS export option) currently.
+- The application requests URLs from root (`/`). The current version has some fetch interception for this, but it's not guaranteed to work for everything (or, custom `<base>` elements might actually interfere). This might be fixable with `<base href="/n/FolderName">`.
+- Literal voodoo magic (one example is [Webleste](https://celeste.r58playz.dev/) breaking, although I somehow had an older version that used IndexedDB that fully worked and I lost??), greatly appreciated if anyone can figure out why. In some cases it may be sufficent to run [LittleExport](http://github.com/plasma4/LittleExport/) to extract necessary data.
 
 > [!WARNING]
 > Folders are **not sandboxed**! Because RuntimeFS serves files from the same origin, uploaded scripts have unrestricted access to local data (including `localStorage`, `IndexedDB`, and `OPFS`).
@@ -48,4 +55,5 @@ A single-file plugin exists for customizing cache in the `plugin` (or requesting
 
 ### TODO
 - Devtools panel (for some cases where Inspect is unavailable, using something like Eruda)
+- LittleExport improvements
 - More complete documentation

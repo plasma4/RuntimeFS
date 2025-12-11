@@ -1,17 +1,18 @@
+const APP_SHELL_FILES = ["./", "./index.html", "./main.min.js", "sw.js"]; // If you're using .php or some other configuration, make sure to change this!
 let pendingNavData = null; // for next navigation request
 const clientSessionStore = new Map();
 const handleCache = new Map();
+const manifestCache = new Map();
 
 const RFS_PREFIX = "rfs";
 const SYSTEM_FILE = "rfs_system.json";
 const CACHE_NAME = "fc";
-const APP_SHELL_FILES = ["./", "./index.html", "./main.js", "./cbor-x.js"]; // If you're using .php for some reason, or are merging cbor-x and main.js into one for compression, make sure to change this!
 const NETWORK_ALLOWLIST_PREFIXES = []; // Allow bypass of VFS if needed
 const FULL_APP_SHELL_URLS = APP_SHELL_FILES.map(
   (file) => new URL(file, self.location.href).href
 );
 
-const STORE_ENTRY_TTL = 30000; // 30 seconds
+const STORE_ENTRY_TTL = 600000; // 10 minutes
 const basePath = new URL("./", self.location).pathname;
 const virtualPathPrefix = basePath + "n/";
 
@@ -207,6 +208,7 @@ self.addEventListener("message", (e) => {
     case "INVALIDATE_CACHE":
       registryCache = null;
       handleCache.clear();
+      manifestCache.clear();
       e.waitUntil(
         (async function () {
           const allClients = await self.clients.matchAll({
@@ -285,6 +287,7 @@ function getMimeType(filePath) {
     css: "text/css",
     js: "text/javascript",
     mjs: "text/javascript",
+    cjs: "text/javascript",
     jsx: "text/javascript",
     ts: "text/javascript",
     tsx: "text/javascript", // Browsers treat TS as text source
@@ -295,6 +298,7 @@ function getMimeType(filePath) {
     txt: "text/plain",
     md: "text/markdown",
     csv: "text/csv",
+    webmanifest: "application/manifest+json",
 
     // Images
     png: "image/png",
@@ -401,6 +405,10 @@ self.addEventListener("fetch", (e) => {
   if (url.pathname.startsWith(virtualPathPrefix)) {
     let session = clientSessionStore.get(clientId);
     if (!session && pendingNavData) session = pendingNavData;
+    if (session) {
+      session.timestamp = Date.now();
+      clientSessionStore.set(clientId, session);
+    }
 
     if (request.mode === "navigate" && pendingNavData) {
       clientSessionStore.set(clientId, {
@@ -427,31 +435,52 @@ async function handleEncryptedRequest(
   request
 ) {
   try {
-    const rfs = await opfsRoot.getDirectoryHandle(RFS_PREFIX);
-    const folderHandle = await rfs.getDirectoryHandle(folderName);
-
-    const manifestHandle = await folderHandle.getFileHandle("manifest.enc");
-    const manifestFile = await manifestHandle.getFile();
-    const manifestBuf = await manifestFile.arrayBuffer();
-
-    const iv = manifestBuf.slice(16, 28);
-    const encData = manifestBuf.slice(28);
+    const CHUNK_SIZE = 1024 * 1024 * 4;
+    const ENCRYPTED_CHUNK_OVERHEAD = 12 + 16; // IV + Tag
 
     let manifest;
-    try {
-      const dec = await crypto.subtle.decrypt(
-        { name: "AES-GCM", iv },
-        key,
-        encData
-      );
-      manifest = JSON.parse(new TextDecoder().decode(dec));
-    } catch (e) {
-      return new Response("Decryption Failed (Bad Password?)", { status: 403 });
+
+    if (manifestCache.has(folderName)) {
+      manifest = manifestCache.get(folderName);
+    } else {
+      const rfs = await opfsRoot.getDirectoryHandle(RFS_PREFIX);
+      const folderHandle = await rfs.getDirectoryHandle(folderName);
+
+      // Decrypt Manifest
+      const manifestHandle = await folderHandle.getFileHandle("manifest.enc");
+      const manifestBuf = await (await manifestHandle.getFile()).arrayBuffer();
+
+      const iv = manifestBuf.slice(16, 28);
+      const encData = manifestBuf.slice(28);
+
+      try {
+        const dec = await crypto.subtle.decrypt(
+          { name: "AES-GCM", iv },
+          key,
+          encData
+        );
+        manifest = JSON.parse(new TextDecoder().decode(dec));
+        manifestCache.set(folderName, manifest);
+      } catch (e) {
+        return new Response("Password Incorrect", { status: 403 });
+      }
     }
 
     const fileMeta = manifest[filePath] || manifest[filePath + "/index.html"];
-    if (!fileMeta)
-      return new Response("File not found (Encrypted)", { status: 404 });
+    if (!fileMeta) return new Response("File not found", { status: 404 });
+
+    const totalSize = fileMeta.size;
+
+    // Handle 0-byte files immediately
+    if (totalSize === 0) {
+      return new Response(new Uint8Array(0), {
+        status: 200,
+        headers: {
+          "Content-Type": fileMeta.type || "application/octet-stream",
+          "Content-Length": "0",
+        },
+      });
+    }
 
     const rawFileHandle = await getCachedFileHandle(
       opfsRoot,
@@ -459,12 +488,9 @@ async function handleEncryptedRequest(
       "content",
       fileMeta.id
     );
-    if (!rawFileHandle) return new Response("File missing!", { status: 404 });
     const rawFile = await rawFileHandle.getFile();
 
     const rangeHeader = request.headers.get("Range");
-    const totalSize = fileMeta.size;
-
     let start = 0;
     let end = totalSize - 1;
 
@@ -480,27 +506,25 @@ async function handleEncryptedRequest(
         headers: { "Content-Range": `bytes */${totalSize}` },
       });
 
-    const startChunk = Math.floor(start / CHUNK_SIZE);
-    const endChunk = Math.floor(end / CHUNK_SIZE);
+    const startChunkIdx = Math.floor(start / CHUNK_SIZE);
+    const endChunkIdx = Math.floor(end / CHUNK_SIZE);
 
-    // Create a ReadableStream to stream decrypted chunks
     const stream = new ReadableStream({
       async start(controller) {
         try {
-          for (let i = startChunk; i <= endChunk; i++) {
-            const isLast = i * CHUNK_SIZE + CHUNK_SIZE >= totalSize;
-            const remainder = totalSize % CHUNK_SIZE;
-            const plainChunkSize = isLast
-              ? remainder === 0
-                ? CHUNK_SIZE
-                : remainder
+          for (let i = startChunkIdx; i <= endChunkIdx; i++) {
+            const isLastChunk = i * CHUNK_SIZE + CHUNK_SIZE >= totalSize;
+            const plainChunkSize = isLastChunk
+              ? totalSize % CHUNK_SIZE || CHUNK_SIZE
               : CHUNK_SIZE;
 
-            const rawOffset = i * (12 + CHUNK_SIZE + 16);
+            // Offset calculation: Previous chunks * (PlainSize + Overhead)
+            const rawOffset = i * (CHUNK_SIZE + ENCRYPTED_CHUNK_OVERHEAD);
+            const encChunkLen = plainChunkSize + ENCRYPTED_CHUNK_OVERHEAD;
 
             const slicedBlob = rawFile.slice(
               rawOffset,
-              rawOffset + encChunkSize
+              rawOffset + encChunkLen
             );
             const buf = await slicedBlob.arrayBuffer();
 
@@ -514,22 +538,20 @@ async function handleEncryptedRequest(
               key,
               chunkCipher
             );
-
-            let data = new Uint8Array(plain);
-
-            if (i === startChunk) chunkStartRel = start % CHUNK_SIZE;
-            if (i === endChunk) chunkEndRel = (end % CHUNK_SIZE) + 1;
-            if (i === endChunk && end % CHUNK_SIZE === 0 && end !== 0)
-              chunkEndRel = data.byteLength; // Wrap case?
+            const data = new Uint8Array(plain);
 
             const globalChunkStart = i * CHUNK_SIZE;
-            const sliceA = Math.max(0, start - globalChunkStart);
-            const sliceB = Math.min(
-              data.byteLength,
-              end + 1 - globalChunkStart
-            );
+            const outputStart = Math.max(start, globalChunkStart);
+            const outputEnd = Math.min(end + 1, globalChunkStart + data.length);
 
-            controller.enqueue(data.slice(sliceA, sliceB));
+            if (outputStart < outputEnd) {
+              controller.enqueue(
+                data.slice(
+                  outputStart - globalChunkStart,
+                  outputEnd - globalChunkStart
+                )
+              );
+            }
           }
           controller.close();
         } catch (e) {
@@ -542,14 +564,13 @@ async function handleEncryptedRequest(
       "Content-Type": fileMeta.type || "application/octet-stream",
       "Content-Length": end - start + 1,
       "Content-Range": `bytes ${start}-${end}/${totalSize}`,
-      "Cache-Control": "no-store",
       "Accept-Ranges": "bytes",
+      "Cache-Control": "no-store",
     };
 
     return new Response(stream, { status: 206, headers });
   } catch (e) {
-    console.error("Encrypted handler error", e);
-    return new Response("Crypto Error", { status: 500 });
+    return new Response("Internal Encryption Error", { status: 500 });
   }
 }
 

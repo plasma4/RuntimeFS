@@ -128,8 +128,7 @@
             alert("An unhandled rejection occurred:\r\n" + errorMessage)
         }
     </script>
-    <script src="cbor-x.js" defer></script>
-    <script src="main.js" defer></script>
+    <script src="main.min.js" defer></script>
 </head>
 
 <body>
@@ -193,7 +192,7 @@
         </legend>
         
         <h3>Regex Replacement</h3>
-        Spaces required; might be slow with very large files.
+        Spaces required; disabled for files over 10MB. File name matching also uses regex.
         <ul>
             <li><code>* | regexHere -> replacement</code> (Global Regex)</li>
             <li><code>file.js $ plain text -> replacement</code> (Global Plain Text)</li>

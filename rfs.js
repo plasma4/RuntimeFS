@@ -1,3 +1,4 @@
+const SW_LINK = "./sw.min.js"; // Change if needed!
 const RFS_PREFIX = "rfs";
 const SYSTEM_FILE = "rfs_system.json";
 const CHUNK_SIZE = 4 * 1024 * 1024;
@@ -29,7 +30,7 @@ navigator.storage
 async function waitForController() {
   if (navigator.serviceWorker.controller)
     return navigator.serviceWorker.controller;
-  await navigator.serviceWorker.register("./sw.js");
+  await navigator.serviceWorker.register(SW_LINK);
   const reg = await navigator.serviceWorker.ready;
   return navigator.serviceWorker.controller || reg.active;
 }
@@ -766,9 +767,6 @@ async function uploadAndEncryptWithPassword() {
   const progressElem = document.getElementById("progress");
   const updateProgress = createProgressThrottle(progressElem);
 
-  // Constants must match sw.js
-  const CHUNK_SIZE = 1024 * 1024 * 4;
-
   try {
     const localDir = await window.showDirectoryPicker({ mode: "read" });
     const root = await getOpfsRoot();
@@ -839,7 +837,7 @@ async function uploadAndEncryptWithPassword() {
 
     await processHandle(localDir, "");
 
-    updateProgress("Saving Manifest...");
+    updateProgress("Saving manifest...");
     const manifestJson = JSON.stringify(manifestData);
     const manifestBuffer = new TextEncoder().encode(manifestJson);
     const manifestIv = crypto.getRandomValues(new Uint8Array(12));
@@ -879,7 +877,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (!("serviceWorker" in navigator)) return;
 
     navigator.serviceWorker
-      .register("./sw.js")
+      .register(SW_LINK)
       .then((reg) => {
         // Check for updates
         reg.addEventListener("updatefound", () => {

@@ -1,6 +1,6 @@
 const RFS_PREFIX = "rfs";
 const SYSTEM_FILE = "rfs_system.json";
-const CHUNK_SIZE = 1024 * 1024 * 4;
+const CHUNK_SIZE = 4 * 1024 * 1024;
 
 let isListingFolders = false;
 let currentlyBusy = false;
@@ -137,10 +137,9 @@ async function processFolderSelection(name, handle) {
 }
 
 async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
-  const password = prompt("Enter password to decrypt this folder:");
+  const password = prompt("Enter the password to decrypt this folder:");
   if (!password) throw new Error("Password required for decryption.");
 
-  // 1. Read and Decrypt Manifest (Binary Format)
   const manifestFile = await manifestHandle.getFile();
   const manifestBuf = await manifestFile.arrayBuffer();
 
@@ -167,7 +166,6 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
   const progressElem = document.getElementById("progress");
   const updateProgress = createProgressThrottle(progressElem);
 
-  // 2. Get handle to content directory
   let contentDir;
   try {
     contentDir = await srcHandle.getDirectoryHandle("content");
@@ -177,9 +175,7 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
     );
   }
 
-  // 3. Iterate manifest and restore files
   // Constants must match uploader
-  const CHUNK_SIZE = 1024 * 1024 * 4;
   const ENCRYPTED_CHUNK_OVERHEAD = 12 + 16; // IV (12) + Tag (16)
 
   const entries = Object.entries(manifestData);
@@ -594,13 +590,14 @@ async function exportData() {
   setUiBusy(true);
   const progressElem = document.getElementById("progress");
   const updateProgress = (msg) => (progressElem.textContent = msg);
+  let password = prompt("Enter a password (or leave blank for no encryption):");
 
   try {
     const registry = await getRegistry();
 
     await LittleExport.exportData({
       fileName: "result",
-      // password: archivePassword, // Uncomment if using encryption transformer
+      password: password,
 
       cookies: document.getElementById("c1").checked,
       localStorage: document.getElementById("c2").checked,

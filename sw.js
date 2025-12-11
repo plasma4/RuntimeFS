@@ -1,4 +1,4 @@
-const APP_SHELL_FILES = ["./", "./index.html", "./main.min.js", "sw.js"]; // If you're using .php or some other configuration, make sure to change this!
+const APP_SHELL_FILES = ["./", "./index.html", "./main.min.js", "sw.min.js"]; // If you're using .php or some other configuration, make sure to change this!
 let pendingNavData = null; // for next navigation request
 const clientSessionStore = new Map();
 const handleCache = new Map();

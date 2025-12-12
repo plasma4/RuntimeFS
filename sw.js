@@ -1,22 +1,22 @@
-const APP_SHELL_FILES = ["./", "./index.html", "./main.min.js", "sw.min.js"]; // If you're using .php or some other configuration, make sure to change this!
-let pendingNavData = null; // for next navigation request
+const APP_SHELL_FILES = ["./", "./index.html", "./main.min.js", "sw.min.js"];
+let pendingNavData = null;
 const clientSessionStore = new Map();
 const handleCache = new Map();
 const manifestCache = new Map();
+const ruleCache = new Map();
 
 const RFS_PREFIX = "rfs";
 const SYSTEM_FILE = "rfs_system.json";
 const CACHE_NAME = "fc";
-const NETWORK_ALLOWLIST_PREFIXES = []; // Allow bypass of VFS if needed
+const NETWORK_ALLOWLIST_PREFIXES = [];
 const FULL_APP_SHELL_URLS = APP_SHELL_FILES.map(
   (file) => new URL(file, self.location.href).href
 );
 
-const STORE_ENTRY_TTL = 600000; // 10 minutes
+const STORE_ENTRY_TTL = 600000;
 const basePath = new URL("./", self.location).pathname;
 const virtualPathPrefix = basePath + "n/";
 
-// Cache for the system.json registry to avoid disk reads on every request
 let registryCache = null;
 
 let _opfsRoot = null;
@@ -42,6 +42,9 @@ function escapeRegex(string) {
 
 function compileRules(rulesString) {
   if (!rulesString || !rulesString.trim()) return [];
+
+  if (ruleCache.has(rulesString)) return ruleCache.get(rulesString);
+
   const compiled = [];
   const lines = rulesString.trim().split(/\r?\n/);
 
@@ -84,11 +87,14 @@ function compileRules(rulesString) {
 
     if (searchRegex) compiled.push({ fileRegex, searchRegex, replacePart });
   }
+
+  if (ruleCache.size > 50) ruleCache.clear();
+  ruleCache.set(rulesString, compiled);
+
   return compiled;
 }
 
 function applyRegexRules(filePath, fileBuffer, fileType, compiledRules) {
-  // Optimization: Don't run regex on binaries or huge files
   if (
     !/^(text\/|application\/(javascript|json|xml|x-javascript|typescript))/.test(
       fileType
@@ -134,7 +140,6 @@ async function getCachedFileHandle(root, folderName, subDir, fileName) {
   if (handleCache.has(cacheKey)) return handleCache.get(cacheKey);
 
   try {
-    // Root -> RFS -> FolderName -> SubDir -> FileName
     const rfs = await root.getDirectoryHandle(RFS_PREFIX);
     const folder = await rfs.getDirectoryHandle(folderName);
     const dir = await folder.getDirectoryHandle(subDir);
@@ -187,10 +192,8 @@ self.addEventListener("message", (e) => {
       const { rules, headers, key } = e.data;
       const compiledRules = compileRules(rules);
 
-      // Set data for pending navigation
       pendingNavData = { rules, compiledRules, headers, key };
 
-      // Set data for current client (if any)
       if (clientId) {
         const s = clientSessionStore.get(clientId) || {};
         s.rules = rules;
@@ -199,7 +202,7 @@ self.addEventListener("message", (e) => {
         if (key) s.key = key;
         clientSessionStore.set(clientId, s);
       }
-      if (e.ports && e.ports[0]) e.ports[0].postMessage("OK"); // any message string works here
+      if (e.ports && e.ports[0]) e.ports[0].postMessage("OK");
       setTimeout(() => {
         if (pendingNavData && pendingNavData.key === key) pendingNavData = null;
       }, 5000);
@@ -281,7 +284,6 @@ function applyCustomHeaders(baseHeaders, filePath, rulesString) {
 function getMimeType(filePath) {
   const ext = filePath.split(".").pop().toLowerCase();
   const mimeTypes = {
-    // Text or code
     html: "text/html",
     htm: "text/html",
     css: "text/css",
@@ -290,7 +292,7 @@ function getMimeType(filePath) {
     cjs: "text/javascript",
     jsx: "text/javascript",
     ts: "text/javascript",
-    tsx: "text/javascript", // Browsers treat TS as text source
+    tsx: "text/javascript",
     json: "application/json",
     jsonld: "application/ld+json",
     xml: "application/xml",
@@ -299,8 +301,6 @@ function getMimeType(filePath) {
     md: "text/markdown",
     csv: "text/csv",
     webmanifest: "application/manifest+json",
-
-    // Images
     png: "image/png",
     jpg: "image/jpeg",
     jpeg: "image/jpeg",
@@ -309,15 +309,11 @@ function getMimeType(filePath) {
     ico: "image/x-icon",
     avif: "image/avif",
     bmp: "image/bmp",
-
-    // Fonts
     woff: "font/woff",
     woff2: "font/woff2",
     ttf: "font/ttf",
     otf: "font/otf",
     eot: "application/vnd.ms-fontobject",
-
-    // Media
     mp3: "audio/mpeg",
     wav: "audio/wav",
     ogg: "audio/ogg",
@@ -326,8 +322,6 @@ function getMimeType(filePath) {
     webm: "video/webm",
     ogv: "video/ogg",
     vtt: "text/vtt",
-
-    // Binary stuff
     wasm: "application/wasm",
     pdf: "application/pdf",
     zip: "application/zip",
@@ -341,20 +335,17 @@ function getMimeType(filePath) {
   return mimeTypes[ext] || "application/octet-stream";
 }
 
-// FETCH HANDLER
 self.addEventListener("fetch", (e) => {
   const { request, clientId } = e;
   const url = new URL(request.url);
   if (
     NETWORK_ALLOWLIST_PREFIXES.some((prefix) => url.pathname.startsWith(prefix))
   ) {
-    // Allow pure network request
     return;
   }
 
   const cleanUrl = url.origin + url.pathname;
 
-  // find virtual folder request
   let virtualReferrerPath = null;
   if (request.referrer && url.origin === self.location.origin) {
     try {
@@ -375,10 +366,8 @@ self.addEventListener("fetch", (e) => {
 
     e.respondWith(
       (async () => {
-        // Create a fake request for the virtual path
         const newReq = new Request(newVirtualUrl, request);
-
-        const response = await generateResponseForVirtualFile(newReq);
+        const response = await generateResponseForVirtualFile(newReq, clientId);
 
         if (response.status !== 404) return response;
         if (FULL_APP_SHELL_URLS.includes(cleanUrl)) {
@@ -386,7 +375,7 @@ self.addEventListener("fetch", (e) => {
           return cache || fetch(request);
         }
 
-        return response; // 404
+        return response;
       })()
     );
     return;
@@ -403,24 +392,7 @@ self.addEventListener("fetch", (e) => {
   }
 
   if (url.pathname.startsWith(virtualPathPrefix)) {
-    let session = clientSessionStore.get(clientId);
-    if (!session && pendingNavData) session = pendingNavData;
-    if (session) {
-      session.timestamp = Date.now();
-      clientSessionStore.set(clientId, session);
-    }
-
-    if (request.mode === "navigate" && pendingNavData) {
-      clientSessionStore.set(clientId, {
-        ...pendingNavData,
-        timestamp: Date.now(),
-      });
-      setTimeout(() => {
-        if (pendingNavData === session) pendingNavData = null;
-      }, 2000);
-    }
-
-    e.respondWith(generateResponseForVirtualFile(request, session));
+    e.respondWith(generateResponseForVirtualFile(request, clientId));
     return;
   }
 
@@ -436,7 +408,7 @@ async function handleEncryptedRequest(
 ) {
   try {
     const CHUNK_SIZE = 1024 * 1024 * 4;
-    const ENCRYPTED_CHUNK_OVERHEAD = 12 + 16; // IV + Tag
+    const ENCRYPTED_CHUNK_OVERHEAD = 12 + 16;
 
     let manifest;
 
@@ -446,7 +418,6 @@ async function handleEncryptedRequest(
       const rfs = await opfsRoot.getDirectoryHandle(RFS_PREFIX);
       const folderHandle = await rfs.getDirectoryHandle(folderName);
 
-      // Decrypt Manifest
       const manifestHandle = await folderHandle.getFileHandle("manifest.enc");
       const manifestBuf = await (await manifestHandle.getFile()).arrayBuffer();
 
@@ -471,7 +442,6 @@ async function handleEncryptedRequest(
 
     const totalSize = fileMeta.size;
 
-    // Handle 0-byte files immediately
     if (totalSize === 0) {
       return new Response(new Uint8Array(0), {
         status: 200,
@@ -518,7 +488,6 @@ async function handleEncryptedRequest(
               ? totalSize % CHUNK_SIZE || CHUNK_SIZE
               : CHUNK_SIZE;
 
-            // Offset calculation: Previous chunks * (PlainSize + Overhead)
             const rawOffset = i * (CHUNK_SIZE + ENCRYPTED_CHUNK_OVERHEAD);
             const encChunkLen = plainChunkSize + ENCRYPTED_CHUNK_OVERHEAD;
 
@@ -574,27 +543,16 @@ async function handleEncryptedRequest(
   }
 }
 
-async function generateResponseForVirtualFile(request, session) {
+async function generateResponseForVirtualFile(request, clientId) {
   try {
     const url = new URL(request.url);
     const { mode } = request;
 
-    const isFirefox = typeof InternalError !== "undefined";
-    if (isFirefox && mode === "navigate" && !url.searchParams.has("boot")) {
-      url.searchParams.set("boot", "1");
-      return new Response(
-        `<!DOCTYPE html><script>location.replace("${url.href}")</script>`,
-        {
-          headers: { "Content-Type": "text/html" },
-        }
-      );
-    }
-
-    if (
-      (!session || !Object.keys(session).length) &&
-      typeof pendingNavData !== "undefined"
-    ) {
-      session = pendingNavData;
+    let session = clientSessionStore.get(clientId);
+    if (!session && pendingNavData) session = pendingNavData;
+    if (session) {
+      session.timestamp = Date.now();
+      clientSessionStore.set(clientId, session);
     }
     session = session || {};
 
@@ -635,8 +593,6 @@ async function generateResponseForVirtualFile(request, session) {
         for (let i = 0; i < parts.length - 1; i++) {
           curr = await curr.getDirectoryHandle(parts[i]);
         }
-
-        // Get the final file
         return await curr.getFileHandle(parts[parts.length - 1]);
       } catch (e) {
         return null;
@@ -645,8 +601,13 @@ async function generateResponseForVirtualFile(request, session) {
 
     let handle = await getFileHandle(root, folderName, relativePath);
 
-    // If file not found and this is a navigation (top-level), try falling back to index.html
-    if (!handle && mode === "navigate") {
+    // Fallback logic for index.html:
+    // If we can't find the file, AND the request is either a top-level nav OR looking for HTML, try index.html
+    const isHtmlRequest =
+      mode === "navigate" ||
+      (request.headers.get("Accept") || "").includes("text/html");
+
+    if (!handle && isHtmlRequest) {
       const indexHandle = await getFileHandle(root, folderName, "index.html");
       if (indexHandle) {
         handle = indexHandle;
@@ -686,6 +647,7 @@ async function generateResponseForVirtualFile(request, session) {
       session.headers || folderData.headers
     );
 
+    // Optimization: Stream direct file if no processing needed
     if (!needsProcessing) {
       const rangeHeader = request.headers.get("Range");
 
@@ -714,6 +676,7 @@ async function generateResponseForVirtualFile(request, session) {
       return new Response(file, { headers: finalHeaders });
     }
 
+    // Processing Path
     let buffer = await file.arrayBuffer();
 
     if (folderData.encryptionType === "password") {
@@ -737,6 +700,20 @@ async function generateResponseForVirtualFile(request, session) {
         contentType,
         compiledRules
       );
+    }
+
+    const isHtml = contentType.includes("html");
+
+    if (isHtml) {
+      const decoder = new TextDecoder();
+      let htmlContent = decoder.decode(buffer);
+      const injection =
+        '<script>navigator.serviceWorker.controller||navigator.serviceWorker.addEventListener("controllerchange",()=>{window.location.reload()});</script>';
+
+      if (htmlContent.includes("</head>")) {
+        htmlContent = htmlContent.replace("</head>", injection + "</head>");
+      }
+      buffer = new TextEncoder().encode(htmlContent).buffer;
     }
 
     const processedSize = buffer.byteLength;

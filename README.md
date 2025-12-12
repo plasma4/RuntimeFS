@@ -6,8 +6,7 @@ RuntimeFS is a no-nonsense `OPFS` and `ServiceWorker` file-system, served in you
 
 Imagine an offline localhost, in your browser with no server-based storage of files. It saves all files and data locally, and can easily be integrated within an existing website too (the code is MIT Licensed, and only around 100KB).
 
-After initial page load, RuntimeFS no longer needs internet connection to function.
-RuntimeFS has been tested in Chromium, Firefox, and Safari (although File System API features are Chromium-exclusive).
+After initial page load, RuntimeFS no longer needs internet connection to function. RuntimeFS also supports in-place opening of files, which doesn't require opening another tab.
 
 RuntimeFS utilizes [cbor-x](https://github.com/kriszyp/cbor-x) and my own [LittleExport](https://github.com/plasma4/LittleExport) tool. Both are MIT Licensed. (LittleExport is integrated directly into RuntimeFS; no separate license file is required.) Only `main.min.js` and `sw.min.js` are required for RuntimeFS to work.
 
@@ -15,6 +14,8 @@ Make sure to modify `APP_SHELL_FILES` in the SW and `SW_LINK` in the main code i
 
 ## Browser Support
 (Safari has to be version 26.0 or above due to [`createWritable`](https://caniuse.com/mdn-api_filesystemfilehandle_createwritable), although I'm unable to verify if anything else is broken on my device for the newest Safari versions.)
+
+File System API features (such as syncing) are Chromium-exclusive. RuntimeFS has been tested in Chromium and Firefox.
 
 (Firefox has a very specific issue involving initially loading JS scripts in `generateResponseForVirtualFile`, so an automatic reload is performed that injects `?boot=1` to the end of the URL.)
 | Feature | 🟢 Chromium | 🟡 Firefox | 🟡 Safari |

@@ -36,9 +36,6 @@
     return true;
   }
 
-  // Helper to recurse objects and extract Blobs for external storage
-  // Returns a promise that resolves to the object with blobs replaced by refs
-  // and populates the externalBlobs array.
   async function prepForCBOR(item, externalBlobs) {
     if (item instanceof Blob) {
       const uuid = crypto.randomUUID();
@@ -66,18 +63,17 @@
   async function restoreFromCBOR(item, tempBlobDir) {
     if (!item || typeof item !== "object") return item;
     if (item.__le_blob_ref) {
-      // Restore blob from temp OPFS
       try {
         const fh = await tempBlobDir.getFileHandle(item.__le_blob_ref);
         const file = await fh.getFile();
-        return new Blob([file], { type: item.type });
+        // Use slice to set the correct MIME type without wrapping the Blob in another Blob
+        return file.slice(0, file.size, item.type);
       } catch (e) {
         console.warn("Missing blob ref:", item.__le_blob_ref);
         return null;
       }
     }
     if (item.__le_blob) {
-      // Legacy support for inline blobs
       return new Blob([item.data], { type: item.type });
     }
     if (Array.isArray(item)) {
@@ -237,7 +233,6 @@
         if (buffer.length === 0) {
           buffer = value;
         } else {
-          // Only concatenate if we absolutely must, usually avoided by higher level logic
           const t = new Uint8Array(buffer.length + value.length);
           t.set(buffer);
           t.set(value, buffer.length);
@@ -399,7 +394,6 @@
           );
       }
 
-      // 1. Storage Metadata
       if (opts.localStorage) {
         const d = {};
         for (let i = 0; i < localStorage.length; i++) {
@@ -426,22 +420,8 @@
         await tar.writeEntry("data/cookies.json", JSON.stringify(c));
       }
 
-      // 2. IDB (Complex) - Prioritize Blobs
-      const pendingIdbBlobs = []; // { uuid, blob }
       if (opts.idb && window.indexedDB && CBOR) {
         const dbs = await window.indexedDB.databases();
-
-        // We need to collect data first to extract blobs, then write blobs, then write CBOR.
-        // To avoid massive RAM usage, we stream write blobs as we find them?
-        // No, TAR is sequential. We must write Blobs BEFORE their references are needed OR
-        // rely on the importer handling out-of-order.
-        // Strategy:
-        // 1. Write Blobs to `data/blobs/uuid`.
-        // 2. Write IDB CBOR to `data/idb/`.
-
-        // However, we discover blobs while iterating IDB.
-        // Correct Stream Flow:
-        // Iterate IDB -> Buffer Batch -> Extract Blobs -> Write Blobs to TAR -> Write CBOR Batch to TAR.
 
         for (const { name, version } of dbs) {
           if (!isAllowed("idb", name, opts) || !opts.dbFilter(name)) continue;
@@ -481,7 +461,6 @@
               CBOR.encode({ name, version, stores })
             );
 
-            // Write Data
             for (const sName of storeNames) {
               logger(`Archiving IDB Store: ${name}/${sName}`);
               let lastKey = null;
@@ -544,7 +523,6 @@
         }
       }
 
-      // 3. Cache Storage
       if (opts.cache && window.caches && CBOR) {
         for (const cacheName of await caches.keys()) {
           if (!isAllowed("cache", cacheName, opts)) continue;
@@ -555,16 +533,6 @@
             if (!res) continue;
             const blob = await res.blob();
             const safeHash = btoa(req.url).slice(0, 50).replace(/\//g, "_");
-            // Cache blobs are usually small-ish, but let's be safe:
-            // We'll write the data inline for now as this structure is simpler,
-            // but in future could be externalized too.
-            // Current strict logic: load to RAM.
-            // To fix RAM spike: use stream? CBOR doesn't support stream input easily.
-            // Mitigation: Skip cache files > 50MB
-            if (blob.size > 50 * 1024 * 1024) {
-              logger(`Skipping large cache item: ${req.url}`);
-              continue;
-            }
 
             await tar.writeEntry(
               `data/cache/${encodeURIComponent(cacheName)}/${safeHash}.cbor`,
@@ -582,7 +550,6 @@
         }
       }
 
-      // 4. OPFS
       if (opts.opfs && navigator.storage) {
         const root = await navigator.storage.getDirectory();
         async function walk(dir, p) {
@@ -591,7 +558,6 @@
             if (!isAllowed("opfs", fp, opts)) continue;
             if (entry.kind === "file") {
               const f = await entry.getFile();
-              // logger(`Archiving OPFS: ${fp}`); // Too spammy
               await tar.writeStream(`opfs/${fp}`, f.size, f.stream());
             } else await walk(entry, fp);
           }
@@ -621,45 +587,118 @@
     }
   }
 
-  async function importData(file, config = {}) {
+  async function importData(arg1, arg2 = {}) {
     const CBOR = window.CBOR;
+
+    let config = arg2;
+    let sourceInput = arg1;
+
+    // Check if first arg is the config object (Object style)
+    if (
+      arg1 &&
+      typeof arg1 === "object" &&
+      !arg1.stream &&
+      !arg1.arrayBuffer &&
+      !arg1.slice &&
+      (arg1.source || arg1.include || arg1.exclude)
+    ) {
+      config = arg1;
+      sourceInput = config.source;
+    }
+
     const opts = { ...config };
     const logger = opts.logger || console.log;
-    const dbCache = {};
-    const rootOpfs = await navigator.storage.getDirectory();
 
-    // Setup temp directory for blobs
-    let tempBlobDir;
     try {
-      tempBlobDir = await rootOpfs.getDirectoryHandle(TEMP_BLOB_DIR, {
-        create: true,
+      let rawStream;
+      if (typeof sourceInput === "string") {
+        // Assume URL (HTTPS link)
+        const response = await fetch(sourceInput);
+        if (!response.ok) {
+          throw new Error(
+            `Failed to fetch source: ${response.status} ${response.statusText}`
+          );
+        }
+        if (!response.body) throw new Error("Source URL returned no data");
+        rawStream = response.body;
+      } else if (sourceInput && typeof sourceInput.stream === "function") {
+        // Blob/file
+        rawStream = sourceInput.stream();
+      } else {
+        throw new Error("Invalid source. Must be a Blob, File, or URL string.");
+      }
+
+      const rawReader = rawStream.getReader();
+      let probeBuffer = new Uint8Array(0);
+
+      // Read at least 8 bytes for signature check
+      while (probeBuffer.length < 8) {
+        const { value, done } = await rawReader.read();
+        if (done) break;
+        const temp = new Uint8Array(probeBuffer.length + value.length);
+        temp.set(probeBuffer);
+        temp.set(value, probeBuffer.length);
+        probeBuffer = temp;
+      }
+
+      // Now reconstruct the stream with the probed bytes prepended
+      const streamWithProbe = new ReadableStream({
+        start(controller) {
+          if (probeBuffer.length > 0) controller.enqueue(probeBuffer);
+        },
+        async pull(controller) {
+          const { value, done } = await rawReader.read();
+          if (done) controller.close();
+          else controller.enqueue(value);
+        },
+        cancel(reason) {
+          rawReader.cancel(reason);
+        },
       });
-    } catch (e) {}
 
-    try {
-      logger("Analyzing file...");
-      const probe = new Uint8Array(await file.slice(0, 8).arrayBuffer());
-      const sig = DEC.decode(probe.slice(0, 6));
+      // Determine the format, setup pipeline
+      const probeHeader = probeBuffer.slice(0, 8);
+      const sig = DEC.decode(probeHeader.slice(0, 6));
       let inputStream;
 
       if (sig === "LE_ENC") {
-        const password = prompt("Enter Password:");
-        if (!password) throw new Error("Password required");
-        inputStream = new DecryptionSource(file.stream(), password)
+        // Encrypted
+        let password = opts.password;
+        if (!password) {
+          password = prompt("Enter the password:");
+        }
+        if (!password)
+          throw new AbortError("Password required to decrypt data.");
+
+        inputStream = new DecryptionSource(streamWithProbe, password)
           .readable()
           .pipeThrough(new DecompressionStream("gzip"));
-      } else if (probe[0] === 0x1f && probe[1] === 0x8b) {
-        inputStream = file
-          .stream()
-          .pipeThrough(new DecompressionStream("gzip"));
+      } else if (probeHeader[0] === 0x1f && probeHeader[1] === 0x8b) {
+        // Standard GZIP
+        inputStream = streamWithProbe.pipeThrough(
+          new DecompressionStream("gzip")
+        );
       } else {
-        inputStream = file.stream();
+        // Plain TAR
+        inputStream = streamWithProbe;
       }
 
       const reader = inputStream.getReader();
+      const rootOpfs = await navigator.storage.getDirectory();
+      const dbCache = {};
+
+      // Temp directory for restoring blobs (IDB references)
+      let tempBlobDir;
+      try {
+        tempBlobDir = await rootOpfs.getDirectoryHandle(TEMP_BLOB_DIR, {
+          create: true,
+        });
+      } catch (e) {}
+
       let buffer = new Uint8Array(0);
       let done = false;
       let totalRead = 0;
+      let lastLog = 0;
 
       async function readMore() {
         const { value, done: d } = await reader.read();
@@ -677,9 +716,7 @@
       }
 
       async function ensure(n) {
-        while (buffer.length < n && !done) {
-          await readMore();
-        }
+        while (buffer.length < n && !done) await readMore();
         return buffer.length >= n;
       }
 
@@ -744,9 +781,6 @@
         }
       }
 
-      const startTime = Date.now();
-      let lastLog = 0;
-
       while (true) {
         const now = Date.now();
         if (now - lastLog > 500) {
@@ -759,8 +793,9 @@
 
         if (!(await ensure(512))) break;
         const header = consume(512);
-        if (header.every((b) => b === 0)) break;
+        if (header.every((b) => b === 0)) break; // End of TAR
 
+        // Parse header
         let name = DEC.decode(header.slice(0, 100)).replace(/\0/g, "").trim();
         const prefix = DEC.decode(header.slice(345, 500))
           .replace(/\0/g, "")
@@ -771,7 +806,6 @@
           .replace(/\0/g, "")
           .trim();
         const size = parseInt(sizeStr, 8);
-
         if (isNaN(size)) {
           logger("Warning: Invalid TAR header found. Stopping.");
           break;
@@ -780,9 +814,9 @@
         const padding = (512 - (size % 512)) % 512;
 
         if (name.startsWith("data/")) {
-          // Metadata
+          // Metadata & Blobs
           if (name.startsWith("data/blobs/")) {
-            // Write blob to temp opfs
+            // Restore Blob to Temp OPFS
             const uuid = name.split("/").pop();
             if (tempBlobDir) {
               const fh = await tempBlobDir.getFileHandle(uuid, {
@@ -794,43 +828,45 @@
               await skip(size);
             }
           } else {
-            // It's likely JSON or CBOR
-            // If it's a huge IDB chunk, reading to memory is a risk.
-            // But CBOR decode needs sync buffer usually.
+            // JSON/CBOR Metadata
             if (size === 0) {
               await skip(padding);
               continue;
             }
+            // Potential bottleneck with memory here
             const d = await readToMemory(size);
 
-            if (name === "data/ls.json")
+            if (name === "data/ls.json") {
               Object.assign(localStorage, JSON.parse(DEC.decode(d)));
-            else if (name === "data/ss.json") {
+            } else if (name === "data/ss.json") {
               const s = JSON.parse(DEC.decode(d));
               for (const k in s) sessionStorage.setItem(k, s[k]);
             } else if (name === "data/cookies.json") {
               const c = JSON.parse(DEC.decode(d));
               for (const k in c)
                 document.cookie = `${k}=${c[k]}; path=/; max-age=31536000`;
-            } else if (name.startsWith("data/custom/") && opts.onCustomItem)
+            } else if (name.startsWith("data/custom/") && opts.onCustomItem) {
               await opts.onCustomItem(name.replace("data/custom/", ""), d);
-            else if (
+            } else if (
               name.startsWith("data/idb/") &&
               CBOR &&
               opts.idb !== false
             ) {
-              // IndexedDB Logic
+              // IndexedDB Restoration
               const parts = name.split("/");
               const dbName = parts[2];
+
               if (name.endsWith("schema.cbor")) {
                 const schema = CBOR.decode(d);
                 if (dbCache[dbName]) dbCache[dbName].close();
+
                 await new Promise((r) => {
                   const q = indexedDB.deleteDatabase(schema.name);
                   q.onsuccess = r;
                   q.onerror = r;
                   q.onblocked = r;
                 });
+
                 await new Promise((res, rej) => {
                   const req = indexedDB.open(schema.name, schema.version);
                   req.onupgradeneeded = (e) => {
@@ -857,13 +893,12 @@
                   req.onerror = rej;
                 });
               } else {
-                // Data chunk
                 const storeName = parts[3];
-                // If restoreFromCBOR needs to access blobs, it needs tempBlobDir
                 const records = await restoreFromCBOR(
                   CBOR.decode(d),
                   tempBlobDir
                 );
+
                 if (!dbCache[dbName]) {
                   dbCache[dbName] = await new Promise((res, rej) => {
                     const r = indexedDB.open(dbName);
@@ -885,14 +920,14 @@
             const cleanName = name.startsWith("opfs/")
               ? name.replace("opfs/", "")
               : name;
-            // logger(`Restoring: ${cleanName}`);
 
             const parts = cleanName.split("/").filter((p) => p.length > 0);
             if (parts.length > 0) {
               const fname = parts.pop();
               let dir = rootOpfs;
-              for (const p of parts)
+              for (const p of parts) {
                 dir = await dir.getDirectoryHandle(p, { create: true });
+              }
 
               const fh = await dir.getFileHandle(fname, { create: true });
               const w = await fh.createWritable();
@@ -908,9 +943,8 @@
         await skip(padding);
       }
 
+      // Cleanup
       Object.values(dbCache).forEach((db) => db.close());
-
-      // Cleanup Temp Blobs
       if (tempBlobDir) {
         try {
           await rootOpfs.removeEntry(TEMP_BLOB_DIR, { recursive: true });
@@ -918,10 +952,11 @@
       }
 
       logger("Import complete!");
+      if (opts.onsuccess) opts.onsuccess();
     } catch (e) {
       logger("Error: " + e.message);
-      console.error(e);
-      throw e;
+      if (opts.onerror) opts.onerror(e);
+      else throw e;
     }
   }
 

@@ -1,4 +1,4 @@
-const SW_LINK = "./sw.min.js";
+const SW_LINK = "./sw.min.js"; // Change if needed!
 const RFS_PREFIX = "rfs";
 const SYSTEM_FILE = "rfs_system.json";
 const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB
@@ -575,17 +575,23 @@ async function openFile(overrideFolderName) {
 async function startImport(file) {
   setUiBusy(true);
   const progressElem = document.getElementById("progress");
+  const TEMP_BLOB_DIR = ".rfs_temp_blobs"; // Must match LittleExport
 
   try {
     const root = await navigator.storage.getDirectory();
 
+    // Safety check before nuking
     try {
       await root.removeEntry(RFS_PREFIX, { recursive: true });
     } catch (e) {}
     try {
       await root.removeEntry(SYSTEM_FILE);
     } catch (e) {}
+    try {
+      await root.removeEntry(TEMP_BLOB_DIR, { recursive: true });
+    } catch (e) {}
 
+    // Yield to main thread to ensure file system operations flush
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     await LittleExport.importData(file, {
@@ -1024,7 +1030,7 @@ async function openFileInPlace() {
   try {
     const registry = await getRegistry();
     const meta = registry[folderName];
-    if (!meta) return setUiBusy(false), alert("Folder not found.");
+    if (!meta) return alert("Folder not found.");
 
     const rules = document.getElementById("regex").value.trim();
     const headers = document.getElementById("headers").value.trim();
@@ -1036,11 +1042,18 @@ async function openFileInPlace() {
     let key = null;
     if (meta.encryptionType === "password") {
       const password = prompt(`Enter password for "${folderName}":`);
-      if (!password) return setUiBusy(false);
+      if (!password) return;
       key = await deriveKeyFromPassword(password, base64ToBuffer(meta.salt));
     }
 
     const sw = await waitForController();
+    if (!navigator.serviceWorker.controller) {
+      alert(
+        "Service Worker is not controlling the page. Please reload and try again."
+      );
+      return;
+    }
+
     await new Promise((resolve) => {
       const channel = new MessageChannel();
       channel.port1.onmessage = () => resolve();
@@ -1054,7 +1067,6 @@ async function openFileInPlace() {
       : "index.html";
     const virtualUrl = `n/${encodeURIComponent(folderName)}/${encodedPath}`;
 
-    // Fix for 404: Ensure we ask for text/html to trigger SW fallback logic
     const resp = await fetch(virtualUrl, {
       headers: { Accept: "text/html" },
     });
@@ -1087,6 +1099,7 @@ async function openFileInPlace() {
     document.close();
   } catch (e) {
     alert("Error opening in-place: " + e.message);
+  } finally {
     setUiBusy(false);
   }
 }

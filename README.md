@@ -50,6 +50,7 @@ Also note:
 - The most likely reason that data export fails when transferring between sites is because those websites use URL properties as part of the key (either from `document.URL` or `location`). You might be able to force a site to use a hardcoded URL for storage with clever regex or code changes.
 - Using regex requires any matched files to be fully loaded into memory, reducing performance. Be careful!
 - Exporting any single files with very large sizes not from OPFS (such as from IndexedDB, or cache storage) might result in crashes.
+- Check `getMimeType` in the ServiceWorker for the supported MIME types; you may need to add your own in some cases.
 - You might encounter freezing of all RuntimeFS-related tabs if any tab is stuck or waiting for something (such as making a IndexedDB writable).
 
 A single-file plugin exists for customizing cache in the `plugin` (or requesting an update), allowing for you to fully customize RuntimeFS from any site hosting it (although **it will clear the cache on hard reload**).

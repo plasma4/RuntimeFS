@@ -281,6 +281,7 @@ function applyCustomHeaders(baseHeaders, filePath, rulesString) {
   return baseHeaders;
 }
 
+// A big ol' list of common mime types. Customize if needed.
 function getMimeType(filePath) {
   const ext = filePath.split(".").pop().toLowerCase();
   const mimeTypes = {
@@ -548,6 +549,18 @@ async function generateResponseForVirtualFile(request, clientId) {
     const url = new URL(request.url);
     const { mode } = request;
 
+    // This forces a specific reload with ?boot=1 to ensure the context is "clean" and controlled for Firefox because Firefox is weird.
+    const isFirefox = typeof InternalError !== "undefined";
+    if (isFirefox && mode === "navigate" && !url.searchParams.has("boot")) {
+      url.searchParams.set("boot", "1");
+      return new Response(
+        `<!DOCTYPE html><script>location.replace("${url.href}");</script>`,
+        {
+          headers: { "Content-Type": "text/html" },
+        }
+      );
+    }
+
     let session = clientSessionStore.get(clientId);
     if (!session && pendingNavData) session = pendingNavData;
     if (session) {
@@ -573,7 +586,6 @@ async function generateResponseForVirtualFile(request, clientId) {
     }
 
     const folderData = registry[folderName] || {};
-
     async function getFileHandle(dir, name, path) {
       try {
         const pathParts = path
@@ -601,8 +613,7 @@ async function generateResponseForVirtualFile(request, clientId) {
 
     let handle = await getFileHandle(root, folderName, relativePath);
 
-    // Fallback logic for index.html:
-    // If we can't find the file, AND the request is either a top-level nav OR looking for HTML, try index.html
+    // Fallback to index.html
     const isHtmlRequest =
       mode === "navigate" ||
       (request.headers.get("Accept") || "").includes("text/html");
@@ -647,7 +658,7 @@ async function generateResponseForVirtualFile(request, clientId) {
       session.headers || folderData.headers
     );
 
-    // Optimization: Stream direct file if no processing needed
+    // Stream directly
     if (!needsProcessing) {
       const rangeHeader = request.headers.get("Range");
 

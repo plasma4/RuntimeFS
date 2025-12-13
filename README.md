@@ -8,9 +8,15 @@ Imagine an offline localhost, in your browser with no server-based storage of fi
 
 After initial page load, RuntimeFS no longer needs internet connection to function. RuntimeFS also supports in-place opening of files, which doesn't require opening another tab.
 
+## Setup
 RuntimeFS utilizes [cbor-x](https://github.com/kriszyp/cbor-x) and my own [LittleExport](https://github.com/plasma4/LittleExport) tool. Both are MIT Licensed. (LittleExport is integrated directly into RuntimeFS; no separate license file is required.) Only `main.min.js` and `sw.min.js` are required for RuntimeFS to work.
 
 Make sure to modify `APP_SHELL_FILES` in the SW and `SW_LINK` in the main code if you are changing the file configuration for proper caching. (Code is minified by using [JSCompress](https://jscompress.com/), which uses `UglifyJS` 3 and `babel-minify`.)
+
+## Usage
+You can use Enter on text inputs to perform actions, instead of clicking buttons. On the Folder to Open section text inputs you can use Shift+Enter to open in-place and Ctrl/Cmd+Enter to sync and open.
+
+Custom regex and headers save on reload and export but do not affect stored files, and only work when opening the file (in-place or new tab) from the RuntimeFS menu (reloading or navigating to the URL directly do not yet).
 
 ## Browser Support
 (Safari has to be version 26.0 or above due to [`createWritable`](https://caniuse.com/mdn-api_filesystemfilehandle_createwritable), although I'm unable to verify if anything else is broken on my device for the newest Safari versions.)
@@ -37,7 +43,6 @@ Not all applications will work! Out of the many sites I tested, there were the m
 - Somewhere in the application, sync AJAX is used. There is sadly no simple workaround. (This type of request is also being phased out from browsers gradually; I've tried getting this working with `Atomics` and web workers but it sadly isn't fixable.)
 - The application isn't compiled yet, such as on a Vite GitHub download.
 - The application requests URLs from root (`/`). The current version has some fetch interception for this, but it's not guaranteed to work for everything (or, custom `<base>` elements might actually interfere). This might be fixable with `<base href="/n/FolderName">`.
-- Literal voodoo magic (one example is [Webleste](https://celeste.r58playz.dev/) breaking, although I somehow had an older version that used IndexedDB that fully worked and I lost??), greatly appreciated if anyone can figure out why. In some cases it may be sufficent to run [LittleExport](http://github.com/plasma4/LittleExport/) to extract necessary data.
 
 > [!WARNING]
 > Folders are **not sandboxed**! Because RuntimeFS serves files from the same origin, uploaded scripts have unrestricted access to local data (including `localStorage`, `IndexedDB`, and `OPFS`).

@@ -711,7 +711,7 @@ async function uploadFolderFallback(event) {
 }
 
 async function syncFiles() {
-  if (!folderName || !dirHandle) return alert("Upload a folder first.");
+  if (!folderName || !dirHandle) return alert("Upload a folder to sync changes (not always supported).");
   setUiBusy(true);
   if (changes.length > 0) {
     await performSyncToOpfs();
@@ -723,7 +723,7 @@ async function syncFiles() {
 }
 
 async function syncAndOpenFile() {
-  if (!folderName || !dirHandle) return alert("Upload a folder first.");
+  if (!folderName || !dirHandle) return alert("Upload a folder to sync changes (not always supported).");
   setUiBusy(true);
   if (changes.length > 0) await performSyncToOpfs();
   openFile(folderName);
@@ -923,30 +923,40 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
-  document
-    .getElementById("folderName")
-    .addEventListener(
-      "keydown",
-      (e) => e.key === "Enter" && !currentlyBusy && uploadFolder()
-    );
-  document
-    .getElementById("openFolderName")
-    .addEventListener(
-      "keydown",
-      (e) => e.key === "Enter" && !currentlyBusy && openFile()
-    );
-  document
-    .getElementById("fileName")
-    .addEventListener(
-      "keydown",
-      (e) => e.key === "Enter" && !currentlyBusy && openFile()
-    );
+  document.getElementById("folderName").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !currentlyBusy) {
+      uploadFolder();
+    }
+  });
+  document.getElementById("openFolderName").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !currentlyBusy) {
+      if (e.shiftKey) {
+        openFileInPlace();
+      } else if (e.ctrlKey || e.metaKey) {
+        syncAndOpenFile();
+      } else {
+        openFile();
+      }
+    }
+  });
+  document.getElementById("fileName").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !currentlyBusy) {
+      if (e.shiftKey) {
+        openFileInPlace();
+      } else if (e.ctrlKey || e.metaKey) {
+        syncAndOpenFile();
+      } else {
+        openFile();
+      }
+    }
+  });
   document
     .getElementById("deleteFolderName")
-    .addEventListener(
-      "keydown",
-      (e) => e.key === "Enter" && !currentlyBusy && deleteFolder()
-    );
+    .addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !currentlyBusy) {
+        deleteFolder();
+      }
+    });
   document
     .getElementById("folderUploadFallbackInput")
     .addEventListener("change", uploadFolderFallback);

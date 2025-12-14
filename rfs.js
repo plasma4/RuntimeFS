@@ -711,7 +711,8 @@ async function uploadFolderFallback(event) {
 }
 
 async function syncFiles() {
-  if (!folderName || !dirHandle) return alert("Upload a folder to sync changes (not always supported).");
+  if (!folderName || !dirHandle)
+    return alert("Upload a folder to sync changes (not always supported).");
   setUiBusy(true);
   if (changes.length > 0) {
     await performSyncToOpfs();
@@ -723,7 +724,8 @@ async function syncFiles() {
 }
 
 async function syncAndOpenFile() {
-  if (!folderName || !dirHandle) return alert("Upload a folder to sync changes (not always supported).");
+  if (!folderName || !dirHandle)
+    return alert("Upload a folder to sync changes (not always supported).");
   setUiBusy(true);
   if (changes.length > 0) await performSyncToOpfs();
   openFile(folderName);
@@ -1090,18 +1092,28 @@ async function openFileInPlace() {
     const basePath = virtualUrl.substring(0, virtualUrl.lastIndexOf("/") + 1);
     const baseTag = `<base href="${basePath}">`;
 
+    let metaTags = "";
+    resp.headers.forEach((val, name) => {
+      if (name.toLowerCase() === "content-security-policy") {
+        metaTags += `<meta http-equiv="Content-Security-Policy" content="${val.replace(
+          /"/g,
+          "&quot;"
+        )}">\n`;
+      }
+    });
+
     const headRegex = /(<head\b[^>]*>)/i;
     const docTypeRegex = /(<!DOCTYPE\b[^>]*>)/i;
     const htmlRegex = /(<html\b[^>]*>)/i;
 
     if (headRegex.test(html)) {
-      html = html.replace(headRegex, `$1${baseTag}`);
+      html = html.replace(headRegex, `$1${baseTag}${metaTags}`);
     } else if (docTypeRegex.test(html)) {
-      html = html.replace(docTypeRegex, `$1<head>${baseTag}</head>`);
+      html = html.replace(docTypeRegex, `$1<head>${baseTag}${metaTags}</head>`);
     } else if (htmlRegex.test(html)) {
-      html = html.replace(htmlRegex, `$1<head>${baseTag}</head>`);
+      html = html.replace(htmlRegex, `$1<head>${baseTag}${metaTags}</head>`);
     } else {
-      html = `<head>${baseTag}</head>${html}`;
+      html = `<head>${baseTag}${metaTags}</head>${html}`;
     }
 
     document.open();

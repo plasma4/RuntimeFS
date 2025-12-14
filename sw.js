@@ -17,8 +17,62 @@ const STORE_ENTRY_TTL = 600000;
 const basePath = new URL("./", self.location).pathname;
 const virtualPathPrefix = basePath + "n/";
 
-let registryCache = null;
+// A big ol' list of common mime types. Customize if needed.
+function getMimeType(filePath) {
+  const ext = filePath.split(".").pop().toLowerCase();
+  const mimeTypes = {
+    html: "text/html",
+    htm: "text/html",
+    css: "text/css",
+    js: "text/javascript",
+    mjs: "text/javascript",
+    cjs: "text/javascript",
+    jsx: "text/javascript",
+    ts: "text/javascript",
+    tsx: "text/javascript",
+    json: "application/json",
+    jsonld: "application/ld+json",
+    xml: "application/xml",
+    svg: "image/svg+xml",
+    txt: "text/plain",
+    md: "text/markdown",
+    csv: "text/csv",
+    webmanifest: "application/manifest+json",
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    gif: "image/gif",
+    webp: "image/webp",
+    ico: "image/x-icon",
+    avif: "image/avif",
+    bmp: "image/bmp",
+    woff: "font/woff",
+    woff2: "font/woff2",
+    ttf: "font/ttf",
+    otf: "font/otf",
+    eot: "application/vnd.ms-fontobject",
+    mp3: "audio/mpeg",
+    wav: "audio/wav",
+    ogg: "audio/ogg",
+    m4a: "audio/mp4",
+    mp4: "video/mp4",
+    webm: "video/webm",
+    ogv: "video/ogg",
+    vtt: "text/vtt",
+    wasm: "application/wasm",
+    pdf: "application/pdf",
+    zip: "application/zip",
+    rar: "application/x-rar-compressed",
+    "7z": "application/x-7z-compressed",
+    tar: "application/x-tar",
+    gz: "application/gzip",
+    bin: "application/octet-stream",
+    dat: "application/octet-stream",
+  };
+  return mimeTypes[ext] || "application/octet-stream";
+}
 
+let registryCache = null;
 let _opfsRoot = null;
 async function getOpfsRoot() {
   if (!_opfsRoot) _opfsRoot = await navigator.storage.getDirectory();
@@ -61,9 +115,15 @@ function compileRules(rulesString) {
     if (!operatorMatch) continue;
 
     const [, fileMatch, operator, searchPattern] = operatorMatch;
-    const fileRegex = new RegExp(
-      fileMatch.trim() === "*" ? ".*" : fileMatch.trim()
-    );
+
+    let fileRegex;
+    try {
+      fileRegex = new RegExp(
+        fileMatch.trim() === "*" ? ".*" : fileMatch.trim()
+      );
+    } catch (e) {
+      continue;
+    }
 
     let searchRegex;
     try {
@@ -85,7 +145,8 @@ function compileRules(rulesString) {
       continue;
     }
 
-    if (searchRegex) compiled.push({ fileRegex, searchRegex, replacePart });
+    if (searchRegex && fileRegex)
+      compiled.push({ fileRegex, searchRegex, replacePart });
   }
 
   if (ruleCache.size > 50) ruleCache.clear();
@@ -281,61 +342,6 @@ function applyCustomHeaders(baseHeaders, filePath, rulesString) {
   return baseHeaders;
 }
 
-// A big ol' list of common mime types. Customize if needed.
-function getMimeType(filePath) {
-  const ext = filePath.split(".").pop().toLowerCase();
-  const mimeTypes = {
-    html: "text/html",
-    htm: "text/html",
-    css: "text/css",
-    js: "text/javascript",
-    mjs: "text/javascript",
-    cjs: "text/javascript",
-    jsx: "text/javascript",
-    ts: "text/javascript",
-    tsx: "text/javascript",
-    json: "application/json",
-    jsonld: "application/ld+json",
-    xml: "application/xml",
-    svg: "image/svg+xml",
-    txt: "text/plain",
-    md: "text/markdown",
-    csv: "text/csv",
-    webmanifest: "application/manifest+json",
-    png: "image/png",
-    jpg: "image/jpeg",
-    jpeg: "image/jpeg",
-    gif: "image/gif",
-    webp: "image/webp",
-    ico: "image/x-icon",
-    avif: "image/avif",
-    bmp: "image/bmp",
-    woff: "font/woff",
-    woff2: "font/woff2",
-    ttf: "font/ttf",
-    otf: "font/otf",
-    eot: "application/vnd.ms-fontobject",
-    mp3: "audio/mpeg",
-    wav: "audio/wav",
-    ogg: "audio/ogg",
-    m4a: "audio/mp4",
-    mp4: "video/mp4",
-    webm: "video/webm",
-    ogv: "video/ogg",
-    vtt: "text/vtt",
-    wasm: "application/wasm",
-    pdf: "application/pdf",
-    zip: "application/zip",
-    rar: "application/x-rar-compressed",
-    "7z": "application/x-7z-compressed",
-    tar: "application/x-tar",
-    gz: "application/gzip",
-    bin: "application/octet-stream",
-    dat: "application/octet-stream",
-  };
-  return mimeTypes[ext] || "application/octet-stream";
-}
-
 self.addEventListener("fetch", (e) => {
   const { request, clientId } = e;
   const url = new URL(request.url);
@@ -469,6 +475,10 @@ async function handleEncryptedRequest(
       const parts = rangeHeader.replace(/bytes=/, "").split("-");
       start = parseInt(parts[0], 10);
       if (parts[1]) end = parseInt(parts[1], 10);
+
+      if (isNaN(start)) start = 0;
+      if (isNaN(end)) end = totalSize - 1;
+      if (end >= totalSize) end = totalSize - 1;
     }
 
     if (start >= totalSize)
@@ -687,9 +697,7 @@ async function generateResponseForVirtualFile(request, clientId) {
       return new Response(file, { headers: finalHeaders });
     }
 
-    // Processing Path
     let buffer = await file.arrayBuffer();
-
     if (folderData.encryptionType === "password") {
       if (!session.key)
         return new Response("Session locked. Reload from Main.", {

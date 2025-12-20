@@ -23,7 +23,7 @@ Custom regex and headers save on reload and export but do not affect stored file
 
 File System API features (such as syncing) are Chromium-exclusive. RuntimeFS has been tested in Chromium and Firefox.
 
-(Firefox has a very specific issue involving initially loading JS scripts in `generateResponseForVirtualFile`, so an automatic reload is performed that injects `?boot=1` to the end of the URL.)
+(Firefox has a very specific issue involving initially loading JS scripts in `generateResponseForVirtualFile`, so an automatic reload is performed that injects `?boot=1` to the end of the URL. This also means that headers won't work.)
 | Feature | 🟢 Chromium | 🟡 Firefox | 🟡 Safari |
 | :--- | :--- | :--- | :--- |
 | **Folder Upload** | ✅ Yes | ⚠️ `<input>` fallback, no sync | ⚠️ `<input>` fallback, no sync |
@@ -52,6 +52,8 @@ Not all applications will work! Out of the many sites I tested, there were the m
 Also note:
 - File names are case-sensitive.
 - Using the tool in Incognito will probably fail due to restrictions on memory or ServiceWorkers (browser dependent).
+- Headers currently **do not work** for in-place opening and Firefox.
+- Cookie exporting does not store `max-age`; only the key and value.
 - The most likely reason that data export fails when transferring between sites is because those websites use URL properties as part of the key (either from `document.URL` or `location`). You might be able to force a site to use a hardcoded URL for storage with clever regex or code changes.
 - Using regex requires any matched files to be fully loaded into memory, reducing performance. Be careful!
 - Exporting any single files with very large sizes not from OPFS (such as from IndexedDB, or cache storage) might result in crashes.

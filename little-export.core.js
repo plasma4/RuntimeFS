@@ -357,27 +357,38 @@
       });
     }
 
-    let targetStream = outputStream;
+    // Byte counting for progress
+    let outputBytesWritten = 0;
+    const countingStream = new TransformStream({
+      transform(chunk, controller) {
+        outputBytesWritten += chunk.byteLength;
+        controller.enqueue(chunk);
+      },
+    });
+
+    // Pipe the counter to the final output
+    const counterPromise = countingStream.readable.pipeTo(outputStream);
+    let targetWritable = countingStream.writable;
+
     if (opts.password) {
       logger("Encrypting...");
       const salt = crypto.getRandomValues(new Uint8Array(16));
       const encStream = new TransformStream(
         new EncryptionTransformer(opts.password, salt)
       );
-      encStream.readable.pipeTo(targetStream);
-      targetStream = encStream.writable;
+      encStream.readable.pipeTo(targetWritable);
+      targetWritable = encStream.writable;
     }
 
     const gzip = new CompressionStream("gzip");
-    gzip.readable.pipeTo(targetStream);
+    gzip.readable.pipeTo(targetWritable);
     const tar = new TarWriter(gzip.writable);
-
-    // Initial progress reporter
     const reportProgress = () => {
-      const mb = (tar.bytesWritten / 1024 / 1024).toFixed(2);
-      logger(`Exporting... ${mb} MB written`);
+      logger(
+        `Exporting... (${(outputBytesWritten / 1024 / 1024).toFixed(2)} MB)`
+      );
     };
-    const progressInterval = setInterval(reportProgress, 500);
+    const progressInterval = setInterval(reportProgress, 250);
 
     try {
       for (const item of opts.customItems) {
@@ -403,6 +414,7 @@
         }
         await tar.writeEntry("data/ls.json", JSON.stringify(d));
       }
+
       if (opts.session) {
         const d = {};
         for (let i = 0; i < sessionStorage.length; i++) {
@@ -411,6 +423,7 @@
         }
         await tar.writeEntry("data/ss.json", JSON.stringify(d));
       }
+
       if (opts.cookies) {
         const c = document.cookie.split(";").reduce((acc, v) => {
           const [key, val] = v.split("=").map((s) => s.trim());
@@ -422,7 +435,6 @@
 
       if (opts.idb && window.indexedDB && CBOR) {
         const dbs = await window.indexedDB.databases();
-
         for (const { name, version } of dbs) {
           if (!isAllowed("idb", name, opts) || !opts.dbFilter(name)) continue;
           logger(`Scanning IDB: ${name}`);
@@ -436,7 +448,6 @@
 
           const storeNames = Array.from(db.objectStoreNames);
           if (storeNames.length > 0) {
-            // Write Schema
             const stores = [];
             const tx = db.transaction(storeNames, "readonly");
             for (const sName of storeNames) {
@@ -461,14 +472,20 @@
               CBOR.encode({ name, version, stores })
             );
 
+            // IDB Iteration with Yielding
+            let lastYield = performance.now();
             for (const sName of storeNames) {
-              logger(`Archiving IDB Store: ${name}/${sName}`);
+              logger(`Archiving IDB: ${name}/${sName}`);
               let lastKey = null;
               let chunkId = 0;
               let hasMore = true;
 
               while (hasMore) {
-                await new Promise((r) => setTimeout(r, 0)); // yield
+                if (performance.now() - lastYield > 100) {
+                  await new Promise((r) => setTimeout(r, 0));
+                  lastYield = performance.now();
+                }
+
                 const batch = await new Promise((res, rej) => {
                   const t = db.transaction(sName, "readonly");
                   const s = t.objectStore(sName);
@@ -482,7 +499,7 @@
                     const c = e.target.result;
                     if (c) {
                       items.push({ k: c.key, v: c.value });
-                      if (items.length < 50) c.continue();
+                      if (items.length < 200) c.continue();
                       else res(items);
                     } else res(items);
                   };
@@ -493,13 +510,10 @@
                   lastKey = batch[batch.length - 1].k;
                   const encBatch = [];
                   const blobsInBatch = [];
-
                   for (const item of batch) {
                     const val = await prepForCBOR(item.v, blobsInBatch);
                     encBatch.push({ k: item.k, v: val });
                   }
-
-                  // Write discovered blobs immediately
                   for (const b of blobsInBatch) {
                     await tar.writeStream(
                       `data/blobs/${b.uuid}`,
@@ -507,8 +521,6 @@
                       b.blob.stream()
                     );
                   }
-
-                  // Write CBOR chunk
                   await tar.writeEntry(
                     `data/idb/${name}/${sName}/${chunkId++}.cbor`,
                     CBOR.encode(encBatch)
@@ -533,7 +545,6 @@
             if (!res) continue;
             const blob = await res.blob();
             const safeHash = btoa(req.url).slice(0, 50).replace(/\//g, "_");
-
             await tar.writeEntry(
               `data/cache/${encodeURIComponent(cacheName)}/${safeHash}.cbor`,
               CBOR.encode({
@@ -566,6 +577,8 @@
       }
 
       await tar.close();
+      await counterPromise; // Ensure all bytes are flushed to the output
+
       if (downloadUrl) {
         const a = document.createElement("a");
         a.href = downloadUrl;
@@ -575,12 +588,13 @@
         a.click();
         setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
       }
+      reportProgress();
       logger("Export complete!");
     } catch (e) {
       logger("Export error: " + e.message);
       console.error(e);
       try {
-        await targetStream.abort(e);
+        await targetWritable.abort(e);
       } catch (z) {}
     } finally {
       clearInterval(progressInterval);
@@ -782,10 +796,9 @@
       }
 
       while (true) {
-        const now = Date.now();
-        if (now - lastLog > 500) {
+        if (now - lastLog > 100) {
           logger(
-            `Importing... ${(totalRead / 1024 / 1024).toFixed(2)} MB read`
+            `Importing... (${(totalRead / 1024 / 1024).toFixed(2)} MB read)`
           );
           lastLog = now;
           await new Promise((r) => setTimeout(r, 0));
@@ -816,7 +829,7 @@
         if (name.startsWith("data/")) {
           // Metadata & Blobs
           if (name.startsWith("data/blobs/")) {
-            // Restore Blob to Temp OPFS
+            // Restore Blob to temp OPFS
             const uuid = name.split("/").pop();
             if (tempBlobDir) {
               const fh = await tempBlobDir.getFileHandle(uuid, {
@@ -828,7 +841,7 @@
               await skip(size);
             }
           } else {
-            // JSON/CBOR Metadata
+            // JSON/CBOR metadata for simpler data
             if (size === 0) {
               await skip(padding);
               continue;

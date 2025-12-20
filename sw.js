@@ -250,10 +250,17 @@ self.addEventListener("message", (e) => {
 
   switch (e.data.type) {
     case "SET_RULES":
-      const { rules, headers, key } = e.data;
+      const { rules, headers, key, folderName } = e.data;
       const compiledRules = compileRules(rules);
 
-      pendingNavData = { rules, compiledRules, headers, key };
+      if (!pendingNavData) pendingNavData = {};
+      pendingNavData[folderName] = {
+        rules,
+        compiledRules,
+        headers,
+        key,
+        timestamp: Date.now(),
+      };
 
       if (clientId) {
         const s = clientSessionStore.get(clientId) || {};
@@ -264,9 +271,14 @@ self.addEventListener("message", (e) => {
         clientSessionStore.set(clientId, s);
       }
       if (e.ports && e.ports[0]) e.ports[0].postMessage("OK");
+
       setTimeout(() => {
-        if (pendingNavData && pendingNavData.key === key) pendingNavData = null;
-      }, 5000);
+        if (pendingNavData && pendingNavData[folderName]) {
+          if (Date.now() - pendingNavData[folderName].timestamp > 5000) {
+            delete pendingNavData[folderName];
+          }
+        }
+      }, 6000);
       break;
 
     case "INVALIDATE_CACHE":
@@ -571,17 +583,21 @@ async function generateResponseForVirtualFile(request, clientId) {
       );
     }
 
+    const virtualPath = url.pathname.substring(virtualPathPrefix.length);
+    const pathParts = virtualPath.split("/").map((p) => decodeURIComponent(p));
+    const folderName = pathParts[0];
+
     let session = clientSessionStore.get(clientId);
-    if (!session && pendingNavData) session = pendingNavData;
+    if (!session && pendingNavData && pendingNavData[folderName]) {
+      session = pendingNavData[folderName];
+    }
+
     if (session) {
       session.timestamp = Date.now();
       clientSessionStore.set(clientId, session);
     }
     session = session || {};
 
-    const virtualPath = url.pathname.substring(virtualPathPrefix.length);
-    const pathParts = virtualPath.split("/").map((p) => decodeURIComponent(p));
-    const folderName = pathParts[0];
     let relativePath = pathParts.slice(1).join("/");
 
     if (!relativePath || relativePath.endsWith("/"))

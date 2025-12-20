@@ -21,12 +21,30 @@ function setUiBusy(isBusy) {
   );
 }
 
+function createProgressLogger(domElement) {
+  let lastUpdate = 0;
+  return async (msg, force = false) => {
+    const now = Date.now();
+    if (force || now - lastUpdate > 50) {
+      if (domElement) domElement.textContent = msg;
+      lastUpdate = now;
+      // Yield to main thread to allow UI paint
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  };
+}
+
+window.addEventListener("beforeunload", function checkUnsavedChanges(event) {
+  if (currentlyBusy) {
+    return "Changes you made may not be saved.";
+  }
+});
+
 const yieldToMain = () => new Promise((r) => setTimeout(r, 0));
 
 async function pumpStream(reader, writer, totalSize, onProgress) {
   let processed = 0;
-  const startTime = Date.now();
-  let lastYield = startTime;
+  let lastLogTime = 0;
 
   try {
     while (true) {
@@ -37,12 +55,14 @@ async function pumpStream(reader, writer, totalSize, onProgress) {
       processed += value.length;
 
       const now = Date.now();
-      if (onProgress && now - lastYield > 100) {
-        onProgress(processed, totalSize);
-        await yieldToMain();
-        lastYield = now;
+      if (onProgress && now - lastLogTime > 100) {
+        // Force yield here to ensure UI paints
+        await new Promise((r) => setTimeout(r, 0));
+        await onProgress(processed, totalSize);
+        lastLogTime = now;
       }
     }
+    if (onProgress) await onProgress(processed, totalSize);
   } finally {
     try {
       writer.close();
@@ -195,16 +215,19 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
     throw new Error("Decryption failed. Wrong password?");
   }
 
-  const progressElem = document.getElementById("progress");
+  const logProgress = createProgressLogger(document.getElementById("progress"));
   const contentDir = await srcHandle.getDirectoryHandle("content");
   const ENCRYPTED_CHUNK_OVERHEAD = 12 + 16;
 
   const entries = Object.entries(manifestData);
   let processedFiles = 0;
+  const totalFiles = entries.length;
 
   for (const [originalPath, meta] of entries) {
-    progressElem.textContent = `Decrypting (${processedFiles}/${entries.length}): ${originalPath}`;
-    await yieldToMain();
+    // This will yield automatically if >100ms has passed
+    await logProgress(
+      `Decrypting (${processedFiles}/${totalFiles}): ${originalPath}`
+    );
 
     const pathParts = originalPath.split("/");
     const fileName = pathParts.pop();
@@ -279,11 +302,11 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
     await writable.close();
     processedFiles++;
   }
-  progressElem.textContent = "";
+  await logProgress("", true); // Clear
 }
 
 async function processFileListAndStore(name, fileList) {
-  const progressElem = document.getElementById("progress");
+  const logProgress = createProgressLogger(document.getElementById("progress"));
 
   try {
     if (!fileList.length) return;
@@ -307,30 +330,41 @@ async function processFileListAndStore(name, fileList) {
       basePath = fileList[0].webkitRelativePath.split("/")[0] + "/";
     }
 
-    for (let i = 0; i < fileList.length; i++) {
-      const file = fileList[i];
-      let path = file.webkitRelativePath || file.name;
-      if (basePath && path.startsWith(basePath))
-        path = path.substring(basePath.length);
-      if (!path) continue;
+    const totalFiles = fileList.length;
+    let processedCount = 0;
 
-      const progressUpdate = (bytes, total) => {
-        progressElem.textContent = `Uploading ${i + 1}/${
-          fileList.length
-        }: ${path} (${Math.round(bytes / 1024)} KB)`;
-      };
+    // Convert FileList to Array for easier processing
+    const files = Array.from(fileList);
+    const CONCURRENCY = 4;
 
-      progressUpdate(0, file.size);
-      await writeStreamToOpfs(
-        folderHandle,
-        path,
-        file.stream(),
-        file.size,
-        progressUpdate
-      );
+    async function worker() {
+      while (files.length > 0) {
+        const file = files.shift();
+        if (!file) break;
+
+        let path = file.webkitRelativePath || file.name;
+        if (basePath && path.startsWith(basePath))
+          path = path.substring(basePath.length);
+        if (!path) continue;
+
+        // Pass the FILE object, not file.stream()
+        // We pass null for individual progress to reduce overhead on many small files
+        await writeStreamToOpfs(folderHandle, path, file, file.size, null);
+
+        processedCount++;
+        // Centralized rate-limited logging
+        await logProgress(
+          `Uploading ${processedCount}/${totalFiles}: ${path} (${Math.round(
+            file.size / 1024
+          )} KB)`
+        );
+      }
     }
 
+    await Promise.all(Array(CONCURRENCY).fill(null).map(worker));
+
     await updateRegistryEntry(name, { encryptionType: null });
+    await logProgress("", true);
     document.getElementById("folderName").value = "";
     document.getElementById("openFolderName").value = name;
     await listFolders();
@@ -338,12 +372,12 @@ async function processFileListAndStore(name, fileList) {
     console.error(e);
     alert("Error: " + e.message);
   } finally {
-    progressElem.textContent = "";
+    await logProgress("", true);
   }
 }
 
 async function processAndStoreFolderStreaming(name, srcHandle) {
-  const progressElem = document.getElementById("progress");
+  const logProgress = createProgressLogger(document.getElementById("progress"));
 
   const root = await getOpfsRoot();
   const rfs = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
@@ -352,8 +386,7 @@ async function processAndStoreFolderStreaming(name, srcHandle) {
   } catch (e) {}
   const destRoot = await rfs.getDirectoryHandle(name, { create: true });
 
-  progressElem.textContent = "Scanning files...";
-  await yieldToMain();
+  await logProgress("Scanning files...", true);
 
   const files = [];
   const dirs = [];
@@ -371,8 +404,7 @@ async function processAndStoreFolderStreaming(name, srcHandle) {
   }
   await scan(srcHandle, []);
 
-  progressElem.textContent = `Creating ${dirs.length} folders...`;
-  await yieldToMain();
+  await logProgress(`Creating ${dirs.length} folders...`, true);
 
   for (const parts of dirs) {
     let curr = destRoot;
@@ -398,20 +430,14 @@ async function processAndStoreFolderStreaming(name, srcHandle) {
             ? pathParts.join("/") + "/" + entry.name
             : entry.name;
 
-        await writeStreamToOpfs(
-          destRoot,
-          fullPathStr,
-          file.stream(),
-          file.size
-        );
+        await writeStreamToOpfs(destRoot, fullPathStr, file, file.size);
 
         completedFiles++;
-        if (completedFiles % 5 === 0 || file.size > 1024 * 1024) {
-          progressElem.textContent = `Uploading: ${completedFiles}/${totalFiles} (${Math.round(
-            (completedFiles / totalFiles) * 100
-          )}%)`;
-          await yieldToMain();
-        }
+
+        const percentage = Math.round((completedFiles / totalFiles) * 100);
+        await logProgress(
+          `Uploading: ${completedFiles}/${totalFiles} (${percentage}%)`
+        );
       } catch (e) {
         console.error(`Failed to upload ${entry.name}:`, e);
       }
@@ -421,7 +447,7 @@ async function processAndStoreFolderStreaming(name, srcHandle) {
   await Promise.all(Array(CONCURRENCY).fill(null).map(uploadWorker));
 
   await updateRegistryEntry(name, { encryptionType: null });
-  progressElem.textContent = "";
+  await logProgress("", true);
   document.getElementById("folderName").value = "";
   document.getElementById("openFolderName").value = name;
   await listFolders();
@@ -430,42 +456,43 @@ async function processAndStoreFolderStreaming(name, srcHandle) {
 async function writeStreamToOpfs(
   parentHandle,
   path,
-  stream,
+  fileObj,
   totalSize,
   onProgress
 ) {
   const parts = path.split("/");
   const fileName = parts.pop();
 
+  // Helper: Create a FRESH stream for every attempt
+  const attemptUpload = async (dirHandle) => {
+    const fileHandle = await dirHandle.getFileHandle(fileName, {
+      create: true,
+    });
+    const writable = await fileHandle.createWritable();
+    // Get a fresh stream reader from the File object
+    await pumpStream(
+      fileObj.stream().getReader(),
+      writable,
+      totalSize,
+      onProgress
+    );
+  };
+
   try {
     let currentDir = parentHandle;
     for (const part of parts) {
       currentDir = await currentDir.getDirectoryHandle(part, { create: true });
     }
-
-    const fileHandle = await currentDir.getFileHandle(fileName, {
-      create: true,
-    });
-    const writable = await fileHandle.createWritable();
-
-    await pumpStream(stream.getReader(), writable, totalSize, onProgress);
+    await attemptUpload(currentDir);
   } catch (e) {
     if (e.name === "InvalidStateError") {
+      console.warn(`Retrying write for ${fileName}...`);
       await yieldToMain();
-      // Retry
       let retryDir = parentHandle;
       for (const part of parts)
         retryDir = await retryDir.getDirectoryHandle(part, { create: true });
-      const retryFile = await retryDir.getFileHandle(fileName, {
-        create: true,
-      });
-      const retryWritable = await retryFile.createWritable();
-      await pumpStream(
-        stream.getReader(),
-        retryWritable,
-        totalSize,
-        onProgress
-      );
+
+      await attemptUpload(retryDir);
       return;
     }
     throw e;
@@ -558,7 +585,7 @@ async function openFile(overrideFolderName) {
     await new Promise((resolve) => {
       const channel = new MessageChannel();
       channel.port1.onmessage = () => resolve();
-      sw.postMessage({ type: "SET_RULES", rules, headers, key }, [
+      sw.postMessage({ type: "SET_RULES", rules, headers, key, folderName }, [
         channel.port2,
       ]);
     });
@@ -767,7 +794,7 @@ async function performSyncToOpfs() {
 
         if (srcHandle.kind === "file") {
           const f = await srcHandle.getFile();
-          await writeStreamToOpfs(folderHandle, pathStr, f.stream(), f.size);
+          await writeStreamToOpfs(folderHandle, pathStr, f, f.size);
         }
       }
     } catch (e) {
@@ -989,27 +1016,50 @@ document.addEventListener("DOMContentLoaded", () => {
       const name = prompt("Please choose a folder name:", entry.name);
       if (name) {
         setUiBusy(true);
-        const scan = async (ent, p) => {
-          if (ent.isFile) {
-            const f = await new Promise((res, rej) => ent.file(res, rej));
-            Object.defineProperty(f, "webkitRelativePath", {
-              value: p + f.name,
-            });
-            return [f];
-          } else if (ent.isDirectory) {
-            const r = ent.createReader();
-            let files = [];
-            let batch;
-            do {
-              batch = await new Promise((res, rej) => r.readEntries(res, rej));
-              for (const c of batch)
-                files.push(...(await scan(c, p + ent.name + "/")));
-            } while (batch.length > 0);
-            return files;
+        const progressElem = document.getElementById("progress");
+        const logProgress = createProgressLogger(progressElem);
+
+        try {
+          // Scan iteratively
+          const files = [];
+          const queue = [{ entry, path: "" }];
+
+          let scannedCount = 0;
+          while (queue.length > 0) {
+            const { entry: curr, path } = queue.shift();
+
+            if (curr.isFile) {
+              const f = await new Promise((res, rej) => curr.file(res, rej));
+              Object.defineProperty(f, "webkitRelativePath", {
+                value: path + f.name,
+              });
+              files.push(f);
+              scannedCount++;
+            } else if (curr.isDirectory) {
+              const reader = curr.createReader();
+              let batch;
+              do {
+                batch = await new Promise((res, rej) =>
+                  reader.readEntries(res, rej)
+                );
+                for (const child of batch) {
+                  queue.push({ entry: child, path: path + curr.name + "/" });
+                }
+              } while (batch.length > 0);
+            }
+
+            if (scannedCount % 50 === 0) {
+              await logProgress(`Scanning... ${scannedCount} files found`);
+            }
           }
-        };
-        const files = await scan(entry, "");
-        await processFileListAndStore(name, files);
+
+          await logProgress(`Processing ${files.length} files...`, true);
+          await processFileListAndStore(name, files);
+        } catch (err) {
+          alert("Scan failed: " + err.message);
+          setUiBusy(false);
+          if (progressElem) progressElem.textContent = "";
+        }
       }
     }
   });
@@ -1069,7 +1119,7 @@ async function openFileInPlace() {
     await new Promise((resolve) => {
       const channel = new MessageChannel();
       channel.port1.onmessage = () => resolve();
-      sw.postMessage({ type: "SET_RULES", rules, headers, key }, [
+      sw.postMessage({ type: "SET_RULES", rules, headers, key, folderName }, [
         channel.port2,
       ]);
     });

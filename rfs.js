@@ -1,7 +1,8 @@
 const SW_LINK = "./sw.min.js"; // Change if needed!
-const RFS_PREFIX = "rfs";
-const SYSTEM_FILE = "rfs_system.json";
+const RFS_PREFIX = "rfs"; // OPFS prefix
+const SYSTEM_FILE = "rfs_system.json"; // File with a little bit of extra data
 const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB
+const CONCURRENCY = 4; // Number of "workers" for folder uploading stuff
 
 let isListingFolders = false;
 let currentlyBusy = false;
@@ -335,8 +336,6 @@ async function processFileListAndStore(name, fileList) {
 
     // Convert FileList to Array for easier processing
     const files = Array.from(fileList);
-    const CONCURRENCY = 4;
-
     async function worker() {
       while (files.length > 0) {
         const file = files.shift();
@@ -385,66 +384,76 @@ async function processAndStoreFolderStreaming(name, srcHandle) {
     await rfs.removeEntry(name, { recursive: true });
   } catch (e) {}
   const destRoot = await rfs.getDirectoryHandle(name, { create: true });
+  await logProgress("Starting stream upload...", true);
 
-  await logProgress("Scanning files...", true);
+  const queue = [
+    {
+      source: srcHandle,
+      dest: destRoot,
+      path: "",
+    },
+  ];
 
-  const files = [];
-  const dirs = [];
-
-  async function scan(dir, pathParts) {
-    for await (const entry of dir.values()) {
-      if (entry.kind === "file") {
-        files.push({ entry, pathParts });
-      } else if (entry.kind === "directory") {
-        const newPath = [...pathParts, entry.name];
-        dirs.push(newPath);
-        await scan(entry, newPath);
-      }
-    }
-  }
-  await scan(srcHandle, []);
-
-  await logProgress(`Creating ${dirs.length} folders...`, true);
-
-  for (const parts of dirs) {
-    let curr = destRoot;
-    for (const p of parts)
-      curr = await curr.getDirectoryHandle(p, { create: true });
-  }
-
+  const pendingUploads = [];
   let completedFiles = 0;
-  const totalFiles = files.length;
-  const CONCURRENCY = 4;
+  let activeWorkers = 0;
 
-  async function uploadWorker() {
-    while (files.length > 0) {
-      const fileData = files.shift();
-      if (!fileData) break;
+  // Helper to run the upload queue
+  async function flushUploads() {
+    while (pendingUploads.length > 0 && activeWorkers < CONCURRENCY) {
+      const task = pendingUploads.shift();
+      activeWorkers++;
 
-      const { entry, pathParts } = fileData;
-
-      try {
-        const file = await entry.getFile();
-        const fullPathStr =
-          pathParts.length > 0
-            ? pathParts.join("/") + "/" + entry.name
-            : entry.name;
-
-        await writeStreamToOpfs(destRoot, fullPathStr, file, file.size);
-
-        completedFiles++;
-
-        const percentage = Math.round((completedFiles / totalFiles) * 100);
-        await logProgress(
-          `Uploading: ${completedFiles}/${totalFiles} (${percentage}%)`
-        );
-      } catch (e) {
-        console.error(`Failed to upload ${entry.name}:`, e);
-      }
+      writeStreamToOpfs(task.dest, task.name, task.file, task.file.size)
+        .then(() => {
+          completedFiles++;
+          logProgress(`Processed ${completedFiles} files...`);
+        })
+        .catch((e) => console.error(`Failed ${task.name}:`, e))
+        .finally(() => {
+          activeWorkers--;
+          // Chain the next flush
+          flushUploads();
+        });
     }
   }
 
-  await Promise.all(Array(CONCURRENCY).fill(null).map(uploadWorker));
+  // Iterative scan
+  while (queue.length > 0) {
+    const { source, dest, path } = queue.shift();
+
+    for await (const entry of source.values()) {
+      if (entry.kind === "file") {
+        const file = await entry.getFile();
+        // Push to upload queue immediately
+        pendingUploads.push({
+          dest: dest, // We already have the parent dest handle!
+          name: entry.name,
+          file: file,
+        });
+
+        // Keep the workers fed
+        if (pendingUploads.length >= CONCURRENCY) flushUploads();
+      } else if (entry.kind === "directory") {
+        const newDest = await dest.getDirectoryHandle(entry.name, {
+          create: true,
+        });
+        queue.push({
+          source: entry,
+          dest: newDest,
+          path: path + "/" + entry.name,
+        });
+      }
+    }
+    // Yield occasionally during scanning
+    await new Promise((r) => setTimeout(r, 0));
+  }
+
+  // Wait for remaining uploads
+  while (pendingUploads.length > 0 || activeWorkers > 0) {
+    flushUploads();
+    await new Promise((r) => setTimeout(r, 100));
+  }
 
   await updateRegistryEntry(name, { encryptionType: null });
   await logProgress("", true);
@@ -470,12 +479,17 @@ async function writeStreamToOpfs(
     });
     const writable = await fileHandle.createWritable();
     // Get a fresh stream reader from the File object
-    await pumpStream(
-      fileObj.stream().getReader(),
-      writable,
-      totalSize,
-      onProgress
-    );
+    if (!onProgress) {
+      await fileObj.stream().pipeTo(writable);
+    } else {
+      // Keep manual pumping only when we absolutely need granular progress
+      await pumpStream(
+        fileObj.stream().getReader(),
+        writable,
+        totalSize,
+        onProgress
+      );
+    }
   };
 
   try {
@@ -737,16 +751,22 @@ async function uploadFolderFallback(event) {
   setUiBusy(false);
 }
 
+var syncTimeout = -1;
 async function syncFiles() {
   if (!folderName || !dirHandle)
     return alert("Upload a folder to sync changes (not always supported).");
   setUiBusy(true);
   if (changes.length > 0) {
     await performSyncToOpfs();
-    alert("Sync complete.");
+    document.getElementById("syncInfo").textContent = "Sync complete found.";
   } else {
-    alert("No changes detected.");
+    document.getElementById("syncInfo").textContent = "No sync changes.";
   }
+  clearTimeout(syncTimeout);
+  syncTimeout = setTimeout(
+    () => (document.getElementById("syncInfo").textContent = ""),
+    1000
+  );
   setUiBusy(false);
 }
 
@@ -754,7 +774,17 @@ async function syncAndOpenFile() {
   if (!folderName || !dirHandle)
     return alert("Upload a folder to sync changes (not always supported).");
   setUiBusy(true);
-  if (changes.length > 0) await performSyncToOpfs();
+  if (changes.length > 0) {
+    await performSyncToOpfs();
+    document.getElementById("syncInfo").textContent = "Sync complete found.";
+  } else {
+    document.getElementById("syncInfo").textContent = "No sync changes.";
+  }
+  clearTimeout(syncTimeout);
+  syncTimeout = setTimeout(
+    () => (document.getElementById("syncInfo").textContent = ""),
+    1000
+  );
   openFile(folderName);
 }
 
@@ -855,6 +885,7 @@ async function uploadAndEncryptWithPassword() {
             const reader = file.stream().getReader();
             let totalProcessed = 0;
 
+            var lastYield = Date.now();
             while (true) {
               let buffer = new Uint8Array(0);
               while (buffer.length < CHUNK_SIZE) {
@@ -867,6 +898,10 @@ async function uploadAndEncryptWithPassword() {
               }
 
               if (buffer.length === 0) break;
+              if (Date.now() - lastYield > 200) {
+                await new Promise((r) => setTimeout(r, 0));
+                lastYield = Date.now();
+              }
 
               const iv = crypto.getRandomValues(new Uint8Array(12));
               const encryptedChunk = await crypto.subtle.encrypt(
@@ -1053,7 +1088,7 @@ document.addEventListener("DOMContentLoaded", () => {
             }
           }
 
-          await logProgress(`Processing ${files.length} files...`, true);
+          await logProgress(`Processed ${files.length} files...`);
           await processFileListAndStore(name, files);
         } catch (err) {
           alert("Scan failed: " + err.message);
@@ -1079,6 +1114,12 @@ document.addEventListener("DOMContentLoaded", () => {
     hT.value = localStorage.getItem("fsHeaders") || "";
     hT.addEventListener("input", () =>
       localStorage.setItem("fsHeaders", hT.value)
+    );
+  }
+
+  if (!window.showDirectoryPicker) {
+    Array.from(document.body.getElementsByClassName("supportCheck")).forEach(
+      (elem) => (elem.style.display = "none")
     );
   }
 });
@@ -1143,25 +1184,29 @@ async function openFileInPlace() {
     const baseTag = `<base href="${basePath}">`;
 
     let metaTags = "";
+    const supportedMetaHeaders = [
+      "content-security-policy",
+      "x-ua-compatible",
+      "content-type",
+      "default-style",
+      "refresh",
+      "referrer-policy", // (Experimental support in some browsers via meta)
+    ];
+
     resp.headers.forEach((val, name) => {
-      if (name.toLowerCase() === "content-security-policy") {
-        metaTags += `<meta http-equiv="Content-Security-Policy" content="${val.replace(
-          /"/g,
-          "&quot;"
-        )}">\n`;
+      if (supportedMetaHeaders.includes(name.toLowerCase())) {
+        const safeVal = val.replace(/"/g, "&quot;");
+        metaTags += `<meta http-equiv="${name}" content="${safeVal}">\n`;
       }
     });
 
-    const headRegex = /(<head\b[^>]*>)/i;
-    const docTypeRegex = /(<!DOCTYPE\b[^>]*>)/i;
-    const htmlRegex = /(<html\b[^>]*>)/i;
-
-    if (headRegex.test(html)) {
-      html = html.replace(headRegex, `$1${baseTag}${metaTags}`);
-    } else if (docTypeRegex.test(html)) {
-      html = html.replace(docTypeRegex, `$1<head>${baseTag}${metaTags}</head>`);
-    } else if (htmlRegex.test(html)) {
-      html = html.replace(htmlRegex, `$1<head>${baseTag}${metaTags}</head>`);
+    if (/<head\b[^>]*>/i.test(html)) {
+      html = html.replace(/(<head\b[^>]*>)/i, `$1${baseTag}${metaTags}`);
+    } else if (/<html\b[^>]*>/i.test(html)) {
+      html = html.replace(
+        /(<html\b[^>]*>)/i,
+        `$1<head>${baseTag}${metaTags}</head>`
+      );
     } else {
       html = `<head>${baseTag}${metaTags}</head>${html}`;
     }

@@ -107,51 +107,54 @@ function compileRules(rulesString) {
     if (parts.length < 2) continue;
 
     const matchPart = parts[0].trim();
-    const replacePart = parts.slice(1).join("->").trim();
+    let replacePart = parts.slice(1).join("->").trim();
+
+    // Parse the operator (like | or $$)
     const operatorMatch = matchPart.match(
       /^(.*?)\s+(\$|\$\$|\|\||\|)\s+(.*)$/s
     );
-
     if (!operatorMatch) continue;
 
+    // funy JS trick
     const [, fileMatch, operator, searchPattern] = operatorMatch;
-
-    let fileRegex;
     try {
-      fileRegex = new RegExp(
+      const fileRegex = new RegExp(
         fileMatch.trim() === "*" ? ".*" : fileMatch.trim()
       );
-    } catch (e) {
-      continue;
-    }
+      let searchRegex;
 
-    let searchRegex;
-    try {
-      switch (operator) {
-        case "|":
-          searchRegex = new RegExp(searchPattern, "g");
-          break;
-        case "$":
-          searchRegex = new RegExp(escapeRegex(searchPattern), "g");
-          break;
-        case "||":
-          searchRegex = new RegExp(searchPattern);
-          break;
-        case "$$":
-          searchRegex = new RegExp(escapeRegex(searchPattern));
-          break;
+      if (searchPattern === "{{SCRIPT}}") {
+        searchRegex =
+          /(?:<!DOCTYPE\\b[^>]*>)|(?:<head\\b[^>]*>)|(?:<body\\b[^>]*>)|(?:<html\\b[^>]*>)|(?:^)/i;
+        replacePart = `$&<script>${replacePart}</script>`;
+      } else {
+        switch (operator) {
+          case "|":
+            searchRegex = new RegExp(searchPattern, "g");
+            break;
+          case "$":
+            searchRegex = new RegExp(escapeRegex(searchPattern), "g");
+            break;
+          case "||":
+            searchRegex = new RegExp(searchPattern);
+            break;
+          case "$$":
+            searchRegex = new RegExp(escapeRegex(searchPattern));
+            break;
+        }
+      }
+
+      if (searchRegex && fileRegex) {
+        compiled.push({ fileRegex, searchRegex, replacePart });
       }
     } catch (e) {
+      console.warn("Rule compilation failed for line " + line + ":", e);
       continue;
     }
-
-    if (searchRegex && fileRegex)
-      compiled.push({ fileRegex, searchRegex, replacePart });
   }
 
   if (ruleCache.size > 50) ruleCache.clear();
   ruleCache.set(rulesString, compiled);
-
   return compiled;
 }
 
@@ -252,12 +255,14 @@ self.addEventListener("message", (e) => {
     case "SET_RULES":
       const { rules, headers, key, folderName } = e.data;
       const compiledRules = compileRules(rules);
+      const compiledHeaders = parseCustomHeaders(headers);
 
       if (!pendingNavData) pendingNavData = {};
       pendingNavData[folderName] = {
         rules,
         compiledRules,
-        headers,
+        headers, // Keep raw string just in case
+        compiledHeaders, // Store compiled version
         key,
         timestamp: Date.now(),
       };
@@ -267,9 +272,11 @@ self.addEventListener("message", (e) => {
         s.rules = rules;
         s.compiledRules = compiledRules;
         s.headers = headers;
+        s.compiledHeaders = compiledHeaders; // Store here too
         if (key) s.key = key;
         clientSessionStore.set(clientId, s);
       }
+
       if (e.ports && e.ports[0]) e.ports[0].postMessage("OK");
 
       setTimeout(() => {
@@ -343,10 +350,10 @@ function parseCustomHeaders(rulesString) {
   return rules;
 }
 
-function applyCustomHeaders(baseHeaders, filePath, rulesString) {
-  if (!rulesString) return baseHeaders;
-  const customHeaderRules = parseCustomHeaders(rulesString);
-  for (const rule of customHeaderRules) {
+function applyCustomHeaders(baseHeaders, filePath, headerRulesArray) {
+  if (!headerRulesArray || !Array.isArray(headerRulesArray)) return baseHeaders;
+
+  for (const rule of headerRulesArray) {
     if (rule.regex.test(filePath)) {
       baseHeaders[rule.header] = rule.value;
     }
@@ -423,7 +430,8 @@ async function handleEncryptedRequest(
   folderName,
   filePath,
   key,
-  request
+  request,
+  customHeaders
 ) {
   try {
     const CHUNK_SIZE = 1024 * 1024 * 4;
@@ -450,6 +458,11 @@ async function handleEncryptedRequest(
           encData
         );
         manifest = JSON.parse(new TextDecoder().decode(dec));
+        if (manifestCache.size > 5) {
+          const firstKey = manifestCache.keys().next().value;
+          manifestCache.delete(firstKey);
+        }
+
         manifestCache.set(folderName, manifest);
       } catch (e) {
         return new Response("Password Incorrect", { status: 403 });
@@ -553,6 +566,7 @@ async function handleEncryptedRequest(
     });
 
     const headers = {
+      ...customHeaders, // Apply custom headers (CSP, etc)
       "Content-Type": fileMeta.type || "application/octet-stream",
       "Content-Length": end - start + 1,
       "Content-Range": `bytes ${start}-${end}/${totalSize}`,
@@ -571,27 +585,55 @@ async function generateResponseForVirtualFile(request, clientId) {
     const url = new URL(request.url);
     const { mode } = request;
 
-    // This forces a specific reload with ?boot=1 to ensure the context is "clean" and controlled for Firefox because Firefox is weird.
+    const virtualPath = url.pathname.substring(virtualPathPrefix.length);
+    const pathParts = virtualPath.split("/").map((p) => {
+      try {
+        return decodeURIComponent(p);
+      } catch (e) {
+        return p;
+      }
+    });
+    const folderName = pathParts[0];
+
+    let root, registry;
+    try {
+      root = await getOpfsRoot();
+      if (mode === "navigate" || !registryCache) {
+        const handle = await root.getFileHandle(SYSTEM_FILE);
+        const file = await handle.getFile();
+        registryCache = JSON.parse(await file.text());
+      }
+      registry = registryCache;
+    } catch (e) {
+      registry = registryCache || {};
+    }
+
+    const folderData = registry[folderName] || {};
+    const isEncrypted = folderData.encryptionType === "password";
+
+    // SpiderMonkey check because Firefox has weird SW header issues. ?boot=1 is used to ensure the context is "clean" and controlled for Firefox because Firefox is weird.
     const isFirefox = typeof InternalError !== "undefined";
-    if (isFirefox && mode === "navigate" && !url.searchParams.has("boot")) {
+    const hasConfig =
+      (folderData.rules && folderData.rules.trim().length > 0) ||
+      (folderData.headers && folderData.headers.trim().length > 0);
+
+    if (
+      isFirefox &&
+      mode === "navigate" &&
+      hasConfig &&
+      !url.searchParams.has("boot")
+    ) {
       url.searchParams.set("boot", "1");
       return new Response(
         `<!DOCTYPE html><script>location.replace("${url.href}");</script>`,
-        {
-          headers: { "Content-Type": "text/html" },
-        }
+        { headers: { "Content-Type": "text/html" } }
       );
     }
-
-    const virtualPath = url.pathname.substring(virtualPathPrefix.length);
-    const pathParts = virtualPath.split("/").map((p) => decodeURIComponent(p));
-    const folderName = pathParts[0];
 
     let session = clientSessionStore.get(clientId);
     if (!session && pendingNavData && pendingNavData[folderName]) {
       session = pendingNavData[folderName];
     }
-
     if (session) {
       session.timestamp = Date.now();
       clientSessionStore.set(clientId, session);
@@ -599,33 +641,26 @@ async function generateResponseForVirtualFile(request, clientId) {
     session = session || {};
 
     let relativePath = pathParts.slice(1).join("/");
-
     if (!relativePath || relativePath.endsWith("/"))
-      relativePath += "index.html";
+      relativePath += "index.html"; // show index.html by default
 
-    let root, registry;
-    try {
-      root = await getOpfsRoot();
-      registry = await getRegistry();
-    } catch (e) {
-      return new Response("System error: OPFS inaccessible", { status: 500 });
-    }
-
-    const folderData = registry[folderName] || {};
+    // Helper function definition
     async function getFileHandle(dir, name, path) {
       try {
-        const pathParts = path
-          .split("/")
-          .map((p) => {
-            try {
-              return decodeURIComponent(p);
-            } catch (e) {
-              return p;
-            }
-          })
-          .filter((p) => p && p.trim() !== "");
-
-        const parts = [RFS_PREFIX, name, ...pathParts];
+        const parts = [
+          RFS_PREFIX,
+          name,
+          ...path
+            .split("/")
+            .map((p) => {
+              try {
+                return decodeURIComponent(p);
+              } catch (e) {
+                return p;
+              }
+            })
+            .filter((p) => p && p.trim() !== ""),
+        ];
 
         let curr = dir;
         for (let i = 0; i < parts.length - 1; i++) {
@@ -637,40 +672,37 @@ async function generateResponseForVirtualFile(request, clientId) {
       }
     }
 
-    let handle = await getFileHandle(root, folderName, relativePath);
-
-    // Fallback to index.html
-    const isHtmlRequest =
-      mode === "navigate" ||
-      (request.headers.get("Accept") || "").includes("text/html");
-
-    if (!handle && isHtmlRequest) {
-      const indexHandle = await getFileHandle(root, folderName, "index.html");
-      if (indexHandle) {
-        handle = indexHandle;
-        relativePath = "index.html";
+    let contentType;
+    let handle = null;
+    let file = null;
+    let totalSize = 0;
+    if (isEncrypted) {
+      contentType = getMimeType(relativePath);
+    } else {
+      handle = await getFileHandle(root, folderName, relativePath);
+      const isHtmlReq =
+        mode === "navigate" ||
+        (request.headers.get("Accept") || "").includes("text/html");
+      if (!handle && isHtmlReq) {
+        const indexHandle = await getFileHandle(root, folderName, "index.html");
+        if (indexHandle) {
+          handle = indexHandle;
+          relativePath = "index.html";
+        }
       }
+
+      if (!handle) return new Response("File not found", { status: 404 });
+
+      file = await handle.getFile();
+      totalSize = file.size;
+      contentType =
+        file.type || getMimeType(relativePath) || "application/octet-stream";
     }
 
-    if (!handle) {
-      return new Response("File not found", { status: 404 });
+    let compiledHeaders = session.compiledHeaders;
+    if (!compiledHeaders && folderData.headers) {
+      compiledHeaders = parseCustomHeaders(folderData.headers);
     }
-
-    const file = await handle.getFile();
-    let totalSize = file.size;
-
-    let contentType = file.type;
-    if (!contentType || contentType === "application/octet-stream") {
-      contentType = getMimeType(relativePath) || "application/octet-stream";
-    }
-
-    let compiledRules = session.compiledRules;
-    if (!compiledRules && folderData.rules)
-      compiledRules = compileRules(folderData.rules);
-
-    const isEncrypted = folderData.encryptionType === "password";
-    const hasRegex = compiledRules && compiledRules.length > 0;
-    const needsProcessing = isEncrypted || hasRegex;
 
     const baseHeaders = {
       "Content-Type": contentType,
@@ -681,13 +713,44 @@ async function generateResponseForVirtualFile(request, clientId) {
     const finalHeaders = applyCustomHeaders(
       baseHeaders,
       relativePath,
-      session.headers || folderData.headers
+      compiledHeaders
     );
 
-    // Stream directly
-    if (!needsProcessing) {
-      const rangeHeader = request.headers.get("Range");
+    if (isEncrypted) {
+      if (!session.key)
+        return new Response("Session locked. Reload from Main.", {
+          status: 403,
+        });
+      return await handleEncryptedRequest(
+        root,
+        folderName,
+        relativePath,
+        session.key,
+        request,
+        finalHeaders
+      );
+    }
 
+    if (totalSize === 0) {
+      return new Response(new Uint8Array(0), { headers: finalHeaders });
+    }
+
+    let compiledRules = session.compiledRules;
+    if (!compiledRules && folderData.rules) {
+      compiledRules = compileRules(folderData.rules);
+    }
+
+    const isText =
+      contentType.startsWith("text/") ||
+      contentType.includes("javascript") ||
+      contentType.includes("json") ||
+      contentType.includes("xml");
+    const isSmallEnough = totalSize < 10 * 1024 * 1024;
+    const hasRegex = compiledRules && compiledRules.length > 0;
+    const shouldApplyRegex = hasRegex && isText && isSmallEnough;
+
+    if (!shouldApplyRegex) {
+      const rangeHeader = request.headers.get("Range");
       if (rangeHeader) {
         const parts = rangeHeader.replace(/bytes=/, "").split("-");
         const start = parseInt(parts[0], 10);
@@ -700,35 +763,23 @@ async function generateResponseForVirtualFile(request, clientId) {
           });
         }
 
-        const chunkSize = end - start + 1;
-        const slicedBlob = file.slice(start, end + 1);
-
         finalHeaders["Content-Range"] = `bytes ${start}-${end}/${totalSize}`;
-        finalHeaders["Content-Length"] = chunkSize;
+        finalHeaders["Content-Length"] = end - start + 1;
 
-        return new Response(slicedBlob, { status: 206, headers: finalHeaders });
+        return new Response(file.slice(start, end + 1), {
+          status: 206,
+          headers: finalHeaders,
+        });
       }
 
-      finalHeaders["Content-Length"] = totalSize;
+      if (!finalHeaders["Content-Length"])
+        finalHeaders["Content-Length"] = totalSize;
       return new Response(file, { headers: finalHeaders });
     }
 
     let buffer = await file.arrayBuffer();
-    if (folderData.encryptionType === "password") {
-      if (!session.key)
-        return new Response("Session locked. Reload from Main.", {
-          status: 403,
-        });
-      return await handleEncryptedRequest(
-        root,
-        folderName,
-        relativePath,
-        session.key,
-        request
-      );
-    }
 
-    if (hasRegex) {
+    if (shouldApplyRegex) {
       buffer = applyRegexRules(
         relativePath,
         buffer,
@@ -737,23 +788,8 @@ async function generateResponseForVirtualFile(request, clientId) {
       );
     }
 
-    const isHtml = contentType.includes("html");
-
-    if (isHtml) {
-      const decoder = new TextDecoder();
-      let htmlContent = decoder.decode(buffer);
-      const injection =
-        '<script>navigator.serviceWorker.controller||navigator.serviceWorker.addEventListener("controllerchange",()=>{window.location.reload()});</script>';
-
-      if (htmlContent.includes("</head>")) {
-        htmlContent = htmlContent.replace("</head>", injection + "</head>");
-      }
-      buffer = new TextEncoder().encode(htmlContent).buffer;
-    }
-
     const processedSize = buffer.byteLength;
     const rangeHeader = request.headers.get("Range");
-
     if (rangeHeader) {
       const parts = rangeHeader.replace(/bytes=/, "").split("-");
       let start = parseInt(parts[0], 10);
@@ -761,7 +797,6 @@ async function generateResponseForVirtualFile(request, clientId) {
 
       if (isNaN(start)) start = 0;
       if (isNaN(end)) end = processedSize - 1;
-      if (end >= processedSize) end = processedSize - 1;
 
       if (start >= processedSize) {
         return new Response(null, {
@@ -770,16 +805,16 @@ async function generateResponseForVirtualFile(request, clientId) {
         });
       }
 
-      const chunkSize = end - start + 1;
-      const slicedBuffer = buffer.slice(start, end + 1);
-
       finalHeaders["Content-Range"] = `bytes ${start}-${end}/${processedSize}`;
-      finalHeaders["Content-Length"] = chunkSize;
-
-      return new Response(slicedBuffer, { status: 206, headers: finalHeaders });
+      finalHeaders["Content-Length"] = end - start + 1;
+      return new Response(buffer.slice(start, end + 1), {
+        status: 206,
+        headers: finalHeaders,
+      });
     }
 
-    finalHeaders["Content-Length"] = processedSize;
+    if (!finalHeaders["Content-Length"])
+      finalHeaders["Content-Length"] = processedSize;
     return new Response(buffer, { headers: finalHeaders });
   } catch (e) {
     console.error("SW error:", e);

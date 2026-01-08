@@ -18,10 +18,12 @@ You can use Enter on text inputs to perform actions, instead of clicking buttons
 
 Custom regex and headers save on reload and export but do not affect stored files, and only work when opening the file (in-place or new tab) from the RuntimeFS menu (reloading or navigating to the URL directly do not yet).
 
+To update to a newer version you can delete the ServiceWorker such as with `chrome://serviceworker-internals/`, or equivalents in other browsers, then reload/force reload.
+
 ## Browser Support
 (Safari has to be version 26.0 or above due to [`createWritable`](https://caniuse.com/mdn-api_filesystemfilehandle_createwritable), although I'm unable to verify if anything else is broken on my device for the newest Safari versions.)
 
-File System API features (such as syncing) are Chromium-exclusive. RuntimeFS has been tested in Chromium and Firefox.
+File System API features (such as syncing or folder encryption) are Chromium-exclusive, and these options will be hidden in other browsers. RuntimeFS has been tested in Chromium, Firefox, and Safari.
 
 (Firefox has a very specific issue involving initially loading JS scripts in `generateResponseForVirtualFile`, so an automatic reload is performed that injects `?boot=1` to the end of the URL. This also means that headers won't work.)
 | Feature | 🟢 Chromium | 🟡 Firefox | 🟡 Safari |

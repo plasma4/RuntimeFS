@@ -1,4 +1,23 @@
 (function () {
+  let blobIdCounter = 0;
+  // stolen from my FractalSky code
+  const fastScheduler = (function () {
+    if ("scheduler" in window && "postTask" in scheduler) {
+      return (cb) => scheduler.postTask(cb, { priority: "user-blocking" });
+    }
+    const channel = new MessageChannel();
+    const queue = [];
+    channel.port1.onmessage = () => {
+      const task = queue.shift();
+      if (task) task();
+    };
+    return (cb) => {
+      queue.push(cb);
+      channel.port2.postMessage(undefined);
+    };
+  })();
+
+  const yieldToMain = () => new Promise((resolve) => fastScheduler(resolve));
   const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB
   const ENC = new TextEncoder();
   const DEC = new TextDecoder();
@@ -36,28 +55,36 @@
     return true;
   }
 
-  async function prepForCBOR(item, externalBlobs) {
+  function prepForCBOR(item, externalBlobs) {
+    if (!item || typeof item !== "object") return item;
     if (item instanceof Blob) {
-      const uuid = crypto.randomUUID();
-      externalBlobs.push({ uuid, blob: item });
-      return { __le_blob_ref: uuid, type: item.type, size: item.size };
+      const id = (blobIdCounter++).toString(36); // Fast, short ID
+      externalBlobs.push({ uuid: id, blob: item });
+      return { __le_blob_ref: id, type: item.type, size: item.size };
     }
-    if (item instanceof ArrayBuffer) return new Uint8Array(item.slice(0));
-    if (ArrayBuffer.isView(item))
-      return new Uint8Array(
-        item.buffer.slice(item.byteOffset, item.byteOffset + item.byteLength)
-      );
+
+    if (item instanceof ArrayBuffer || ArrayBuffer.isView(item)) {
+      return item;
+    }
+
+    if (item instanceof Date || item instanceof RegExp) {
+      return item;
+    }
+
     if (Array.isArray(item)) {
-      return Promise.all(item.map((i) => prepForCBOR(i, externalBlobs)));
-    }
-    if (item && typeof item === "object") {
-      const n = {};
-      for (const k in item) {
-        n[k] = await prepForCBOR(item[k], externalBlobs);
+      const len = item.length;
+      const res = new Array(len);
+      for (let i = 0; i < len; i++) {
+        res[i] = prepForCBOR(item[i], externalBlobs);
       }
-      return n;
+      return res;
     }
-    return item;
+
+    const res = {};
+    for (const k in item) {
+      res[k] = prepForCBOR(item[k], externalBlobs);
+    }
+    return res;
   }
 
   async function restoreFromCBOR(item, tempBlobDir) {
@@ -89,35 +116,98 @@
     return item;
   }
 
-  function createTarHeader(filename, size, isDir = false) {
-    const buffer = new Uint8Array(512);
-    let name = filename;
-    let prefix = "";
-    if (name.length > 100) {
-      let splitIndex = name.lastIndexOf("/", 154);
-      if (splitIndex === -1 || splitIndex < name.length - 100)
-        splitIndex = Math.max(0, name.length - 100);
-      prefix = name.slice(0, splitIndex);
-      name = name.slice(splitIndex + (prefix ? 1 : 0));
+  const HEADER_TEMPLATE = new Uint8Array(512);
+  (function initTemplate() {
+    const enc = new TextEncoder();
+    // Pre-fill constant "000664 \0", "000000 \0", "ustar\0", "00"
+    enc.encodeInto("000664 \0", HEADER_TEMPLATE.subarray(100, 108));
+    enc.encodeInto("000000 \0", HEADER_TEMPLATE.subarray(108, 116));
+    enc.encodeInto("000000 \0", HEADER_TEMPLATE.subarray(116, 124));
+    enc.encodeInto("        ", HEADER_TEMPLATE.subarray(148, 156)); // Checksum placeholder
+    enc.encodeInto("ustar\0", HEADER_TEMPLATE.subarray(257, 263));
+    enc.encodeInto("00", HEADER_TEMPLATE.subarray(263, 265));
+  })();
+
+  function createTarHeader(filename, size, time, isDir = false) {
+    const buffer = HEADER_TEMPLATE.slice(0);
+
+    // Calculate byte size first to prevent buffer overflow/corruption
+    let nameBytes = ENC.encode(filename);
+    let prefixBytes = new Uint8Array(0);
+
+    if (nameBytes.length > 100) {
+      // Find a split point based on BYTES, not characters
+      let splitIndex = -1;
+      for (let i = 0; i < filename.length; i++) {
+        if (filename.charCodeAt(i) === 47) {
+          // Check bytes of the prefix (0 to i)
+          const prefixCandidate = filename.slice(0, i);
+          const nameCandidate = filename.slice(i + 1);
+
+          const pLen = ENC.encode(prefixCandidate).byteLength;
+          const nLen = ENC.encode(nameCandidate).byteLength;
+
+          if (pLen <= 155 && nLen <= 100) {
+            splitIndex = i;
+          }
+        }
+      }
+
+      if (splitIndex !== -1) {
+        const prefixStr = filename.slice(0, splitIndex);
+        const nameStr = filename.slice(splitIndex + 1);
+        prefixBytes = ENC.encode(prefixStr);
+        nameBytes = ENC.encode(nameStr);
+      } else {
+        console.warn("Filename too long for USTAR:", filename);
+        nameBytes = nameBytes.slice(0, 100);
+      }
     }
-    const writeStr = (str, offset, len) => {
-      const b = ENC.encode(str);
-      for (let i = 0; i < Math.min(len, b.length); i++)
-        buffer[offset + i] = b[i];
+
+    const writeStr = (strOrBytes, offset, len) => {
+      const dest = buffer.subarray(offset, offset + len);
+      if (typeof strOrBytes === "string") {
+        ENC.encodeInto(strOrBytes, dest);
+      } else {
+        // It's already Uint8Array
+        for (let i = 0; i < Math.min(len, strOrBytes.length); i++) {
+          dest[i] = strOrBytes[i];
+        }
+      }
     };
-    const writeOctal = (num, offset, len) =>
-      writeStr(num.toString(8).padStart(len - 1, "0"), offset, len - 1);
-    writeStr(name, 0, 100);
+
+    const writeOctal = (num, offset, len) => {
+      let i = offset + len - 1;
+      buffer[i] = 0;
+      i--;
+      if (num < 2147483647) {
+        while (i >= offset) {
+          buffer[i] = (num & 7) + 48;
+          num >>>= 3;
+          i--;
+        }
+      } else {
+        while (i >= offset) {
+          buffer[i] = (num % 8) + 48;
+          num = Math.floor(num / 8);
+          i--;
+        }
+      }
+    };
+
+    // Pass the pre-calculated bytes to avoid re-encoding
+    writeStr(nameBytes, 0, 100);
     writeOctal(0o664, 100, 8);
     writeOctal(0, 108, 8);
     writeOctal(0, 116, 8);
     writeOctal(size, 124, 12);
-    writeOctal(Math.floor(Date.now() / 1000), 136, 12);
+    writeOctal(time, 136, 12);
     writeStr("        ", 148, 8);
     buffer[156] = isDir ? 53 : 48;
     writeStr("ustar", 257, 6);
     writeStr("00", 263, 2);
-    if (prefix) writeStr(prefix, 345, 155);
+    if (prefixBytes.length > 0) writeStr(prefixBytes, 345, 155);
+
     let sum = 0;
     for (let i = 0; i < 512; i++) sum += buffer[i];
     writeOctal(sum, 148, 7);
@@ -129,15 +219,21 @@
       this.writer = writableStream.getWriter();
       this.pos = 0;
       this.bytesWritten = 0;
+      this.time = Math.floor(Date.now() / 1000);
     }
     async writeEntry(path, data) {
-      let bytes = typeof data === "string" ? ENC.encode(data) : data;
-      await this.write(createTarHeader(path, bytes.length));
-      await this.write(bytes);
-      await this.pad();
+      const bytes = typeof data === "string" ? ENC.encode(data) : data;
+      const header = createTarHeader(path, bytes.length, this.time);
+      const paddingLen = (512 - ((this.pos + 512 + bytes.length) % 512)) % 512;
+      const totalLen = 512 + bytes.length + paddingLen;
+      const combined = new Uint8Array(totalLen);
+
+      combined.set(header, 0);
+      combined.set(bytes, 512);
+      await this.write(combined);
     }
     async writeStream(path, size, readableStream) {
-      await this.write(createTarHeader(path, size));
+      await this.write(createTarHeader(path, size, this.time));
       await readableStream.pipeTo(
         new WritableStream({
           write: async (chunk) => {
@@ -225,33 +321,56 @@
     readable() {
       const self = this;
       let reader;
-      let buffer = new Uint8Array(0);
+      let chunks = [];
+      let totalBuffered = 0;
 
       async function readMore() {
         const { value, done } = await reader.read();
         if (done) return false;
-        if (buffer.length === 0) {
-          buffer = value;
-        } else {
-          const t = new Uint8Array(buffer.length + value.length);
-          t.set(buffer);
-          t.set(value, buffer.length);
-          buffer = t;
-        }
+        chunks.push(value);
+        totalBuffered += value.length;
         return true;
       }
 
       async function ensure(n) {
-        while (buffer.length < n) {
+        while (totalBuffered < n) {
           if (!(await readMore())) return false;
         }
         return true;
       }
 
       function consume(n) {
-        const v = buffer.slice(0, n);
-        buffer = buffer.slice(n);
-        return v;
+        if (n === 0) return new Uint8Array(0);
+        if (chunks[0] && chunks[0].length >= n) {
+          const result = chunks[0].slice(0, n);
+          if (chunks[0].length === n) {
+            chunks.shift();
+          } else {
+            chunks[0] = chunks[0].subarray(n);
+          }
+          totalBuffered -= n;
+          return result;
+        }
+
+        // Otherwise, merge just enough chunks
+        const res = new Uint8Array(n);
+        let offset = 0;
+        while (offset < n) {
+          const chunk = chunks[0];
+          const remaining = n - offset;
+          const toCopy = Math.min(chunk.length, remaining);
+
+          res.set(chunk.subarray(0, toCopy), offset);
+          offset += toCopy;
+
+          if (toCopy === chunk.length) {
+            chunks.shift();
+          } else {
+            chunks[0] = chunk.subarray(toCopy);
+          }
+        }
+        totalBuffered -= n;
+        return res;
       }
 
       return new ReadableStream({
@@ -266,7 +385,6 @@
 
             // Consume initial empty block
             if (!(await ensure(16))) throw new Error("Corrupt header");
-            const hIv = consume(12);
             const hLen = new DataView(consume(4).buffer).getUint32(0, true);
             if (!(await ensure(hLen))) throw new Error("Corrupt header");
             consume(hLen); // discard empty block ciphertext
@@ -312,6 +430,7 @@
   }
 
   async function exportData(config = {}) {
+    blobIdCounter = 0;
     const CBOR = window.CBOR;
     const opts = {
       fileName: "archive",
@@ -339,7 +458,7 @@
         outputStream = await handle.createWritable();
       } catch (e) {
         if (e.name === "AbortError") return logger("Export cancelled.");
-        console.warn("FS Picker failed, fallback to blob");
+        console.warn("FS Picker failed, falling back to WritableStream.");
       }
     }
 
@@ -388,7 +507,7 @@
         `Exporting... (${(outputBytesWritten / 1024 / 1024).toFixed(2)} MB)`
       );
     };
-    const progressInterval = setInterval(reportProgress, 250);
+    const progressInterval = setInterval(reportProgress, 100);
 
     try {
       for (const item of opts.customItems) {
@@ -437,6 +556,7 @@
         const dbs = await window.indexedDB.databases();
         for (const { name, version } of dbs) {
           if (!isAllowed("idb", name, opts) || !opts.dbFilter(name)) continue;
+          const safeName = encodeURIComponent(name);
           logger(`Scanning IDB: ${name}`);
 
           const db = await new Promise((res, rej) => {
@@ -447,8 +567,8 @@
           });
 
           const storeNames = Array.from(db.objectStoreNames);
+          const stores = [];
           if (storeNames.length > 0) {
-            const stores = [];
             const tx = db.transaction(storeNames, "readonly");
             for (const sName of storeNames) {
               const s = tx.objectStore(sName);
@@ -467,67 +587,70 @@
                 }),
               });
             }
-            await tar.writeEntry(
-              `data/idb/${name}/schema.cbor`,
-              CBOR.encode({ name, version, stores })
-            );
+          }
+          // Write empty DBs too because some stuff uses 'em
+          await tar.writeEntry(
+            `data/idb/${safeName}/schema.cbor`,
+            CBOR.encode({ name, version, stores })
+          );
 
-            // IDB Iteration with Yielding
-            let lastYield = performance.now();
-            for (const sName of storeNames) {
-              logger(`Archiving IDB: ${name}/${sName}`);
-              let lastKey = null;
-              let chunkId = 0;
-              let hasMore = true;
+          // IDB Iteration with Yielding
+          let lastYield = Date.now();
+          for (const sName of storeNames) {
+            logger(`Archiving IDB: ${name}/${sName}`);
+            let lastKey = null;
+            let chunkId = 0;
+            let hasMore = true;
 
-              while (hasMore) {
-                if (performance.now() - lastYield > 100) {
-                  await new Promise((r) => setTimeout(r, 0));
-                  lastYield = performance.now();
+            while (hasMore) {
+              if (Date.now() - lastYield > 100) {
+                await yieldToMain();
+                lastYield = Date.now();
+              }
+
+              const batch = await new Promise((res, rej) => {
+                const t = db.transaction(sName, "readonly");
+                const s = t.objectStore(sName);
+                const range =
+                  lastKey !== null
+                    ? IDBKeyRange.lowerBound(lastKey, true)
+                    : null;
+                const req = s.openCursor(range);
+                const items = [];
+                req.onsuccess = (e) => {
+                  const c = e.target.result;
+                  if (c) {
+                    items.push({ k: c.key, v: c.value });
+                    if (items.length < 200) c.continue();
+                    else res(items);
+                  } else res(items);
+                };
+                req.onerror = () => rej(t.error);
+              });
+
+              if (batch.length > 0) {
+                lastKey = batch[batch.length - 1].k;
+                const encBatch = [];
+                const blobsInBatch = [];
+                for (const item of batch) {
+                  const val = prepForCBOR(item.v, blobsInBatch);
+                  encBatch.push({ k: item.k, v: val });
                 }
-
-                const batch = await new Promise((res, rej) => {
-                  const t = db.transaction(sName, "readonly");
-                  const s = t.objectStore(sName);
-                  const range =
-                    lastKey !== null
-                      ? IDBKeyRange.lowerBound(lastKey, true)
-                      : null;
-                  const req = s.openCursor(range);
-                  const items = [];
-                  req.onsuccess = (e) => {
-                    const c = e.target.result;
-                    if (c) {
-                      items.push({ k: c.key, v: c.value });
-                      if (items.length < 200) c.continue();
-                      else res(items);
-                    } else res(items);
-                  };
-                  req.onerror = () => rej(t.error);
-                });
-
-                if (batch.length > 0) {
-                  lastKey = batch[batch.length - 1].k;
-                  const encBatch = [];
-                  const blobsInBatch = [];
-                  for (const item of batch) {
-                    const val = await prepForCBOR(item.v, blobsInBatch);
-                    encBatch.push({ k: item.k, v: val });
-                  }
-                  for (const b of blobsInBatch) {
-                    await tar.writeStream(
-                      `data/blobs/${b.uuid}`,
-                      b.blob.size,
-                      b.blob.stream()
-                    );
-                  }
-                  await tar.writeEntry(
-                    `data/idb/${name}/${sName}/${chunkId++}.cbor`,
-                    CBOR.encode(encBatch)
+                for (const b of blobsInBatch) {
+                  await tar.writeStream(
+                    `data/blobs/${b.uuid}`,
+                    b.blob.size,
+                    b.blob.stream()
                   );
-                } else {
-                  hasMore = false;
                 }
+                await tar.writeEntry(
+                  `data/idb/${safeName}/${encodeURIComponent(
+                    sName
+                  )}/${chunkId++}.cbor`,
+                  CBOR.encode(encBatch)
+                );
+              } else {
+                hasMore = false;
               }
             }
           }
@@ -710,44 +833,59 @@
       } catch (e) {}
 
       let buffer = new Uint8Array(0);
+      let cursor = 0;
       let done = false;
       let totalRead = 0;
-      let lastLog = 0;
 
       async function readMore() {
         const { value, done: d } = await reader.read();
-        if (d) done = true;
-        else {
+        if (d) {
+          done = true;
+        } else {
           totalRead += value.length;
-          if (buffer.length === 0) buffer = value;
-          else {
-            const t = new Uint8Array(buffer.length + value.length);
-            t.set(buffer);
-            t.set(value, buffer.length);
+          const remaining = buffer.length - cursor;
+          if (remaining === 0) {
+            // Nothing left, just swap
+            buffer = value;
+            cursor = 0;
+          } else {
+            // Combine ONLY what's left + new data
+            const t = new Uint8Array(remaining + value.length);
+            t.set(buffer.subarray(cursor), 0); // Zero-copy view for source
+            t.set(value, remaining);
             buffer = t;
+            cursor = 0; // Reset cursor for the new buffer
           }
         }
       }
 
       async function ensure(n) {
-        while (buffer.length < n && !done) await readMore();
-        return buffer.length >= n;
+        // Check availability relative to cursor
+        while (buffer.length - cursor < n && !done) {
+          await readMore();
+        }
+        return buffer.length - cursor >= n;
       }
 
       function consume(n) {
-        const v = buffer.slice(0, n);
-        buffer = buffer.slice(n);
+        // Zero-copy view!
+        const v = buffer.subarray(cursor, cursor + n);
+        cursor += n;
         return v;
       }
 
       async function streamToWriter(writer, size) {
         let remaining = size;
-        if (buffer.length > 0) {
-          const toWrite = Math.min(buffer.length, remaining);
-          await writer.write(buffer.slice(0, toWrite));
-          buffer = buffer.slice(toWrite);
+
+        const available = buffer.length - cursor;
+        if (available > 0) {
+          const toWrite = Math.min(available, remaining);
+          await writer.write(buffer.subarray(cursor, cursor + toWrite));
+          cursor += toWrite;
           remaining -= toWrite;
         }
+
+        // Stream directly
         while (remaining > 0) {
           const { value, done: d } = await reader.read();
           if (d) {
@@ -755,16 +893,48 @@
             break;
           }
           totalRead += value.length;
+
           if (value.length <= remaining) {
             await writer.write(value);
             remaining -= value.length;
           } else {
-            await writer.write(value.slice(0, remaining));
-            buffer = value.slice(remaining);
+            await writer.write(value.subarray(0, remaining));
+            buffer = value;
+            cursor = remaining; // Set cursor to start after the written part
             remaining = 0;
           }
         }
         await writer.close();
+      }
+
+      async function skip(size) {
+        let remaining = size;
+        while (remaining > 0) {
+          const available = buffer.length - cursor;
+          if (available > 0) {
+            const take = Math.min(available, remaining);
+            cursor += take;
+            remaining -= take;
+          } else {
+            // Buffer exhausted, read more
+            const { value, done: d } = await reader.read();
+            if (d) {
+              done = true;
+              break;
+            }
+            totalRead += value.length;
+
+            if (value.length <= remaining) {
+              remaining -= value.length;
+              // We consumed the whole chunk implicitly, no need to buffer it
+            } else {
+              // We read more than we need to skip
+              buffer = value;
+              cursor = remaining;
+              remaining = 0;
+            }
+          }
+        }
       }
 
       async function readToMemory(size) {
@@ -772,36 +942,15 @@
         return consume(size);
       }
 
-      async function skip(size) {
-        let remaining = size;
-        while (remaining > 0) {
-          if (buffer.length > 0) {
-            const take = Math.min(buffer.length, remaining);
-            buffer = buffer.slice(take);
-            remaining -= take;
-          } else {
-            const { value, done: d } = await reader.read();
-            if (d) {
-              done = true;
-              break;
-            }
-            totalRead += value.length;
-            if (value.length <= remaining) remaining -= value.length;
-            else {
-              buffer = value.slice(remaining);
-              remaining = 0;
-            }
-          }
-        }
-      }
-
+      var lastLog = Date.now();
       while (true) {
+        var now = Date.now();
         if (now - lastLog > 100) {
           logger(
             `Importing... (${(totalRead / 1024 / 1024).toFixed(2)} MB read)`
           );
           lastLog = now;
-          await new Promise((r) => setTimeout(r, 0));
+          await yieldToMain();
         }
 
         if (!(await ensure(512))) break;
@@ -836,9 +985,14 @@
                 create: true,
               });
               const w = await fh.createWritable();
-              await streamToWriter(w, size);
-            } else {
-              await skip(size);
+              try {
+                await streamToWriter(w, size);
+              } catch (err) {
+                try {
+                  await w.abort();
+                } catch (_) {}
+                throw err;
+              }
             }
           } else {
             // JSON/CBOR metadata for simpler data
@@ -846,7 +1000,6 @@
               await skip(padding);
               continue;
             }
-            // Potential bottleneck with memory here
             const d = await readToMemory(size);
 
             if (name === "data/ls.json") {
@@ -865,13 +1018,17 @@
               CBOR &&
               opts.idb !== false
             ) {
-              // IndexedDB Restoration
               const parts = name.split("/");
-              const dbName = parts[2];
+              const dbName = decodeURIComponent(parts[2]);
 
               if (name.endsWith("schema.cbor")) {
                 const schema = CBOR.decode(d);
-                if (dbCache[dbName]) dbCache[dbName].close();
+
+                // Close cached connection so we can delete/upgrade
+                if (dbCache[dbName]) {
+                  dbCache[dbName].close();
+                  dbCache[dbName] = null;
+                }
 
                 await new Promise((r) => {
                   const q = indexedDB.deleteDatabase(schema.name);
@@ -906,12 +1063,13 @@
                   req.onerror = rej;
                 });
               } else {
-                const storeName = parts[3];
+                const storeName = decodeURIComponent(parts[3]);
                 const records = await restoreFromCBOR(
                   CBOR.decode(d),
                   tempBlobDir
                 );
 
+                // Re-open DB if it was closed or not yet opened
                 if (!dbCache[dbName]) {
                   dbCache[dbName] = await new Promise((res, rej) => {
                     const r = indexedDB.open(dbName);
@@ -919,11 +1077,31 @@
                     r.onerror = rej;
                   });
                 }
-                const tx = dbCache[dbName].transaction(storeName, "readwrite");
-                const st = tx.objectStore(storeName);
-                records.forEach((r) =>
-                  st.put(r.v, st.keyPath ? undefined : r.k)
-                );
+
+                // Safe transaction handling
+                try {
+                  const tx = dbCache[dbName].transaction(
+                    storeName,
+                    "readwrite"
+                  );
+                  const st = tx.objectStore(storeName);
+                  await Promise.all(
+                    records.map(
+                      (r) =>
+                        new Promise((resolve) => {
+                          const req = st.put(r.v, st.keyPath ? undefined : r.k);
+                          req.onsuccess = resolve;
+                          // Prevent one bad record from failing the whole import
+                          req.onerror = (e) => {
+                            alert("IndexedDB importing issue occured:\n" + e);
+                            resolve();
+                          };
+                        })
+                    )
+                  );
+                } catch (e) {
+                  console.warn(`Failed to import batch to ${storeName}:`, e);
+                }
               }
             }
           }
@@ -944,8 +1122,15 @@
 
               const fh = await dir.getFileHandle(fname, { create: true });
               const w = await fh.createWritable();
-              if (size > 0) await streamToWriter(w, size);
-              else await w.close();
+              try {
+                if (size > 0) await streamToWriter(w, size);
+                else await w.close();
+              } catch (err) {
+                try {
+                  await w.abort();
+                } catch (_) {}
+                throw err;
+              }
             } else {
               if (size > 0) await skip(size);
             }

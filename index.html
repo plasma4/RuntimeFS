@@ -80,7 +80,7 @@
         input:focus,
         textarea:focus {
             background-color: #5d5ba3;
-            filter: drop-shadow(0 0 8px white);
+            box-shadow: 0 0 8px white;
         }
 
         input::placeholder,
@@ -141,7 +141,8 @@
         <label for="folderName">Folder Name:</label>
         <input type="text" id="folderName" placeholder="Enter a name...">
         <button onclick="uploadFolder()">Upload Folder</button>
-        <button onclick="syncFiles()">Sync</button>
+        <button onclick="syncFiles()" class="supportCheck">Sync</button>
+        <span id="syncInfo" class="supportCheck"></span>
         <input type="file" id="folderUploadFallbackInput" webkitdirectory directory style="display: none">
         <hr>
         <label for="openFolderName">Folder to Open:</label>
@@ -149,8 +150,8 @@
         <label for="fileName" placeholder="File name...">File:</label>
         <input type="text" id="fileName" placeholder="index.html (optional)">
         <button onclick="openFile()">Open</button>
-        <button onclick="openFileInPlace()">In-Place Open</button>
-        <button onclick="syncAndOpenFile()">Sync and Open</button>
+        <button onclick="openFileInPlace()" class="supportCheck">In-Place Open</button>
+        <button onclick="syncAndOpenFile()" class="supportCheck">Sync and Open</button>
     </fieldset>
 
     <fieldset>
@@ -191,14 +192,16 @@
         <legend>
             <h2>Advanced</h2>
         </legend>
-        
+
         <h3>Regex Replacement</h3>
         Spaces required; disabled for files over 10MB. File name matching also uses regex.
+        <br>
+        Replace | with || and $ with $$ to only match the first instance.
+        Replace regexHere or plain text with <code>{{SCRIPT}}</code> to inject a script into the HTML.
         <ul>
-            <li><code>* | regexHere -> replacement</code> (Global Regex)</li>
-            <li><code>file.js $ plain text -> replacement</code> (Global Plain Text)</li>
-            <li><code>file.js || singleRegex -> replacement</code> (First Match Regex)</li>
-            <li><code>file.js $$ single plain text -> replacement</code> (First Match Plain Text)</li>
+            <li><code>* | regexHere -> replacement</code></li>
+            <li><code>file.js $ plain text -> replacement</code></li>
+            <li><code>index.html $ {{SCRIPT}} -> alert(1)</code></li>
         </ul>
         <textarea id="regex" rows="5" cols="40" placeholder="Enter rules here..."></textarea>
         <hr>
@@ -209,14 +212,16 @@
             <li><code>*.html -> Content-Security-Policy: default-src 'self'; worker-src 'self' blob:;</code></li>
         </ul>
         <textarea id="headers" rows="5" cols="40" placeholder="Enter headers here..."></textarea>
-        <hr>
-        <h3>Encrypt Folders</h3>
-        You can encrypt a folder into a bunch of files.
-        <br><br>
-        <label for="encryptFolderName">Folder Name:</label>
-        <input type="text" id="encryptFolderName" placeholder="Enter a name...">
-        <br>
-        <button onclick="uploadAndEncryptWithPassword()">Password Encrypt Folder (in-browser)</button>
+        <div class="supportCheck">
+            <hr>
+            <h3>Encrypt Folders</h3>
+            You can encrypt a folder into a bunch of files.
+            <br><br>
+            <label for="encryptFolderName">Folder Name:</label>
+            <input type="text" id="encryptFolderName" placeholder="Enter a name...">
+            <br>
+            <button onclick="uploadAndEncryptWithPassword()">Password Encrypt Folder (in-browser)</button>
+        </div>
     </fieldset>
 </body>
 

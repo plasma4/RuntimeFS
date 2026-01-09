@@ -472,7 +472,7 @@ async function writeStreamToOpfs(
   const parts = path.split("/");
   const fileName = parts.pop();
 
-  // Helper: Create a FRESH stream for every attempt
+  // Fresh stream for each attempt
   const attemptUpload = async (dirHandle) => {
     const fileHandle = await dirHandle.getFileHandle(fileName, {
       create: true,
@@ -1184,20 +1184,11 @@ async function openFileInPlace() {
     const baseTag = `<base href="${basePath}">`;
 
     let metaTags = "";
-    const supportedMetaHeaders = [
-      "content-security-policy",
-      "x-ua-compatible",
-      "content-type",
-      "default-style",
-      "refresh",
-      "referrer-policy", // (Experimental support in some browsers via meta)
-    ];
-
     resp.headers.forEach((val, name) => {
-      if (supportedMetaHeaders.includes(name.toLowerCase())) {
-        const safeVal = val.replace(/"/g, "&quot;");
-        metaTags += `<meta http-equiv="${name}" content="${safeVal}">\n`;
-      }
+      metaTags += `<meta http-equiv="${val.replace(
+        /"/g,
+        "&quot;"
+      )}" content="${safeVal}">\n`;
     });
 
     if (/<head\b[^>]*>/i.test(html)) {

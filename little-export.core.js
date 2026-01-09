@@ -311,12 +311,10 @@
     }
   }
 
-  // Improved DecryptionSource that doesn't merge arrays aggressively
   class DecryptionSource {
     constructor(readableStream, password) {
       this.stream = readableStream;
       this.password = password;
-      this.buffer = new Uint8Array(0);
     }
     readable() {
       const self = this;
@@ -341,8 +339,10 @@
 
       function consume(n) {
         if (n === 0) return new Uint8Array(0);
+
+        // Fast path: first chunk has enough data
         if (chunks[0] && chunks[0].length >= n) {
-          const result = chunks[0].slice(0, n);
+          const result = chunks[0].subarray(0, n);
           if (chunks[0].length === n) {
             chunks.shift();
           } else {
@@ -352,7 +352,7 @@
           return result;
         }
 
-        // Otherwise, merge just enough chunks
+        // Merge logic
         const res = new Uint8Array(n);
         let offset = 0;
         while (offset < n) {
@@ -378,34 +378,45 @@
           reader = self.stream.getReader();
           try {
             if (!(await ensure(22))) throw new Error("File too small");
+            // Avoid manual byte comparison issues
             const sig = new TextDecoder().decode(consume(6));
             if (sig !== "LE_ENC") throw new Error("Not an encrypted archive");
+
             const salt = consume(16);
             const key = await deriveKey(self.password, salt);
-
-            // Consume initial empty block
             if (!(await ensure(16))) throw new Error("Corrupt header");
-            const hLen = new DataView(consume(4).buffer).getUint32(0, true);
+
+            const hLenRaw = consume(4);
+            const hLen = new DataView(
+              hLenRaw.buffer,
+              hLenRaw.byteOffset,
+              hLenRaw.byteLength
+            ).getUint32(0, true);
+
             if (!(await ensure(hLen))) throw new Error("Corrupt header");
             consume(hLen); // discard empty block ciphertext
 
             while (true) {
-              if (buffer.length < 16) {
-                if (!(await readMore())) {
-                  if (buffer.length === 0) break; // Clean EOF
-                  // If bytes remain but less than 16, it's corrupt or truncated
-                  if (buffer.length < 16) break;
+              // Check if we have enough for the next header (IV + Len = 16 bytes)
+              if (totalBuffered < 16) {
+                if (!(await ensure(16))) {
+                  // If clean EOF (0 bytes left), we are done
+                  if (totalBuffered === 0) break;
+                  // If partial bytes left, stream is truncated
+                  throw new Error("Truncated encrypted stream");
                 }
               }
-              // Need at least 16 bytes for IV+Len
-              if (buffer.length < 16) await ensure(16);
-              if (buffer.length < 16) break;
 
               const iv = consume(12);
-              const lenVal = new DataView(consume(4).buffer).getUint32(0, true);
+              const lenRaw = consume(4);
+              const lenVal = new DataView(
+                lenRaw.buffer,
+                lenRaw.byteOffset,
+                lenRaw.byteLength
+              ).getUint32(0, true);
 
               // Ensure we have the full ciphertext chunk
-              while (buffer.length < lenVal) {
+              while (totalBuffered < lenVal) {
                 if (!(await readMore()))
                   throw new Error("Unexpected EOF in ciphertext");
               }
@@ -510,6 +521,7 @@
     const progressInterval = setInterval(reportProgress, 100);
 
     try {
+      // Archive optional custom data if specified
       for (const item of opts.customItems) {
         logger(`Archiving custom: ${item.path}`);
         const path = `data/custom/${item.path}`;
@@ -594,7 +606,6 @@
             CBOR.encode({ name, version, stores })
           );
 
-          // IDB Iteration with Yielding
           let lastYield = Date.now();
           for (const sName of storeNames) {
             logger(`Archiving IDB: ${name}/${sName}`);
@@ -749,7 +760,9 @@
     try {
       let rawStream;
       if (typeof sourceInput === "string") {
-        // Assume URL (HTTPS link)
+        if (!sourceInput.startsWith("http")) {
+          sourceInput = "https://" + sourceInput;
+        }
         const response = await fetch(sourceInput);
         if (!response.ok) {
           throw new Error(
@@ -849,7 +862,7 @@
             buffer = value;
             cursor = 0;
           } else {
-            // Combine ONLY what's left + new data
+            // Combine ONLY what's left and new data
             const t = new Uint8Array(remaining + value.length);
             t.set(buffer.subarray(cursor), 0); // Zero-copy view for source
             t.set(value, remaining);

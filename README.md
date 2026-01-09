@@ -53,8 +53,9 @@ Not all applications will work! Out of the many sites I tested, there were the m
 
 Also note:
 - File names are case-sensitive.
+- On first load, uploading a folder in Firefox and opening it might not work; reloading should fix this issue.
 - Using the tool in Incognito will probably fail due to restrictions on memory or ServiceWorkers (browser dependent).
-- Headers currently **do not work** for in-place opening and Firefox.
+- Some headers like CSP currently **do not work** for in-place opening. Headers might also pose security risks!
 - Cookie exporting does not store `max-age`; only the key and value.
 - The most likely reason that data export fails when transferring between sites is because those websites use URL properties as part of the key (either from `document.URL` or `location`). You might be able to force a site to use a hardcoded URL for storage with clever regex or code changes.
 - Using regex requires any matched files to be fully loaded into memory, reducing performance. Be careful!
@@ -66,5 +67,5 @@ A single-file plugin exists for customizing cache in the `plugin` (or requesting
 
 ### TODO
 - Devtools panel (for some cases where Inspect is unavailable, using something like Eruda)
-- LittleExport improvements
+- LittleExport improvements (see its [dedicated repo](https://github.com/plasma4/LittleExport))
 - More complete documentation

@@ -9,6 +9,7 @@ let currentlyBusy = false;
 let folderName, dirHandle, observer;
 let changes = [];
 
+let _registryCache = null;
 let _opfsRoot = null;
 async function getOpfsRoot() {
   if (!_opfsRoot) _opfsRoot = await navigator.storage.getDirectory();
@@ -89,17 +90,34 @@ async function waitForController() {
 }
 
 async function getRegistry() {
-  try {
-    const root = await getOpfsRoot();
-    const handle = await root.getFileHandle(SYSTEM_FILE);
-    const file = await handle.getFile();
-    return JSON.parse(await file.text());
-  } catch (e) {
-    return {};
-  }
+  if (_registryCache) return _registryCache;
+
+  // Use a lock with mode: 'shared' to allow concurrent reads,
+  // but block if a 'exclusive' lock (writing) is active.
+  return await navigator.locks.request(
+    "rfs_registry_lock",
+    { mode: "shared" },
+    async () => {
+      // Double check cache after acquiring lock
+      if (_registryCache) return _registryCache;
+      try {
+        const root = await getOpfsRoot();
+        const handle = await root.getFileHandle(SYSTEM_FILE);
+        const file = await handle.getFile();
+        const text = await file.text();
+        _registryCache = text ? JSON.parse(text) : {};
+      } catch (e) {
+        // If file doesn't exist or is empty
+        _registryCache = {};
+      }
+      return _registryCache;
+    }
+  );
 }
 
 async function saveRegistry(registry) {
+  // Update local cache immediately
+  _registryCache = registry;
   const root = await getOpfsRoot();
   const handle = await root.getFileHandle(SYSTEM_FILE, { create: true });
   const writable = await handle.createWritable();
@@ -108,8 +126,20 @@ async function saveRegistry(registry) {
 }
 
 async function updateRegistryEntry(name, data) {
+  // Lock exclusively for writing
   await navigator.locks.request("rfs_registry_lock", async () => {
-    const reg = await getRegistry();
+    // Force a fresh read inside the lock to ensure we have the latest state on disk
+    // (In case another tab updated it)
+    let reg;
+    try {
+      const root = await getOpfsRoot();
+      const handle = await root.getFileHandle(SYSTEM_FILE);
+      const file = await handle.getFile();
+      reg = JSON.parse(await file.text());
+    } catch (e) {
+      reg = {};
+    }
+
     if (data === null) {
       delete reg[name];
     } else {
@@ -962,31 +992,6 @@ async function uploadAndEncryptWithPassword() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  function setupServiceWorkerListeners() {
-    if (!("serviceWorker" in navigator)) return;
-    navigator.serviceWorker
-      .register(SW_LINK)
-      .then((reg) => {
-        reg.addEventListener("updatefound", () => {
-          const newWorker = reg.installing;
-          newWorker.addEventListener("statechange", () => {
-            if (
-              newWorker.state === "installed" &&
-              navigator.serviceWorker.controller
-            ) {
-              location.reload();
-            }
-          });
-        });
-      })
-      .catch(console.error);
-    navigator.serviceWorker.addEventListener("message", async (event) => {
-      if (event.data && event.data.type === "SW_READY") await listFolders();
-      if (event.data && event.data.type === "INVALIDATE_CACHE")
-        await listFolders();
-    });
-  }
-
   document.getElementById("folderName").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !currentlyBusy) {
       uploadFolder();
@@ -1099,7 +1104,29 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  setupServiceWorkerListeners();
+  if (!("serviceWorker" in navigator)) return;
+  navigator.serviceWorker
+    .register(SW_LINK)
+    .then((reg) => {
+      reg.addEventListener("updatefound", () => {
+        const newWorker = reg.installing;
+        newWorker.addEventListener("statechange", () => {
+          if (
+            newWorker.state === "installed" &&
+            navigator.serviceWorker.controller
+          ) {
+            location.reload();
+          }
+        });
+      });
+    })
+    .catch(console.error);
+  navigator.serviceWorker.addEventListener("message", async (event) => {
+    if (event.data && event.data.type === "SW_READY") await listFolders();
+    if (event.data && event.data.type === "INVALIDATE_CACHE")
+      await listFolders();
+  });
+
   listFolders();
 
   const rT = document.getElementById("regex");
@@ -1125,6 +1152,12 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 async function openFileInPlace() {
+  if (!navigator.serviceWorker.controller) {
+    alert(
+      "Service Worker is not controlling the page. Please reload and try again."
+    );
+    return;
+  }
   const folderName = document.getElementById("openFolderName").value.trim();
   const fileName = document.getElementById("fileName").value.trim();
   if (!folderName) return alert("Provide a folder name.");
@@ -1133,7 +1166,9 @@ async function openFileInPlace() {
   try {
     const registry = await getRegistry();
     const meta = registry[folderName];
-    if (!meta) return alert("Folder not found.");
+    if (!meta) {
+      return alert("Folder not found.");
+    }
 
     const rules = document.getElementById("regex").value.trim();
     const headers = document.getElementById("headers").value.trim();
@@ -1145,25 +1180,29 @@ async function openFileInPlace() {
     let key = null;
     if (meta.encryptionType === "password") {
       const password = prompt(`Enter password for "${folderName}":`);
-      if (!password) return;
+      if (!password) {
+        return setUiBusy(false);
+      }
       key = await deriveKeyFromPassword(password, base64ToBuffer(meta.salt));
     }
 
     const sw = await waitForController();
-    if (!navigator.serviceWorker.controller) {
-      alert(
-        "Service Worker is not controlling the page. Please reload and try again."
-      );
-      return;
-    }
-
-    await new Promise((resolve) => {
-      const channel = new MessageChannel();
-      channel.port1.onmessage = () => resolve();
-      sw.postMessage({ type: "SET_RULES", rules, headers, key, folderName }, [
-        channel.port2,
-      ]);
-    });
+    // Wrap SW communication in a race to ensure we don't hang forever
+    await Promise.race([
+      new Promise((resolve) => {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = () => resolve();
+        sw.postMessage({ type: "SET_RULES", rules, headers, key, folderName }, [
+          channel.port2,
+        ]);
+      }),
+      new Promise((_, reject) =>
+        setTimeout(
+          () => reject(new Error("Service Worker response timeout")),
+          4000
+        )
+      ),
+    ]);
 
     const encodedPath = fileName
       ? fileName.split("/").map(encodeURIComponent).join("/")
@@ -1184,11 +1223,12 @@ async function openFileInPlace() {
     const baseTag = `<base href="${basePath}">`;
 
     let metaTags = "";
-    resp.headers.forEach((val, name) => {
-      metaTags += `<meta http-equiv="${val.replace(
+    // FIXED: capture both value (val) and key (key)
+    resp.headers.forEach((val, key) => {
+      metaTags += `<meta http-equiv="${key.replace(
         /"/g,
         "&quot;"
-      )}" content="${safeVal}">\n`;
+      )}" content="${val.replace(/"/g, "&quot;")}">\n`;
     });
 
     if (/<head\b[^>]*>/i.test(html)) {

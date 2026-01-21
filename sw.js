@@ -1,5 +1,7 @@
-const APP_SHELL_FILES = ["./", "./index.html", "./main.min.js", "sw.min.js"];
-let pendingNavData = null;
+const APP_SHELL_FILES = ["./", "./index.html", "./main.min.js", "sw.min.js"]; // If you're using .php or some other configuration, make sure to change this!
+const NETWORK_ALLOWLIST_PREFIXES = []; // For custom bypassing of the virtual file system (not used by default)
+
+let pendingNavData = null; // for next navigation request
 const clientSessionStore = new Map();
 const handleCache = new Map();
 const manifestCache = new Map();
@@ -8,9 +10,8 @@ const ruleCache = new Map();
 const RFS_PREFIX = "rfs";
 const SYSTEM_FILE = "rfs_system.json";
 const CACHE_NAME = "fc";
-const NETWORK_ALLOWLIST_PREFIXES = [];
 const FULL_APP_SHELL_URLS = APP_SHELL_FILES.map(
-  (file) => new URL(file, self.location.href).href
+  (file) => new URL(file, self.location.href).href,
 );
 
 const STORE_ENTRY_TTL = 600000;
@@ -69,7 +70,7 @@ function getMimeType(filePath) {
     bin: "application/octet-stream",
     dat: "application/octet-stream",
   };
-  return mimeTypes[ext] || "application/octet-stream";
+  return mimeTypes[ext] || "text/plain";
 }
 
 let registryCache = null;
@@ -111,7 +112,7 @@ function compileRules(rulesString) {
 
     // Parse the operator (like | or $$)
     const operatorMatch = matchPart.match(
-      /^(.*?)\s+(\$|\$\$|\|\||\|)\s+(.*)$/s
+      /^(.*?)\s+(\$|\$\$|\|\||\|)\s+(.*)$/s,
     );
     if (!operatorMatch) continue;
 
@@ -119,7 +120,7 @@ function compileRules(rulesString) {
     const [, fileMatch, operator, searchPattern] = operatorMatch;
     try {
       const fileRegex = new RegExp(
-        fileMatch.trim() === "*" ? ".*" : fileMatch.trim()
+        fileMatch.trim() === "*" ? ".*" : fileMatch.trim(),
       );
       let searchRegex;
 
@@ -161,7 +162,7 @@ function compileRules(rulesString) {
 function applyRegexRules(filePath, fileBuffer, fileType, compiledRules) {
   if (
     !/^(text\/|application\/(javascript|json|xml|x-javascript|typescript))/.test(
-      fileType
+      fileType,
     )
   )
     return fileBuffer;
@@ -226,7 +227,7 @@ self.addEventListener("install", async function () {
       } catch (e) {
         console.warn("Failed to cache app shell file:", url);
       }
-    })
+    }),
   );
   await self.skipWaiting();
 });
@@ -243,7 +244,7 @@ self.addEventListener("activate", (e) => {
         includeUncontrolled: true,
       });
       for (const client of allClients) client.postMessage({ type: "SW_READY" });
-    })()
+    })(),
   );
 });
 
@@ -304,7 +305,7 @@ self.addEventListener("message", (e) => {
                 folderName: e.data.folderName,
               });
           }
-        })()
+        })(),
       );
       break;
 
@@ -342,7 +343,7 @@ function parseCustomHeaders(rulesString) {
               .replace(/\./g, "\\.")
               .replace(/\*/g, ".*")
               .replace(/\?/g, ".") +
-            "$"
+            "$",
         );
         rules.push({ regex, header: headerName, value: headerValue });
       } catch (e) {}
@@ -368,10 +369,17 @@ self.addEventListener("fetch", (e) => {
     NETWORK_ALLOWLIST_PREFIXES.some((prefix) => url.pathname.startsWith(prefix))
   ) {
     return;
+  } else if (url.pathname.startsWith(virtualPathPrefix)) {
+    const virtualPath = url.pathname.substring(virtualPathPrefix.length);
+    // If there are no slashes remaining, it's a root folder access (e.g. "MyFolder")
+    // A correct path would be "MyFolder/" or "MyFolder/file.html"
+    if (!virtualPath.includes("/")) {
+      e.respondWith(Response.redirect(url.href + "/", 301));
+      return;
+    }
   }
 
   const cleanUrl = url.origin + url.pathname;
-
   let virtualReferrerPath = null;
   if (request.referrer && url.origin === self.location.origin) {
     try {
@@ -402,7 +410,7 @@ self.addEventListener("fetch", (e) => {
         }
 
         return response;
-      })()
+      })(),
     );
     return;
   }
@@ -412,7 +420,7 @@ self.addEventListener("fetch", (e) => {
       (async () => {
         const cached = await caches.match(request);
         return cached || fetch(request);
-      })()
+      })(),
     );
     return;
   }
@@ -431,7 +439,7 @@ async function handleEncryptedRequest(
   filePath,
   key,
   request,
-  customHeaders
+  customHeaders,
 ) {
   try {
     const CHUNK_SIZE = 1024 * 1024 * 4;
@@ -455,7 +463,7 @@ async function handleEncryptedRequest(
         const dec = await crypto.subtle.decrypt(
           { name: "AES-GCM", iv },
           key,
-          encData
+          encData,
         );
         manifest = JSON.parse(new TextDecoder().decode(dec));
         if (manifestCache.size > 5) {
@@ -488,7 +496,7 @@ async function handleEncryptedRequest(
       opfsRoot,
       folderName,
       "content",
-      fileMeta.id
+      fileMeta.id,
     );
     const rawFile = await rawFileHandle.getFile();
 
@@ -529,7 +537,7 @@ async function handleEncryptedRequest(
 
             const slicedBlob = rawFile.slice(
               rawOffset,
-              rawOffset + encChunkLen
+              rawOffset + encChunkLen,
             );
             const buf = await slicedBlob.arrayBuffer();
 
@@ -541,7 +549,7 @@ async function handleEncryptedRequest(
             const plain = await crypto.subtle.decrypt(
               { name: "AES-GCM", iv: chunkIv },
               key,
-              chunkCipher
+              chunkCipher,
             );
             const data = new Uint8Array(plain);
 
@@ -553,8 +561,8 @@ async function handleEncryptedRequest(
               controller.enqueue(
                 data.slice(
                   outputStart - globalChunkStart,
-                  outputEnd - globalChunkStart
-                )
+                  outputEnd - globalChunkStart,
+                ),
               );
             }
           }
@@ -626,7 +634,7 @@ async function generateResponseForVirtualFile(request, clientId) {
       url.searchParams.set("boot", "1");
       return new Response(
         `<!DOCTYPE html><script>location.replace("${url.href}");</script>`,
-        { headers: { "Content-Type": "text/html" } }
+        { headers: { "Content-Type": "text/html" } },
       );
     }
 
@@ -713,7 +721,7 @@ async function generateResponseForVirtualFile(request, clientId) {
     const finalHeaders = applyCustomHeaders(
       baseHeaders,
       relativePath,
-      compiledHeaders
+      compiledHeaders,
     );
 
     if (isEncrypted) {
@@ -727,7 +735,7 @@ async function generateResponseForVirtualFile(request, clientId) {
         relativePath,
         session.key,
         request,
-        finalHeaders
+        finalHeaders,
       );
     }
 
@@ -784,7 +792,7 @@ async function generateResponseForVirtualFile(request, clientId) {
         relativePath,
         buffer,
         contentType,
-        compiledRules
+        compiledRules,
       );
     }
 

@@ -19,7 +19,7 @@ async function getOpfsRoot() {
 function setUiBusy(isBusy) {
   currentlyBusy = isBusy;
   Array.from(document.getElementsByTagName("button")).forEach(
-    (button) => (button.disabled = currentlyBusy)
+    (button) => (button.disabled = currentlyBusy),
   );
 }
 
@@ -78,7 +78,7 @@ async function pumpStream(reader, writer, totalSize, onProgress) {
 navigator.storage
   .persist()
   .then((p) =>
-    console.log(p ? "Storage persisted." : "Storage not persisted.")
+    console.log(p ? "Storage persisted." : "Storage not persisted."),
   );
 
 async function waitForController() {
@@ -111,7 +111,7 @@ async function getRegistry() {
         _registryCache = {};
       }
       return _registryCache;
-    }
+    },
   );
 }
 
@@ -192,7 +192,7 @@ async function processFolderSelection(name, handle) {
     await decryptAndLoadFolderToOpfs(
       handle,
       encManifest,
-      await rfs.getDirectoryHandle(name, { create: true })
+      await rfs.getDirectoryHandle(name, { create: true }),
     );
     await updateRegistryEntry(name, { encryptionType: null });
   } catch (e) {
@@ -239,7 +239,7 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
     const decryptedManifestBytes = await crypto.subtle.decrypt(
       { name: "AES-GCM", iv },
       key,
-      encData
+      encData,
     );
     manifestData = JSON.parse(new TextDecoder().decode(decryptedManifestBytes));
   } catch (e) {
@@ -257,7 +257,7 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
   for (const [originalPath, meta] of entries) {
     // This will yield automatically if >100ms has passed
     await logProgress(
-      `Decrypting (${processedFiles}/${totalFiles}): ${originalPath}`
+      `Decrypting (${processedFiles}/${totalFiles}): ${originalPath}`,
     );
 
     const pathParts = originalPath.split("/");
@@ -295,15 +295,26 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
             : CHUNK_SIZE;
           const encSize = plainSize + ENCRYPTED_CHUNK_OVERHEAD;
 
-          while (buffer.length < encSize) {
+          const chunks = [];
+          let currentLen = buffer.length;
+
+          while (currentLen < encSize) {
             const { done, value } = await reader.read();
             if (done) break;
-            const newBuf = new Uint8Array(buffer.length + value.length);
-            newBuf.set(buffer);
-            newBuf.set(value, buffer.length);
-            buffer = newBuf;
+            chunks.push(value);
+            currentLen += value.length;
           }
 
+          if (chunks.length > 0) {
+            const newBuf = new Uint8Array(currentLen);
+            newBuf.set(buffer);
+            let offset = buffer.length;
+            for (const chunk of chunks) {
+              newBuf.set(chunk, offset);
+              offset += chunk.length;
+            }
+            buffer = newBuf;
+          }
           if (buffer.length < encSize) break;
 
           const chunkData = buffer.slice(0, encSize);
@@ -316,12 +327,12 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
             const plainChunk = await crypto.subtle.decrypt(
               { name: "AES-GCM", iv: chunkIv },
               key,
-              chunkCipher
+              chunkCipher,
             );
             await writable.write(new Uint8Array(plainChunk));
           } catch (e) {
             console.error(
-              `Decryption error at chunk ${chunkIndex} for ${originalPath}`
+              `Decryption error at chunk ${chunkIndex} for ${originalPath}`,
             );
           }
           chunkIndex++;
@@ -384,8 +395,8 @@ async function processFileListAndStore(name, fileList) {
         // Centralized rate-limited logging
         await logProgress(
           `Uploading ${processedCount}/${totalFiles}: ${path} (${Math.round(
-            file.size / 1024
-          )} KB)`
+            file.size / 1024,
+          )} KB)`,
         );
       }
     }
@@ -497,7 +508,7 @@ async function writeStreamToOpfs(
   path,
   fileObj,
   totalSize,
-  onProgress
+  onProgress,
 ) {
   const parts = path.split("/");
   const fileName = parts.pop();
@@ -517,7 +528,7 @@ async function writeStreamToOpfs(
         fileObj.stream().getReader(),
         writable,
         totalSize,
-        onProgress
+        onProgress,
       );
     }
   };
@@ -758,14 +769,14 @@ async function deriveKeyFromPassword(password, salt) {
     enc.encode(password),
     { name: "PBKDF2" },
     false,
-    ["deriveKey"]
+    ["deriveKey"],
   );
   return await crypto.subtle.deriveKey(
     { name: "PBKDF2", salt, iterations: 600000, hash: "SHA-256" },
     base,
     { name: "AES-GCM", length: 256 },
     true,
-    ["encrypt", "decrypt"]
+    ["encrypt", "decrypt"],
   );
 }
 
@@ -795,7 +806,7 @@ async function syncFiles() {
   clearTimeout(syncTimeout);
   syncTimeout = setTimeout(
     () => (document.getElementById("syncInfo").textContent = ""),
-    1000
+    1000,
   );
   setUiBusy(false);
 }
@@ -813,7 +824,7 @@ async function syncAndOpenFile() {
   clearTimeout(syncTimeout);
   syncTimeout = setTimeout(
     () => (document.getElementById("syncInfo").textContent = ""),
-    1000
+    1000,
   );
   openFile(folderName);
 }
@@ -937,7 +948,7 @@ async function uploadAndEncryptWithPassword() {
               const encryptedChunk = await crypto.subtle.encrypt(
                 { name: "AES-GCM", iv },
                 key,
-                buffer
+                buffer,
               );
 
               await writable.write(iv);
@@ -963,7 +974,7 @@ async function uploadAndEncryptWithPassword() {
     const encManifest = await crypto.subtle.encrypt(
       { name: "AES-GCM", iv: manifestIv },
       key,
-      manifestBuffer
+      manifestBuffer,
     );
 
     const manifestHandle = await destDir.getFileHandle("manifest.enc", {
@@ -992,6 +1003,19 @@ async function uploadAndEncryptWithPassword() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  if (window.location.protocol === "file:") {
+    alert(
+      "RuntimeFS cannot run from a local file:// context; use an online version or localhost instead.",
+    );
+    return;
+  }
+  if (!window.isSecureContext) {
+    alert("RuntimeFS cannot run in a non-secure context.");
+    return;
+  } else if (!("serviceWorker" in navigator)) {
+    alert("RuntimeFS cannot run without ServiceWorkers enabled.");
+    return;
+  }
   document.getElementById("folderName").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !currentlyBusy) {
       uploadFolder();
@@ -1080,7 +1104,7 @@ document.addEventListener("DOMContentLoaded", () => {
               let batch;
               do {
                 batch = await new Promise((res, rej) =>
-                  reader.readEntries(res, rej)
+                  reader.readEntries(res, rej),
                 );
                 for (const child of batch) {
                   queue.push({ entry: child, path: path + curr.name + "/" });
@@ -1089,7 +1113,7 @@ document.addEventListener("DOMContentLoaded", () => {
             }
 
             if (scannedCount % 50 === 0) {
-              await logProgress(`Scanning... ${scannedCount} files found`);
+              await logProgress(`Scanned ${scannedCount} files...`);
             }
           }
 
@@ -1104,7 +1128,6 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  if (!("serviceWorker" in navigator)) return;
   navigator.serviceWorker
     .register(SW_LINK)
     .then((reg) => {
@@ -1134,19 +1157,19 @@ document.addEventListener("DOMContentLoaded", () => {
   if (rT) {
     rT.value = localStorage.getItem("fsRegex") || "";
     rT.addEventListener("input", () =>
-      localStorage.setItem("fsRegex", rT.value)
+      localStorage.setItem("fsRegex", rT.value),
     );
   }
   if (hT) {
     hT.value = localStorage.getItem("fsHeaders") || "";
     hT.addEventListener("input", () =>
-      localStorage.setItem("fsHeaders", hT.value)
+      localStorage.setItem("fsHeaders", hT.value),
     );
   }
 
   if (!window.showDirectoryPicker) {
     Array.from(document.body.getElementsByClassName("supportCheck")).forEach(
-      (elem) => (elem.style.display = "none")
+      (elem) => (elem.style.display = "none"),
     );
   }
 });
@@ -1154,7 +1177,7 @@ document.addEventListener("DOMContentLoaded", () => {
 async function openFileInPlace() {
   if (!navigator.serviceWorker.controller) {
     alert(
-      "Service Worker is not controlling the page. Please reload and try again."
+      "Service Worker is not controlling the page. Please reload and try again.",
     );
     return;
   }
@@ -1199,8 +1222,8 @@ async function openFileInPlace() {
       new Promise((_, reject) =>
         setTimeout(
           () => reject(new Error("Service Worker response timeout")),
-          4000
-        )
+          4000,
+        ),
       ),
     ]);
 
@@ -1227,7 +1250,7 @@ async function openFileInPlace() {
     resp.headers.forEach((val, key) => {
       metaTags += `<meta http-equiv="${key.replace(
         /"/g,
-        "&quot;"
+        "&quot;",
       )}" content="${val.replace(/"/g, "&quot;")}">\n`;
     });
 
@@ -1236,7 +1259,7 @@ async function openFileInPlace() {
     } else if (/<html\b[^>]*>/i.test(html)) {
       html = html.replace(
         /(<html\b[^>]*>)/i,
-        `$1<head>${baseTag}${metaTags}</head>`
+        `$1<head>${baseTag}${metaTags}</head>`,
       );
     } else {
       html = `<head>${baseTag}${metaTags}</head>${html}`;

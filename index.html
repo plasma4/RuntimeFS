@@ -116,12 +116,11 @@
                 errorMessage = `Error: ${reason}`
             } else if (reason !== null && typeof reason === "object") {
                 try {
-                    errorMessage = `Object Error: ${JSON.stringify(reason)}`
+                    errorMessage = `Object error: ${JSON.stringify(reason)}`
                 } catch (e) {
-                    errorMessage = "Object Error occured (cannot display object contents)"
+                    errorMessage = "Object error occured (cannot display object contents)"
                 }
             } else {
-                // For other primitives like numbers, booleans, null, or undefined
                 errorMessage = `Error: ${String(reason)}`
             }
 

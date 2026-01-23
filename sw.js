@@ -334,7 +334,10 @@ function parseCustomHeaders(rulesString) {
       if (colonIndex === -1) return;
 
       const headerName = fullHeaderString.substring(0, colonIndex).trim();
-      const headerValue = fullHeaderString.substring(colonIndex + 1).trim();
+      const headerValue = fullHeaderString
+        .substring(colonIndex + 1)
+        .trim()
+        .replace(/^['"]|['"]$/g, ""); // remove quotes at start and end
 
       try {
         const regex = new RegExp(
@@ -726,7 +729,7 @@ async function generateResponseForVirtualFile(request, clientId) {
 
     if (isEncrypted) {
       if (!session.key)
-        return new Response("Session locked. Reload from Main.", {
+        return new Response("Session locked. Reload from the main RuntimeFS interface.", {
           status: 403,
         });
       return await handleEncryptedRequest(

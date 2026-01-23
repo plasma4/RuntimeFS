@@ -6,7 +6,7 @@ RuntimeFS is a no-nonsense `OPFS` and `ServiceWorker` file-system, served in you
 
 Imagine an offline localhost, in your browser with no server-based storage of files. It saves all files and data locally, and can easily be integrated within an existing website too (the code is MIT Licensed, and only around 100KB).
 
-After initial page load, RuntimeFS no longer needs internet connection to function. RuntimeFS also supports in-place opening of files, which doesn't require opening another tab.
+After the initial page loads, RuntimeFS no longer needs internet connection to function. RuntimeFS also supports in-place opening of files, which doesn't require opening another tab.
 
 ## Setup
 RuntimeFS utilizes [cbor-x](https://github.com/kriszyp/cbor-x) and my own [LittleExport](https://github.com/plasma4/LittleExport) tool. Both are MIT Licensed. (LittleExport is integrated directly into RuntimeFS; no separate license file is required.) Only `main.min.js` and `sw.min.js` are required for RuntimeFS to work.
@@ -21,16 +21,16 @@ Custom regex and headers save on reload and export but do not affect stored file
 To update to a newer version you can delete the ServiceWorker such as with `chrome://serviceworker-internals/`, or equivalents in other browsers, then reload/force reload.
 
 ## Browser Support
-(Safari has to be version 26.0 or above due to [`createWritable`](https://caniuse.com/mdn-api_filesystemfilehandle_createwritable), although I'm unable to verify if anything else is broken on my device for the newest Safari versions.)
-
 File System API features (such as syncing or folder encryption) are Chromium-exclusive, and these options will be hidden in other browsers. RuntimeFS has been tested in Chromium, Firefox, and Safari.
 
 (Firefox has a very specific issue involving initially loading JS scripts in `generateResponseForVirtualFile`, so an automatic reload is performed that injects `?boot=1` to the end of the URL. This also means that headers won't work.)
+
+In the future, non-Chromium browsers might adopt parts of the File System API that allow for streamed exports.
 | Feature | 🟢 Chromium | 🟡 Firefox | 🟡 Safari |
 | :--- | :--- | :--- | :--- |
 | **Folder Upload** | ✅ Yes | ⚠️ `<input>` fallback, no sync | ⚠️ `<input>` fallback, no sync |
 | **Encryption (folder-based)** | ✅ Yes | ❌ No | ❌ No |
-| **Export (including encryption)** | ✅ Mostly streamed to disk | ⚠️ RAM only (crashes if too big) | ⚠️ RAM only (crashes if too big) |
+| **Export (including encryption)** | ✅ Mostly streamed to disk | ⚠️ RAM only | ⚠️ RAM only |
 
 ## URL Persistence & Location Spoofing
 URL Persistence is an informal term that means that websites store data along with URLs. Examples include the Ruffle emulator (in `localStorage`) and Unity (in `IndexedDB`). If you export data from `example.com/v1/` and try to import it to `example.com/v2/` (or to different domains), it probably won't work.

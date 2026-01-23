@@ -31,18 +31,35 @@ function createProgressLogger(domElement) {
       if (domElement) domElement.textContent = msg;
       lastUpdate = now;
       // Yield to main thread to allow UI paint
-      await new Promise((r) => setTimeout(r, 0));
+      await yieldToMain();
     }
   };
 }
 
-window.addEventListener("beforeunload", function checkUnsavedChanges(event) {
+window.addEventListener("beforeunload", function () {
   if (currentlyBusy) {
-    return "Changes you made may not be saved.";
+    return "Changes you made may not be saved."; // not that the string text matters
   }
 });
 
-const yieldToMain = () => new Promise((r) => setTimeout(r, 0));
+// stolen from my FractalSky code
+const fastScheduler = (function () {
+  if ("scheduler" in window && "postTask" in scheduler) {
+    return (cb) => scheduler.postTask(cb, { priority: "user-blocking" });
+  }
+  const channel = new MessageChannel();
+  const queue = [];
+  channel.port1.onmessage = () => {
+    const task = queue.shift();
+    if (task) task();
+  };
+  return (cb) => {
+    queue.push(cb);
+    channel.port2.postMessage(undefined);
+  };
+})();
+
+const yieldToMain = () => new Promise((resolve) => fastScheduler(resolve));
 
 async function pumpStream(reader, writer, totalSize, onProgress) {
   let processed = 0;
@@ -59,7 +76,7 @@ async function pumpStream(reader, writer, totalSize, onProgress) {
       const now = Date.now();
       if (onProgress && now - lastLogTime > 100) {
         // Force yield here to ensure UI paints
-        await new Promise((r) => setTimeout(r, 0));
+        await yieldToMain();
         await onProgress(processed, totalSize);
         lastLogTime = now;
       }
@@ -92,8 +109,7 @@ async function waitForController() {
 async function getRegistry() {
   if (_registryCache) return _registryCache;
 
-  // Use a lock with mode: 'shared' to allow concurrent reads,
-  // but block if a 'exclusive' lock (writing) is active.
+  // Shared to allow concurrent reads but block if writing is active.
   return await navigator.locks.request(
     "rfs_registry_lock",
     { mode: "shared" },
@@ -118,11 +134,17 @@ async function getRegistry() {
 async function saveRegistry(registry) {
   // Update local cache immediately
   _registryCache = registry;
-  const root = await getOpfsRoot();
-  const handle = await root.getFileHandle(SYSTEM_FILE, { create: true });
-  const writable = await handle.createWritable();
-  await writable.write(JSON.stringify(registry));
-  await writable.close();
+  await navigator.locks.request(
+    "rfs_registry_lock",
+    { mode: "exclusive" },
+    async () => {
+      const root = await getOpfsRoot();
+      const handle = await root.getFileHandle(SYSTEM_FILE, { create: true });
+      const writable = await handle.createWritable();
+      await writable.write(JSON.stringify(registry));
+      await writable.close();
+    },
+  );
 }
 
 async function updateRegistryEntry(name, data) {
@@ -344,7 +366,7 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
     await writable.close();
     processedFiles++;
   }
-  await logProgress("", true); // Clear
+  await logProgress("", true);
 }
 
 async function processFileListAndStore(name, fileList) {
@@ -487,13 +509,13 @@ async function processAndStoreFolderStreaming(name, srcHandle) {
       }
     }
     // Yield occasionally during scanning
-    await new Promise((r) => setTimeout(r, 0));
+    await yieldToMain();
   }
 
   // Wait for remaining uploads
   while (pendingUploads.length > 0 || activeWorkers > 0) {
     flushUploads();
-    await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 20));
   }
 
   await updateRegistryEntry(name, { encryptionType: null });
@@ -697,7 +719,6 @@ async function startImport(file) {
     }
 
     alert("Import complete!");
-    location.reload();
   } catch (e) {
     console.error(e);
     alert("Import failed: " + e.message);
@@ -780,9 +801,9 @@ async function deriveKeyFromPassword(password, salt) {
   );
 }
 
-async function uploadFolderFallback(event) {
+async function uploadFolderFallback(e) {
   const name = document.getElementById("folderName").value.trim();
-  const input = event.target;
+  const input = e.target;
   if (!input.files.length) {
     setUiBusy(false);
     return;
@@ -795,7 +816,9 @@ async function uploadFolderFallback(event) {
 var syncTimeout = -1;
 async function syncFiles() {
   if (!folderName || !dirHandle)
-    return alert("Upload a folder to sync changes (not always supported).");
+    return alert(
+      "Upload a folder to sync changes (drag and drop not supported).",
+    );
   setUiBusy(true);
   if (changes.length > 0) {
     await performSyncToOpfs();
@@ -813,7 +836,9 @@ async function syncFiles() {
 
 async function syncAndOpenFile() {
   if (!folderName || !dirHandle)
-    return alert("Upload a folder to sync changes (not always supported).");
+    return alert(
+      "Upload a folder to sync changes (drag and drop not supported).",
+    );
   setUiBusy(true);
   if (changes.length > 0) {
     await performSyncToOpfs();
@@ -940,7 +965,7 @@ async function uploadAndEncryptWithPassword() {
 
               if (buffer.length === 0) break;
               if (Date.now() - lastYield > 200) {
-                await new Promise((r) => setTimeout(r, 0));
+                await yieldToMain();
                 lastYield = Date.now();
               }
 
@@ -1144,10 +1169,9 @@ document.addEventListener("DOMContentLoaded", () => {
       });
     })
     .catch(console.error);
-  navigator.serviceWorker.addEventListener("message", async (event) => {
-    if (event.data && event.data.type === "SW_READY") await listFolders();
-    if (event.data && event.data.type === "INVALIDATE_CACHE")
-      await listFolders();
+  navigator.serviceWorker.addEventListener("message", async (e) => {
+    if (e.data && e.data.type === "SW_READY") await listFolders();
+    if (e.data && e.data.type === "INVALIDATE_CACHE") await listFolders();
   });
 
   listFolders();

@@ -59,16 +59,17 @@
   function prepForCBOR(item, externalBlobs) {
     if (!item || typeof item !== "object") return item;
     if (item instanceof Blob) {
-      const id = (blobIdCounter++).toString(36); // Fast, short ID
+      const id = (blobIdCounter++).toString(36);
       externalBlobs.push({ uuid: id, blob: item });
       return { __le_blob_ref: id, type: item.type, size: item.size };
     }
 
-    if (item instanceof ArrayBuffer || ArrayBuffer.isView(item)) {
-      return item;
-    }
-
-    if (item instanceof Date || item instanceof RegExp) {
+    if (
+      item instanceof ArrayBuffer ||
+      ArrayBuffer.isView(item) ||
+      item instanceof Date ||
+      item instanceof RegExp
+    ) {
       return item;
     }
 
@@ -91,15 +92,10 @@
   async function restoreFromCBOR(item, tempBlobDir) {
     if (!item || typeof item !== "object") return item;
     if (item.__le_blob_ref) {
-      try {
-        const fh = await tempBlobDir.getFileHandle(item.__le_blob_ref);
-        const file = await fh.getFile();
-        // Use slice to set the correct MIME type without wrapping the Blob in another Blob
-        return file.slice(0, file.size, item.type);
-      } catch (e) {
-        console.warn("Missing blob ref:", item.__le_blob_ref);
-        return null;
-      }
+      const fh = await tempBlobDir.getFileHandle(item.__le_blob_ref);
+      const file = await fh.getFile();
+      // Use slice to set the correct MIME type without wrapping the Blob in another Blob
+      return file.slice(0, file.size, item.type);
     }
     if (item.__le_blob) {
       return new Blob([item.data], { type: item.type });
@@ -117,101 +113,104 @@
     return item;
   }
 
+  const TAR_CONSTANTS = {
+    USTAR_MAGIC: new Uint8Array([117, 115, 116, 97, 114, 0]), // "ustar\0"
+    USTAR_VER: new Uint8Array([48, 48]), // "00"
+    EMPTY_SPACE: new Uint8Array(8).fill(32), // 8 spaces
+  };
+
+  // Pre-compute a clean header template
   const HEADER_TEMPLATE = new Uint8Array(512);
   (function initTemplate() {
-    const enc = new TextEncoder();
-    // Pre-fill constant "000664 \0", "000000 \0", "ustar\0", "00"
-    enc.encodeInto("000664 \0", HEADER_TEMPLATE.subarray(100, 108));
-    enc.encodeInto("000000 \0", HEADER_TEMPLATE.subarray(108, 116));
-    enc.encodeInto("000000 \0", HEADER_TEMPLATE.subarray(116, 124));
-    enc.encodeInto("        ", HEADER_TEMPLATE.subarray(148, 156)); // Checksum placeholder
-    enc.encodeInto("ustar\0", HEADER_TEMPLATE.subarray(257, 263));
-    enc.encodeInto("00", HEADER_TEMPLATE.subarray(263, 265));
+    const w = (str, off) => ENC.encodeInto(str, HEADER_TEMPLATE.subarray(off));
+    // Default values
+    w("000664 \0", 100); // Mode
+    w("000000 \0", 108); // UID
+    w("000000 \0", 116); // GID
+    HEADER_TEMPLATE.set(TAR_CONSTANTS.EMPTY_SPACE, 148); // Checksum (spaces)
+    HEADER_TEMPLATE[156] = 48; // Typeflag '0'
+    HEADER_TEMPLATE.set(TAR_CONSTANTS.USTAR_MAGIC, 257);
+    HEADER_TEMPLATE.set(TAR_CONSTANTS.USTAR_VER, 263);
   })();
 
   function createTarHeader(filename, size, time, isDir = false) {
-    const buffer = HEADER_TEMPLATE.slice(0);
+    // 1. Max Size Check (USTAR limit is 8^11 - 1 bytes, approx 8.5GB)
+    if (size > 8589934591) {
+      throw new Error(
+        "File size exceeds USTAR 8GB limit. Extensions required.",
+      );
+    }
 
-    // Calculate byte size first to prevent buffer overflow/corruption
-    let nameBytes = ENC.encode(filename);
-    let prefixBytes = new Uint8Array(0);
+    const buffer = HEADER_TEMPLATE.slice(0); // Fast zero-copy clone
 
-    if (nameBytes.length > 100) {
-      // Find a split point based on BYTES, not characters
-      let splitIndex = -1;
-      for (let i = 0; i < filename.length; i++) {
-        if (filename.charCodeAt(i) === 47) {
-          // Check bytes of the prefix (0 to i)
-          const prefixCandidate = filename.slice(0, i);
-          const nameCandidate = filename.slice(i + 1);
+    // 2. Handle Directory Conventions
+    if (isDir) {
+      if (!filename.endsWith("/")) filename += "/";
+      buffer[156] = 53; // '5'
+    }
 
-          const pLen = ENC.encode(prefixCandidate).byteLength;
-          const nLen = ENC.encode(nameCandidate).byteLength;
+    // 3. Path Processing
+    const fullBytes = ENC.encode(filename);
 
-          if (pLen <= 155 && nLen <= 100) {
-            splitIndex = i;
+    if (fullBytes.length <= 100) {
+      buffer.set(fullBytes, 0);
+    } else {
+      // Split logic: Prefix (155) + Name (100)
+      let bestSplit = -1;
+
+      for (let i = 0; i < fullBytes.length; i++) {
+        // Split strictly on slash
+        if (fullBytes[i] === 47) {
+          const prefixLen = i;
+          const nameLen = fullBytes.length - 1 - i;
+
+          // Check if both parts fit their respective fields
+          if (prefixLen <= 155 && nameLen <= 100 && nameLen > 0) {
+            bestSplit = i;
           }
         }
       }
 
-      if (splitIndex !== -1) {
-        const prefixStr = filename.slice(0, splitIndex);
-        const nameStr = filename.slice(splitIndex + 1);
-        prefixBytes = ENC.encode(prefixStr);
-        nameBytes = ENC.encode(nameStr);
+      if (bestSplit !== -1) {
+        buffer.set(fullBytes.subarray(bestSplit + 1), 0); // Name
+        buffer.set(fullBytes.subarray(0, bestSplit), 345); // Prefix
       } else {
-        console.warn("Filename too long for USTAR:", filename);
-        nameBytes = nameBytes.slice(0, 100);
+        // Robustness: Throw rather than create a corrupt file
+        throw new Error(
+          `Filename too long or unsplittable for USTAR: ${filename}`,
+        );
       }
     }
 
-    const writeStr = (strOrBytes, offset, len) => {
-      const dest = buffer.subarray(offset, offset + len);
-      if (typeof strOrBytes === "string") {
-        ENC.encodeInto(strOrBytes, dest);
-      } else {
-        // It's already Uint8Array
-        for (let i = 0; i < Math.min(len, strOrBytes.length); i++) {
-          dest[i] = strOrBytes[i];
-        }
-      }
-    };
-
+    // 4. Helper to write octal safely
     const writeOctal = (num, offset, len) => {
-      let i = offset + len - 1;
-      buffer[i] = 0;
-      i--;
-      if (num < 2147483647) {
-        while (i >= offset) {
-          buffer[i] = (num & 7) + 48;
-          num >>>= 3;
-          i--;
-        }
-      } else {
-        while (i >= offset) {
-          buffer[i] = (num % 8) + 48;
-          num = Math.floor(num / 8);
-          i--;
-        }
-      }
+      const str = Math.floor(num)
+        .toString(8)
+        .padStart(len - 1, "0");
+      // Ensure we don't overflow the field width (already checked size, but good practice)
+      if (str.length >= len) throw new Error("Octal field overflow");
+
+      ENC.encodeInto(str, buffer.subarray(offset, offset + len - 1));
+      buffer[offset + len - 1] = 0; // Null terminate
     };
 
-    // Pass the pre-calculated bytes to avoid re-encoding
-    writeStr(nameBytes, 0, 100);
-    writeOctal(0o664, 100, 8);
-    writeOctal(0, 108, 8);
-    writeOctal(0, 116, 8);
     writeOctal(size, 124, 12);
     writeOctal(time, 136, 12);
-    writeStr("        ", 148, 8);
-    buffer[156] = isDir ? 53 : 48;
-    writeStr("ustar", 257, 6);
-    writeStr("00", 263, 2);
-    if (prefixBytes.length > 0) writeStr(prefixBytes, 345, 155);
 
+    // 5. Checksum Calculation
+    // Treat checksum field (148-155) as spaces (ASCII 32)
     let sum = 0;
-    for (let i = 0; i < 512; i++) sum += buffer[i];
-    writeOctal(sum, 148, 7);
+    for (let i = 0; i < 512; i++) {
+      sum += buffer[i];
+    }
+
+    // 6. Write Checksum (6 digits + null + space)
+    // This format is the most compatible (BSD/GNU standard)
+    const cksumStr = sum.toString(8).padStart(6, "0");
+    ENC.encodeInto(cksumStr, buffer.subarray(148));
+    buffer[154] = 0; // Null
+    buffer[155] = 32; // Space
+
     return buffer;
   }
 
@@ -263,40 +262,69 @@
     constructor(password, salt) {
       this.salt = salt;
       this.keyPromise = deriveKey(password, salt);
-      this.pending = new Uint8Array(0);
+      this.chunks = [];
+      this.currentSize = 0;
     }
+
     async start(controller) {
       controller.enqueue(ENC.encode("LE_ENC"));
       controller.enqueue(this.salt);
-      // Empty block for alignment/reserved
       await this.encryptAndPush(
         new Uint8Array(0),
         controller,
         await this.keyPromise,
       );
     }
-    async transform(chunk, controller) {
-      const key = await this.keyPromise;
-      const newPending = new Uint8Array(this.pending.length + chunk.length);
-      newPending.set(this.pending);
-      newPending.set(chunk, this.pending.length);
-      this.pending = newPending;
 
-      while (this.pending.length >= CHUNK_SIZE) {
-        const slice = this.pending.slice(0, CHUNK_SIZE);
-        this.pending = this.pending.slice(CHUNK_SIZE);
-        await this.encryptAndPush(slice, controller, key);
+    async transform(chunk, controller) {
+      this.chunks.push(chunk);
+      this.currentSize += chunk.byteLength;
+
+      // Buffer chunks until we hit 4MB to ensure efficient encryption block sizes
+      if (this.currentSize >= CHUNK_SIZE) {
+        const fullBuffer = new Uint8Array(this.currentSize);
+        let offset = 0;
+        for (const c of this.chunks) {
+          fullBuffer.set(c, offset);
+          offset += c.byteLength;
+        }
+
+        const key = await this.keyPromise;
+        let pos = 0;
+        // Process complete 4MB chunks
+        while (pos + CHUNK_SIZE <= fullBuffer.length) {
+          await this.encryptAndPush(
+            fullBuffer.subarray(pos, pos + CHUNK_SIZE),
+            controller,
+            key,
+          );
+          pos += CHUNK_SIZE;
+        }
+
+        // Keep the remainder for the next transform call
+        const remainder = fullBuffer.subarray(pos);
+        this.chunks = remainder.length > 0 ? [remainder] : [];
+        this.currentSize = remainder.length;
       }
     }
+
     async flush(controller) {
-      if (this.pending.length > 0) {
+      // Write whatever is left in the buffer
+      if (this.currentSize > 0) {
+        const finalBuffer = new Uint8Array(this.currentSize);
+        let offset = 0;
+        for (const c of this.chunks) {
+          finalBuffer.set(c, offset);
+          offset += c.byteLength;
+        }
         await this.encryptAndPush(
-          this.pending,
+          finalBuffer,
           controller,
           await this.keyPromise,
         );
       }
     }
+
     async encryptAndPush(data, controller, key) {
       const iv = crypto.getRandomValues(new Uint8Array(12));
       const ciphertext = await crypto.subtle.encrypt(
@@ -454,6 +482,7 @@
       cookies: true,
       idb: true,
       cache: true,
+      logSpeed: 100,
       customItems: [],
       include: {},
       exclude: {},
@@ -512,18 +541,16 @@
     }
 
     const gzip = new CompressionStream("gzip");
-    // Important: We don't await this immediately, but checking errors is good
+    // We don't await this immediately, but checking errors is good
     gzip.readable
       .pipeTo(targetWritable)
-      .catch((e) => console.error("GZIP Pipe Error", e));
+      .catch((e) => console.error("GZIP piping error:", e));
 
     const tar = new TarWriter(gzip.writable);
     const reportProgress = () => {
-      logger(
-        `Exporting... (${(outputBytesWritten / 1024 / 1024).toFixed(2)} MB)`,
-      );
+      logger(`Exporting (${(outputBytesWritten / 1048576).toFixed(2)} MB)...`);
     };
-    const progressInterval = setInterval(reportProgress, 250);
+    const progressInterval = setInterval(reportProgress, opts.logSpeed);
 
     try {
       for (const item of opts.customItems) {
@@ -579,7 +606,7 @@
             const r = indexedDB.open(name);
             r.onsuccess = () => res(r.result);
             r.onerror = () => rej(r.error);
-            r.onblocked = () => rej(new Error("Blocked"));
+            r.onblocked = () => rej(new Error("IndexedDB open was blocked."));
           });
 
           const storeNames = Array.from(db.objectStoreNames);
@@ -771,6 +798,7 @@
 
     const opts = { ...config };
     const logger = opts.logger || console.log;
+    const logSpeed = opts.logSpeed || 100;
 
     try {
       let rawStream;
@@ -778,12 +806,12 @@
         if (!sourceInput.startsWith("http"))
           sourceInput = "https://" + sourceInput;
         const response = await fetch(sourceInput);
-        if (!response.ok) throw new Error("Fetch failed");
+        if (!response.ok) throw new Error("Fetching of URL failed.");
         rawStream = response.body;
       } else if (sourceInput && typeof sourceInput.stream === "function") {
         rawStream = sourceInput.stream();
       } else {
-        throw new Error("Invalid source");
+        throw new Error("Invalid source.");
       }
 
       const rawReader = rawStream.getReader();
@@ -832,7 +860,8 @@
 
       if (sig === "LE_ENC") {
         let password = opts.password || prompt("Enter the password:");
-        if (!password) throw new Error("Password required");
+        if (!password)
+          throw new Error("A password is required to decrypt this data.");
         inputStream = new DecryptionSource(combinedStream, password)
           .readable()
           .pipeThrough(new DecompressionStream("gzip"));
@@ -847,12 +876,16 @@
       const reader = inputStream.getReader();
       const streamBuffer = new ChunkBuffer();
       let done = false;
+      let totalRead = 0;
 
       async function ensure(n) {
         while (!streamBuffer.has(n) && !done) {
           const { value, done: d } = await reader.read();
           if (d) done = true;
-          else streamBuffer.push(value);
+          else {
+            totalRead += value.byteLength;
+            streamBuffer.push(value);
+          }
         }
         return streamBuffer.has(n);
       }
@@ -880,6 +913,7 @@
           } else {
             const { value, done: d } = await reader.read();
             if (d) throw new Error("Unexpected EOF");
+            totalRead += value.byteLength;
             if (value.byteLength <= remaining) {
               await writer.write(value);
               remaining -= value.byteLength;
@@ -903,14 +937,7 @@
       const dbCache = {};
 
       let lastLog = Date.now();
-
       while (true) {
-        if (Date.now() - lastLog > 500) {
-          logger(`Importing...`);
-          lastLog = Date.now();
-          await yieldToMain();
-        }
-
         if (!(await ensure(512))) break;
         const header = streamBuffer.read(512);
         if (header.every((b) => b === 0)) break;
@@ -920,6 +947,14 @@
           .replace(/\0/g, "")
           .trim();
         if (prefix) name = `${prefix}/${name}`;
+        var now = Date.now();
+        if (now - lastLog > logSpeed) {
+          logger(
+            `Importing (${(totalRead / 1048576).toFixed(2)} MB) ${name}...`,
+          );
+          lastLog = now;
+          await yieldToMain();
+        }
 
         const sizeStr = DEC.decode(header.slice(124, 136))
           .replace(/\0/g, "")

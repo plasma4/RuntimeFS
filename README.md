@@ -14,23 +14,25 @@ RuntimeFS utilizes [cbor-x](https://github.com/kriszyp/cbor-x) and my own [Littl
 Make sure to modify `APP_SHELL_FILES` in the SW and `SW_LINK` in the main code if you are changing the file configuration for proper caching. (Code is minified by using [JSCompress](https://jscompress.com/), which uses `UglifyJS` 3 and `babel-minify`.)
 
 ## Usage
-You can use Enter on text inputs to perform actions, instead of clicking buttons. On the Folder to Open section text inputs you can use Shift+Enter to open in-place and Ctrl/Cmd+Enter to sync and open.
+You can use Enter on text inputs to perform actions, instead of clicking buttons. On the Folder to Open section text inputs you can use Shift+Enter to open in-place and Ctrl/Cmd+Enter to sync and open. (Syncing will only show up after uploading a folder, not dragging, through a supported browser.)
 
 Custom regex and headers save on reload and export but do not affect stored files, and only work when opening the file (in-place or new tab) from the RuntimeFS menu (reloading or navigating to the URL directly do not yet).
 
-To update to a newer version you can delete the ServiceWorker such as with `chrome://serviceworker-internals/`, or equivalents in other browsers, then reload/force reload.
+To update to a newer version, a single-file plugin exists for customizing cache in `plugin/custom.html` (or simply to request an update), allowing for you to fully customize RuntimeFS from any site hosting it (although **it will clear the cache on hard reload**). If this isn't included in the way you use RuntimeFS, you can upload it as a virtual folder.
 
 ## Browser Support
 File System API features (such as syncing or folder encryption) are Chromium-exclusive, and these options will be hidden in other browsers. RuntimeFS has been tested in Chromium, Firefox, and Safari.
 
+Firefox with Private browsing is known not allow folder uploading, and similar issues might occur in "hardened" browsers or browsing modes.
+
 (Firefox has a very specific issue involving initially loading JS scripts in `generateResponseForVirtualFile`, so an automatic reload is performed that injects `?boot=1` to the end of the URL. This also means that headers won't work.)
 
-In the future, non-Chromium browsers might adopt parts of the File System API that allow for streamed exports.
-| Feature | 🟢 Chromium | 🟡 Firefox | 🟡 Safari |
-| :--- | :--- | :--- | :--- |
-| **Folder Upload** | ✅ Yes | ⚠️ `<input>` fallback, no sync | ⚠️ `<input>` fallback, no sync |
-| **Encryption (folder-based)** | ✅ Yes | ❌ No | ❌ No |
-| **Export (including encryption)** | ✅ Mostly streamed to disk | ⚠️ RAM only | ⚠️ RAM only |
+In the future, non-Chromium browsers might adopt parts of the File System API that allow for streamed exports. The RAM-only fallback should still work for a few hundred MBs.
+| Feature | 🟢 Chromium | 🟡 Firefox/Safari/Brave |
+| :--- | :--- | :--- |
+| **Folder Upload** | ✅ Yes | ⚠️ `<input>` fallback, no sync |
+| **Encryption (folder-based)** | ✅ Yes | ❌ No |
+| **Export (including encryption)** | ✅ Mostly streamed to disk | ⚠️ RAM-only |
 
 ## URL Persistence & Location Spoofing
 URL Persistence is an informal term that means that websites store data along with URLs. Examples include the Ruffle emulator (in `localStorage`) and Unity (in `IndexedDB`). If you export data from `example.com/v1/` and try to import it to `example.com/v2/` (or to different domains), it probably won't work.
@@ -45,6 +47,7 @@ Not all applications will work! Out of the many sites I tested, there were the m
 - Somewhere in the application, sync AJAX is used. There is sadly no simple workaround. (This type of request is also being phased out from browsers gradually; I've tried getting this working with `Atomics` and web workers but it sadly isn't fixable.)
 - The application isn't compiled yet, such as on a Vite GitHub download.
 - The application requests URLs from root (`/`). The current version has some fetch interception for this, but it's not guaranteed to work for everything (or, custom `<base>` elements might actually interfere). This might be fixable with `<base href="/n/FolderName">`.
+- Theoretically, a giant single IndexedDB record or USTAR limitations (like very long file names or files over 8.5GB) will prevent data from being exportable.
 
 > [!WARNING]
 > Folders are **not sandboxed**! Because RuntimeFS serves files from the same origin, uploaded scripts have unrestricted access to local data (including `localStorage`, `IndexedDB`, and `OPFS`).
@@ -63,8 +66,6 @@ Also note:
 - Exporting any single files with very large sizes not from OPFS (such as from IndexedDB, or cache storage) might result in crashes.
 - Check `getMimeType` in the ServiceWorker for the supported MIME types; you may need to add your own in some cases.
 - You might encounter freezing of all RuntimeFS-related tabs if any tab is stuck or waiting for something (such as making a IndexedDB writable). RuntimeFS might also encounter a QuotaExceededError in certain situations (like running out of memory or private tabs).
-
-A single-file plugin exists for customizing cache in the `plugin` (or requesting an update), allowing for you to fully customize RuntimeFS from any site hosting it (although **it will clear the cache on hard reload**).
 
 ### TODO
 - Devtools panel (for some cases where Inspect is unavailable, using something like Eruda)

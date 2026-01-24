@@ -1,11 +1,22 @@
 const APP_SHELL_FILES = ["./", "./index.html", "./main.min.js", "sw.min.js"]; // If you're using .php or some other configuration, make sure to change this!
 const NETWORK_ALLOWLIST_PREFIXES = []; // For custom bypassing of the virtual file system (not used by default)
+// SpiderMonkey check because Firefox has weird SW header issues. ?boot=1 is used to ensure the context is "clean" and controlled for Firefox because Firefox sometimes acts strangely with SWs. Use `typeof InternalError !== "undefined"` to enable with Firefox.
+let reloadOnRequest = false;
 
 let pendingNavData = null; // for next navigation request
 const clientSessionStore = new Map();
 const handleCache = new Map();
 const manifestCache = new Map();
 const ruleCache = new Map();
+const MAX_REGEX_SIZE = 10 * 1024 * 1024;
+
+const dirHandleCache = new Map(); // Cache for directory handles
+const MAX_DIR_CACHE_SIZE = 1000; // Prevent memory leaks
+
+function addToCache(map, key, value) {
+  if (map.size >= MAX_DIR_CACHE_SIZE) map.delete(map.keys().next().value); // Simple LRU
+  map.set(key, value);
+}
 
 const RFS_PREFIX = "rfs";
 const SYSTEM_FILE = "rfs_system.json";
@@ -200,24 +211,51 @@ async function getRegistry() {
   return registryCache;
 }
 
-async function getCachedFileHandle(root, folderName, subDir, fileName) {
-  const cacheKey = `${folderName}/${subDir}/${fileName}`;
-  if (handleCache.has(cacheKey)) return handleCache.get(cacheKey);
+async function getCachedFileHandle(root, folderName, relativePath) {
+  const fileCacheKey = `${folderName}|${relativePath}`;
+
+  if (handleCache.has(fileCacheKey)) return handleCache.get(fileCacheKey);
 
   try {
-    const rfs = await root.getDirectoryHandle(RFS_PREFIX);
-    const folder = await rfs.getDirectoryHandle(folderName);
-    const dir = await folder.getDirectoryHandle(subDir);
-    const file = await dir.getFileHandle(fileName);
+    const pathParts = relativePath
+      .split("/")
+      .filter((p) => p && p.trim() !== "");
+    const fileName = decodeURIComponent(pathParts.pop());
 
-    handleCache.set(cacheKey, file);
-    return file;
+    let currentDirHandle;
+    let currentPathKey = folderName; // Start at the folder root
+    if (dirHandleCache.has(currentPathKey)) {
+      currentDirHandle = dirHandleCache.get(currentPathKey);
+    } else {
+      // Cold start: Get RFS root -> Folder root
+      const rfsHandle = await root.getDirectoryHandle(RFS_PREFIX);
+      currentDirHandle = await rfsHandle.getDirectoryHandle(folderName);
+      addToCache(dirHandleCache, currentPathKey, currentDirHandle);
+    }
+
+    // Traverse subdirectories using cache
+    for (const part of pathParts) {
+      const decodedPart = decodeURIComponent(part);
+      currentPathKey += `/${decodedPart}`;
+
+      if (dirHandleCache.has(currentPathKey)) {
+        currentDirHandle = dirHandleCache.get(currentPathKey);
+      } else {
+        currentDirHandle =
+          await currentDirHandle.getDirectoryHandle(decodedPart);
+        addToCache(dirHandleCache, currentPathKey, currentDirHandle);
+      }
+    }
+
+    const fileHandle = await currentDirHandle.getFileHandle(fileName);
+    addToCache(handleCache, fileCacheKey, fileHandle);
+    return fileHandle;
   } catch (e) {
     return null;
   }
 }
 
-self.addEventListener("install", async function () {
+self.addEventListener("install", async function installCache() {
   const cache = await caches.open(CACHE_NAME);
   await Promise.all(
     APP_SHELL_FILES.map(async (url) => {
@@ -293,6 +331,7 @@ self.addEventListener("message", (e) => {
       registryCache = null;
       handleCache.clear();
       manifestCache.clear();
+      dirHandleCache.clear();
       e.waitUntil(
         (async function () {
           const allClients = await self.clients.matchAll({
@@ -489,7 +528,7 @@ async function handleEncryptedRequest(
       return new Response(new Uint8Array(0), {
         status: 200,
         headers: {
-          "Content-Type": fileMeta.type || "application/octet-stream",
+          "Content-Type": fileMeta.type || getMimeType(filePath),
           "Content-Length": "0",
         },
       });
@@ -562,7 +601,7 @@ async function handleEncryptedRequest(
 
             if (outputStart < outputEnd) {
               controller.enqueue(
-                data.slice(
+                data.subarray(
                   outputStart - globalChunkStart,
                   outputEnd - globalChunkStart,
                 ),
@@ -606,41 +645,24 @@ async function generateResponseForVirtualFile(request, clientId) {
     });
     const folderName = pathParts[0];
 
-    let root, registry;
-    try {
-      root = await getOpfsRoot();
-      if (mode === "navigate" || !registryCache) {
-        const handle = await root.getFileHandle(SYSTEM_FILE);
-        const file = await handle.getFile();
-        registryCache = JSON.parse(await file.text());
-      }
-      registry = registryCache;
-    } catch (e) {
-      registry = registryCache || {};
-    }
-
+    let root = await getOpfsRoot();
+    if (!registryCache) await getRegistry();
+    const registry = registryCache || {};
     const folderData = registry[folderName] || {};
-    const isEncrypted = folderData.encryptionType === "password";
-
-    // SpiderMonkey check because Firefox has weird SW header issues. ?boot=1 is used to ensure the context is "clean" and controlled for Firefox because Firefox is weird.
-    const isFirefox = typeof InternalError !== "undefined";
-    const hasConfig =
-      (folderData.rules && folderData.rules.trim().length > 0) ||
-      (folderData.headers && folderData.headers.trim().length > 0);
 
     if (
-      isFirefox &&
+      reloadOnRequest &&
       mode === "navigate" &&
-      hasConfig &&
       !url.searchParams.has("boot")
     ) {
       url.searchParams.set("boot", "1");
       return new Response(
-        `<!DOCTYPE html><script>location.replace("${url.href}");</script>`,
+        `<!DOCTYPE html><script>location.replace("${url.href}")</script>`,
         { headers: { "Content-Type": "text/html" } },
       );
     }
 
+    // Session managing
     let session = clientSessionStore.get(clientId);
     if (!session && pendingNavData && pendingNavData[folderName]) {
       session = pendingNavData[folderName];
@@ -653,85 +675,23 @@ async function generateResponseForVirtualFile(request, clientId) {
 
     let relativePath = pathParts.slice(1).join("/");
     if (!relativePath || relativePath.endsWith("/"))
-      relativePath += "index.html"; // show index.html by default
+      relativePath += "index.html";
 
-    // Helper function definition
-    async function getFileHandle(dir, name, path) {
-      try {
-        const parts = [
-          RFS_PREFIX,
-          name,
-          ...path
-            .split("/")
-            .map((p) => {
-              try {
-                return decodeURIComponent(p);
-              } catch (e) {
-                return p;
-              }
-            })
-            .filter((p) => p && p.trim() !== ""),
-        ];
+    if (folderData.encryptionType === "password") {
+      if (!session.key) return new Response("Session locked", { status: 403 });
+      let compiledHeaders =
+        session.compiledHeaders || parseCustomHeaders(folderData.headers);
+      const baseHeaders = {
+        "Content-Type": getMimeType(relativePath),
+        "Cache-Control": "no-store",
+        "Accept-Ranges": "bytes",
+      };
+      const finalHeaders = applyCustomHeaders(
+        baseHeaders,
+        relativePath,
+        compiledHeaders,
+      );
 
-        let curr = dir;
-        for (let i = 0; i < parts.length - 1; i++) {
-          curr = await curr.getDirectoryHandle(parts[i]);
-        }
-        return await curr.getFileHandle(parts[parts.length - 1]);
-      } catch (e) {
-        return null;
-      }
-    }
-
-    let contentType;
-    let handle = null;
-    let file = null;
-    let totalSize = 0;
-    if (isEncrypted) {
-      contentType = getMimeType(relativePath);
-    } else {
-      handle = await getFileHandle(root, folderName, relativePath);
-      const isHtmlReq =
-        mode === "navigate" ||
-        (request.headers.get("Accept") || "").includes("text/html");
-      if (!handle && isHtmlReq) {
-        const indexHandle = await getFileHandle(root, folderName, "index.html");
-        if (indexHandle) {
-          handle = indexHandle;
-          relativePath = "index.html";
-        }
-      }
-
-      if (!handle) return new Response("File not found", { status: 404 });
-
-      file = await handle.getFile();
-      totalSize = file.size;
-      contentType =
-        file.type || getMimeType(relativePath) || "application/octet-stream";
-    }
-
-    let compiledHeaders = session.compiledHeaders;
-    if (!compiledHeaders && folderData.headers) {
-      compiledHeaders = parseCustomHeaders(folderData.headers);
-    }
-
-    const baseHeaders = {
-      "Content-Type": contentType,
-      "Cache-Control": "no-store",
-      "Accept-Ranges": "bytes",
-    };
-
-    const finalHeaders = applyCustomHeaders(
-      baseHeaders,
-      relativePath,
-      compiledHeaders,
-    );
-
-    if (isEncrypted) {
-      if (!session.key)
-        return new Response("Session locked. Reload from the main RuntimeFS interface.", {
-          status: 403,
-        });
       return await handleEncryptedRequest(
         root,
         folderName,
@@ -742,93 +702,125 @@ async function generateResponseForVirtualFile(request, clientId) {
       );
     }
 
-    if (totalSize === 0) {
-      return new Response(new Uint8Array(0), { headers: finalHeaders });
-    }
-
-    let compiledRules = session.compiledRules;
-    if (!compiledRules && folderData.rules) {
-      compiledRules = compileRules(folderData.rules);
-    }
-
-    const isText =
-      contentType.startsWith("text/") ||
-      contentType.includes("javascript") ||
-      contentType.includes("json") ||
-      contentType.includes("xml");
-    const isSmallEnough = totalSize < 10 * 1024 * 1024;
-    const hasRegex = compiledRules && compiledRules.length > 0;
-    const shouldApplyRegex = hasRegex && isText && isSmallEnough;
-
-    if (!shouldApplyRegex) {
-      const rangeHeader = request.headers.get("Range");
-      if (rangeHeader) {
-        const parts = rangeHeader.replace(/bytes=/, "").split("-");
-        const start = parseInt(parts[0], 10);
-        const end = parts[1] ? parseInt(parts[1], 10) : totalSize - 1;
-
-        if (start >= totalSize || end >= totalSize) {
-          return new Response(null, {
-            status: 416,
-            headers: { "Content-Range": `bytes */${totalSize}` },
-          });
+    let handle = await getCachedFileHandle(root, folderName, relativePath);
+    if (
+      !handle &&
+      (mode === "navigate" ||
+        (request.headers.get("Accept") || "").includes("text/html"))
+    ) {
+      if (!relativePath.endsWith("index.html")) {
+        const indexHandle = await getCachedFileHandle(
+          root,
+          folderName,
+          "index.html",
+        );
+        if (indexHandle) {
+          handle = indexHandle;
+          relativePath = "index.html";
         }
-
-        finalHeaders["Content-Range"] = `bytes ${start}-${end}/${totalSize}`;
-        finalHeaders["Content-Length"] = end - start + 1;
-
-        return new Response(file.slice(start, end + 1), {
-          status: 206,
-          headers: finalHeaders,
-        });
       }
-
-      if (!finalHeaders["Content-Length"])
-        finalHeaders["Content-Length"] = totalSize;
-      return new Response(file, { headers: finalHeaders });
     }
 
-    let buffer = await file.arrayBuffer();
+    if (!handle) return new Response("File not found", { status: 404 });
+
+    const file = await handle.getFile();
+    const totalSize = file.size;
+    const contentType =
+      file.type || getMimeType(relativePath) || "application/octet-stream";
+
+    let compiledHeaders =
+      session.compiledHeaders || parseCustomHeaders(folderData.headers);
+    let compiledRules = session.compiledRules || compileRules(folderData.rules);
+    const isText =
+      /^(text\/|application\/(javascript|json|xml|x-javascript|typescript))/.test(
+        contentType,
+      );
+    const shouldApplyRegex =
+      compiledRules &&
+      compiledRules.length > 0 &&
+      isText &&
+      totalSize < MAX_REGEX_SIZE;
 
     if (shouldApplyRegex) {
+      let buffer = await file.arrayBuffer();
+      // Apply Regex
       buffer = applyRegexRules(
         relativePath,
         buffer,
         contentType,
         compiledRules,
       );
-    }
 
-    const processedSize = buffer.byteLength;
-    const rangeHeader = request.headers.get("Range");
-    if (rangeHeader) {
-      const parts = rangeHeader.replace(/bytes=/, "").split("-");
-      let start = parseInt(parts[0], 10);
-      let end = parts[1] ? parseInt(parts[1], 10) : processedSize - 1;
+      const processedSize = buffer.byteLength;
+      finalHeaders["Content-Length"] = processedSize.toString();
 
-      if (isNaN(start)) start = 0;
-      if (isNaN(end)) end = processedSize - 1;
+      // Range Request on Modified Content (in-memory)
+      const rangeHeader = request.headers.get("Range");
+      if (rangeHeader) {
+        const parts = rangeHeader.replace(/bytes=/, "").split("-");
+        let start = parseInt(parts[0], 10) || 0;
+        let end = parts[1] ? parseInt(parts[1], 10) : processedSize - 1;
 
-      if (start >= processedSize) {
-        return new Response(null, {
-          status: 416,
-          headers: { "Content-Range": `bytes */${processedSize}` },
+        if (start >= processedSize) {
+          return new Response(null, {
+            status: 416,
+            headers: { "Content-Range": `bytes */${processedSize}` },
+          });
+        }
+
+        end = Math.min(end, processedSize - 1);
+        finalHeaders["Content-Range"] =
+          `bytes ${start}-${end}/${processedSize}`;
+        finalHeaders["Content-Length"] = (end - start + 1).toString();
+
+        return new Response(buffer.slice(start, end + 1), {
+          status: 206,
+          headers: finalHeaders,
         });
       }
 
-      finalHeaders["Content-Range"] = `bytes ${start}-${end}/${processedSize}`;
+      return new Response(buffer, { headers: finalHeaders });
+    }
+
+    const finalHeaders = applyCustomHeaders(
+      {
+        "Content-Type": contentType,
+        "Cache-Control": "no-store",
+        "Accept-Ranges": "bytes",
+      },
+      relativePath,
+      compiledHeaders,
+    );
+
+    if (totalSize === 0)
+      return new Response(new Uint8Array(0), { headers: finalHeaders });
+
+    const rangeHeader = request.headers.get("Range");
+    if (rangeHeader) {
+      const parts = rangeHeader.replace(/bytes=/, "").split("-");
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : totalSize - 1;
+
+      if (start >= totalSize) {
+        return new Response(null, {
+          status: 416,
+          headers: { "Content-Range": `bytes */${totalSize}` },
+        });
+      }
+
+      finalHeaders["Content-Range"] = `bytes ${start}-${end}/${totalSize}`;
       finalHeaders["Content-Length"] = end - start + 1;
-      return new Response(buffer.slice(start, end + 1), {
+
+      return new Response(file.slice(start, end + 1), {
         status: 206,
         headers: finalHeaders,
       });
     }
 
-    if (!finalHeaders["Content-Length"])
-      finalHeaders["Content-Length"] = processedSize;
-    return new Response(buffer, { headers: finalHeaders });
+    finalHeaders["Content-Length"] = totalSize;
+    return new Response(file, { headers: finalHeaders });
   } catch (e) {
-    console.error("SW error:", e);
-    return new Response("Internal error", { status: 500 });
+    console.error("SW Gen Error:", e);
+    return new Response("Internal Server Error", { status: 500 });
   }
 }

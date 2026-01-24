@@ -37,6 +37,11 @@
             cursor: not-allowed;
         }
 
+        .supportCheck,
+        #encryptionSection {
+            display: none;
+        }
+
         fieldset {
             border: solid 1px #ecc683;
             margin-bottom: 1em;
@@ -211,7 +216,7 @@
             <li><code>*.html -> Content-Security-Policy: default-src 'self'; worker-src 'self' blob:;</code></li>
         </ul>
         <textarea id="headers" rows="5" cols="40" placeholder="Enter headers here..."></textarea>
-        <div class="supportCheck">
+        <div id="encryptionSection">
             <hr>
             <h3>Encrypt Folders</h3>
             You can encrypt a folder into a bunch of files.

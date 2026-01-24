@@ -9,6 +9,7 @@ let currentlyBusy = false;
 let folderName, dirHandle, observer;
 let changes = [];
 
+let showingSync = false;
 let _registryCache = null;
 let _opfsRoot = null;
 async function getOpfsRoot() {
@@ -17,24 +18,31 @@ async function getOpfsRoot() {
 }
 
 function setUiBusy(isBusy) {
-  currentlyBusy = isBusy;
-  Array.from(document.getElementsByTagName("button")).forEach(
-    (button) => (button.disabled = currentlyBusy),
-  );
+  if (currentlyBusy !== isBusy) {
+    currentlyBusy = isBusy;
+    Array.from(document.getElementsByTagName("button")).forEach(
+      (button) => (button.disabled = currentlyBusy),
+    );
+  }
 }
 
 function createProgressLogger(domElement) {
   let lastUpdate = 0;
+  let lastMsg = null;
   return async (msg, force = false) => {
     const now = Date.now();
     if (force || now - lastUpdate > 50) {
-      if (domElement) domElement.textContent = msg;
+      if (msg !== lastMsg) {
+        domElement.textContent = lastMsg = msg;
+      }
       lastUpdate = now;
       // Yield to main thread to allow UI paint
       await yieldToMain();
     }
   };
 }
+
+let logProgress = createProgressLogger(document.getElementById("progress"));
 
 window.addEventListener("beforeunload", function () {
   if (currentlyBusy) {
@@ -60,37 +68,6 @@ const fastScheduler = (function () {
 })();
 
 const yieldToMain = () => new Promise((resolve) => fastScheduler(resolve));
-
-async function pumpStream(reader, writer, totalSize, onProgress) {
-  let processed = 0;
-  let lastLogTime = 0;
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      await writer.write(value);
-      processed += value.length;
-
-      const now = Date.now();
-      if (onProgress && now - lastLogTime > 100) {
-        // Force yield here to ensure UI paints
-        await yieldToMain();
-        await onProgress(processed, totalSize);
-        lastLogTime = now;
-      }
-    }
-    if (onProgress) await onProgress(processed, totalSize);
-  } finally {
-    try {
-      writer.close();
-    } catch (e) {}
-    try {
-      reader.releaseLock();
-    } catch (e) {}
-  }
-}
 
 navigator.storage
   .persist()
@@ -147,35 +124,48 @@ async function saveRegistry(registry) {
   );
 }
 
+let _registryWriteQueue = Promise.resolve();
+
 async function updateRegistryEntry(name, data) {
-  // Lock exclusively for writing
-  await navigator.locks.request("rfs_registry_lock", async () => {
-    // Force a fresh read inside the lock to ensure we have the latest state on disk
-    // (In case another tab updated it)
-    let reg;
-    try {
+  return navigator.locks.request(
+    "rfs_registry_lock",
+    { mode: "exclusive" },
+    async () => {
       const root = await getOpfsRoot();
-      const handle = await root.getFileHandle(SYSTEM_FILE);
-      const file = await handle.getFile();
-      reg = JSON.parse(await file.text());
-    } catch (e) {
-      reg = {};
-    }
+      let registry = {};
 
-    if (data === null) {
-      delete reg[name];
-    } else {
-      reg[name] = { ...reg[name], ...data, lastModified: Date.now() };
-    }
-    await saveRegistry(reg);
-  });
+      try {
+        const handle = await root.getFileHandle(SYSTEM_FILE);
+        const file = await handle.getFile();
+        registry = JSON.parse(await file.text());
+      } catch (e) {
+        registry = {};
+      }
 
-  if (navigator.serviceWorker.controller) {
-    navigator.serviceWorker.controller.postMessage({
-      type: "INVALIDATE_CACHE",
-      folderName: name,
-    });
-  }
+      if (data === null) {
+        delete registry[name];
+      } else {
+        registry[name] = {
+          ...(registry[name] || {}),
+          ...data,
+          lastModified: Date.now(),
+        };
+      }
+
+      _registryCache = registry;
+      const handle = await root.getFileHandle(SYSTEM_FILE, { create: true });
+      const writable = await handle.createWritable();
+      await writable.write(JSON.stringify(registry));
+      await writable.close();
+
+      if (navigator.serviceWorker.controller) {
+        navigator.serviceWorker.controller.postMessage({
+          type: "INVALIDATE_CACHE",
+          folderName: name,
+        });
+      }
+    },
+  );
 }
 
 async function uploadFolder() {
@@ -183,18 +173,16 @@ async function uploadFolder() {
   const name = folderNameInput.value.trim();
   if (!name) return alert("Please enter a name.");
 
-  setUiBusy(true);
   try {
     if (window.showDirectoryPicker) {
       const localDirHandle = await window.showDirectoryPicker({ mode: "read" });
+      setUiBusy(true);
       await processFolderSelection(name, localDirHandle);
     } else {
       document.getElementById("folderUploadFallbackInput").click();
     }
   } catch (e) {
     if (e.name !== "AbortError") alert("Upload error: " + e.message);
-  } finally {
-    setUiBusy(false);
   }
 }
 
@@ -204,12 +192,17 @@ async function processFolderSelection(name, handle) {
 
   try {
     const encManifest = await handle.getFileHandle("manifest.enc");
-    console.log("Encrypted folder detected.");
     const root = await getOpfsRoot();
     const rfs = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
     try {
       await rfs.removeEntry(name, { recursive: true });
-    } catch (e) {}
+    } catch (e) {
+      if (e.name !== "NotFoundError")
+        alert(
+          "RuntimeFS cannot currently remove this folder; try closing other open RuntimeFS tabs.",
+        );
+      return;
+    }
 
     await decryptAndLoadFolderToOpfs(
       handle,
@@ -232,6 +225,12 @@ async function processFolderSelection(name, handle) {
     try {
       observer = new FileSystemObserver((recs) => changes.push(...recs));
       observer.observe(dirHandle, { recursive: true });
+      if (!showingSync) {
+        Array.from(
+          document.body.getElementsByClassName("supportCheck"),
+        ).forEach((elem) => (elem.style.display = "revert"));
+        showingSync = true;
+      }
     } catch (e) {
       console.warn("Observer failed:", e);
     }
@@ -240,6 +239,7 @@ async function processFolderSelection(name, handle) {
   changes.length = 0;
   document.getElementById("folderName").value = "";
   document.getElementById("openFolderName").value = name;
+  setUiBusy(false);
   await listFolders();
 }
 
@@ -268,7 +268,6 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
     throw new Error("Decryption failed. Wrong password?");
   }
 
-  const logProgress = createProgressLogger(document.getElementById("progress"));
   const contentDir = await srcHandle.getDirectoryHandle("content");
   const ENCRYPTED_CHUNK_OVERHEAD = 12 + 16;
 
@@ -370,209 +369,187 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
 }
 
 async function processFileListAndStore(name, fileList) {
-  const logProgress = createProgressLogger(document.getElementById("progress"));
-
-  try {
-    if (!fileList.length) return;
-    const root = await getOpfsRoot();
-    const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
-    try {
-      await rfsRoot.removeEntry(name, { recursive: true });
-      await yieldToMain();
-    } catch (e) {}
-
-    const folderHandle = await rfsRoot.getDirectoryHandle(name, {
-      create: true,
-    });
-
-    let basePath = "";
-    if (
-      fileList.length > 0 &&
-      fileList[0].webkitRelativePath &&
-      fileList[0].webkitRelativePath.includes("/")
-    ) {
-      basePath = fileList[0].webkitRelativePath.split("/")[0] + "/";
-    }
-
-    const totalFiles = fileList.length;
-    let processedCount = 0;
-
-    // Convert FileList to Array for easier processing
-    const files = Array.from(fileList);
-    async function worker() {
-      while (files.length > 0) {
-        const file = files.shift();
-        if (!file) break;
-
-        let path = file.webkitRelativePath || file.name;
-        if (basePath && path.startsWith(basePath))
-          path = path.substring(basePath.length);
-        if (!path) continue;
-
-        // Pass the FILE object, not file.stream()
-        // We pass null for individual progress to reduce overhead on many small files
-        await writeStreamToOpfs(folderHandle, path, file, file.size, null);
-
-        processedCount++;
-        // Centralized rate-limited logging
-        await logProgress(
-          `Uploading ${processedCount}/${totalFiles}: ${path} (${Math.round(
-            file.size / 1024,
-          )} KB)`,
-        );
-      }
-    }
-
-    await Promise.all(Array(CONCURRENCY).fill(null).map(worker));
-
-    await updateRegistryEntry(name, { encryptionType: null });
-    await logProgress("", true);
-    document.getElementById("folderName").value = "";
-    document.getElementById("openFolderName").value = name;
-    await listFolders();
-  } catch (e) {
-    console.error(e);
-    alert("Error: " + e.message);
-  } finally {
-    await logProgress("", true);
-  }
-}
-
-async function processAndStoreFolderStreaming(name, srcHandle) {
-  const logProgress = createProgressLogger(document.getElementById("progress"));
-
   const root = await getOpfsRoot();
-  const rfs = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
+  const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
   try {
-    await rfs.removeEntry(name, { recursive: true });
-  } catch (e) {}
-  const destRoot = await rfs.getDirectoryHandle(name, { create: true });
-  await logProgress("Starting stream upload...", true);
-
-  const queue = [
-    {
-      source: srcHandle,
-      dest: destRoot,
-      path: "",
-    },
-  ];
-
-  const pendingUploads = [];
-  let completedFiles = 0;
-  let activeWorkers = 0;
-
-  // Helper to run the upload queue
-  async function flushUploads() {
-    while (pendingUploads.length > 0 && activeWorkers < CONCURRENCY) {
-      const task = pendingUploads.shift();
-      activeWorkers++;
-
-      writeStreamToOpfs(task.dest, task.name, task.file, task.file.size)
-        .then(() => {
-          completedFiles++;
-          logProgress(`Processed ${completedFiles} files...`);
-        })
-        .catch((e) => console.error(`Failed ${task.name}:`, e))
-        .finally(() => {
-          activeWorkers--;
-          // Chain the next flush
-          flushUploads();
-        });
-    }
-  }
-
-  // Iterative scan
-  while (queue.length > 0) {
-    const { source, dest, path } = queue.shift();
-
-    for await (const entry of source.values()) {
-      if (entry.kind === "file") {
-        const file = await entry.getFile();
-        // Push to upload queue immediately
-        pendingUploads.push({
-          dest: dest, // We already have the parent dest handle!
-          name: entry.name,
-          file: file,
-        });
-
-        // Keep the workers fed
-        if (pendingUploads.length >= CONCURRENCY) flushUploads();
-      } else if (entry.kind === "directory") {
-        const newDest = await dest.getDirectoryHandle(entry.name, {
-          create: true,
-        });
-        queue.push({
-          source: entry,
-          dest: newDest,
-          path: path + "/" + entry.name,
-        });
-      }
-    }
-    // Yield occasionally during scanning
-    await yieldToMain();
-  }
-
-  // Wait for remaining uploads
-  while (pendingUploads.length > 0 || activeWorkers > 0) {
-    flushUploads();
-    await new Promise((r) => setTimeout(r, 20));
-  }
-
-  await updateRegistryEntry(name, { encryptionType: null });
-  await logProgress("", true);
-  document.getElementById("folderName").value = "";
-  document.getElementById("openFolderName").value = name;
-  await listFolders();
-}
-
-async function writeStreamToOpfs(
-  parentHandle,
-  path,
-  fileObj,
-  totalSize,
-  onProgress,
-) {
-  const parts = path.split("/");
-  const fileName = parts.pop();
-
-  // Fresh stream for each attempt
-  const attemptUpload = async (dirHandle) => {
-    const fileHandle = await dirHandle.getFileHandle(fileName, {
-      create: true,
-    });
-    const writable = await fileHandle.createWritable();
-    // Get a fresh stream reader from the File object
-    if (!onProgress) {
-      await fileObj.stream().pipeTo(writable);
-    } else {
-      // Keep manual pumping only when we absolutely need granular progress
-      await pumpStream(
-        fileObj.stream().getReader(),
-        writable,
-        totalSize,
-        onProgress,
+    await rfsRoot.removeEntry(name, { recursive: true });
+  } catch (e) {
+    if (e.name !== "NotFoundError")
+      alert(
+        "RuntimeFS cannot currently remove this folder; try closing other open RuntimeFS tabs.",
       );
+  }
+  const folderHandle = await rfsRoot.getDirectoryHandle(name, { create: true });
+
+  const files = Array.from(fileList);
+  const totalFolderSize = files.reduce((acc, f) => acc + f.size, 0);
+  const totalMB = (totalFolderSize / (1024 * 1024)).toFixed(2);
+  let bytesUploaded = 0;
+  let completedFiles = 0;
+
+  let basePath = "";
+  if (files[0]?.webkitRelativePath?.includes("/")) {
+    basePath = files[0].webkitRelativePath.split("/")[0] + "/";
+  }
+
+  const dirCache = new Map();
+  const worker = async () => {
+    while (files.length > 0) {
+      const file = files.shift();
+      if (!file) break;
+
+      let path = file.webkitRelativePath || file.name;
+      if (basePath && path.startsWith(basePath))
+        path = path.substring(basePath.length);
+
+      await writeStreamToOpfs(folderHandle, path, file, {
+        dirCache,
+        onProgress: (delta) => {
+          bytesUploaded += delta;
+          const totalPct = Math.round((bytesUploaded / totalFolderSize) * 100);
+          logProgress(
+            `Uploading: ${totalPct}% (${(bytesUploaded / 1048576).toFixed(2)}/${totalMB} MB)`,
+          );
+        },
+      });
+      completedFiles++;
     }
   };
 
-  try {
-    let currentDir = parentHandle;
-    for (const part of parts) {
-      currentDir = await currentDir.getDirectoryHandle(part, { create: true });
-    }
-    await attemptUpload(currentDir);
-  } catch (e) {
-    if (e.name === "InvalidStateError") {
-      console.warn(`Retrying write for ${fileName}...`);
-      await yieldToMain();
-      let retryDir = parentHandle;
-      for (const part of parts)
-        retryDir = await retryDir.getDirectoryHandle(part, { create: true });
+  await Promise.all(Array(CONCURRENCY).fill(null).map(worker));
 
-      await attemptUpload(retryDir);
+  document.getElementById("folderName").value = "";
+  document.getElementById("openFolderName").value = name;
+
+  await updateRegistryEntry(name, { encryptionType: null });
+  await logProgress("", true);
+  await listFolders();
+}
+
+async function processAndStoreFolderStreaming(name, srcHandle) {
+  const root = await getOpfsRoot();
+  const rfs = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
+
+  // Cleanup old folder data
+  try {
+    await rfs.removeEntry(name, { recursive: true });
+  } catch (e) {
+    if (e.name !== "NotFoundError") {
+      alert(
+        "RuntimeFS cannot currently remove this folder; try closing other open RuntimeFS tabs.",
+      );
       return;
     }
-    throw e;
+  }
+
+  const destRoot = await rfs.getDirectoryHandle(name, { create: true });
+
+  const filesToUpload = [];
+  let totalFolderSize = 0;
+  let bytesUploaded = 0;
+  let scannedCount = 0; // Fix: Defined missing variable
+
+  // 1. Scan Phase: Collect all file handles and calculate total size
+  logProgress("Calculating folder size...");
+  const scanQueue = [{ source: srcHandle, dest: destRoot }];
+
+  while (scanQueue.length > 0) {
+    const { source, dest } = scanQueue.shift();
+    for await (const entry of source.values()) {
+      if (entry.kind === "file") {
+        const file = await entry.getFile();
+        totalFolderSize += file.size;
+        // Store the file object immediately to ensure permission persistence
+        filesToUpload.push({ dest, entry, file });
+        scannedCount++;
+        if (scannedCount % 100 === 0) await yieldToMain();
+      } else {
+        const nextDest = await dest.getDirectoryHandle(entry.name, {
+          create: true,
+        });
+        scanQueue.push({ source: entry, dest: nextDest });
+      }
+    }
+  }
+
+  const totalMB = (totalFolderSize / (1024 * 1024)).toFixed(2);
+
+  // 2. Worker Phase: Upload the collected files
+  const worker = async () => {
+    while (filesToUpload.length > 0) {
+      const task = filesToUpload.shift();
+      if (!task) break;
+
+      await writeStreamToOpfs(task.dest, task.entry.name, task.file, {
+        onProgress: (delta) => {
+          bytesUploaded += delta;
+          const totalPct = Math.round((bytesUploaded / totalFolderSize) * 100);
+          logProgress(
+            `Uploading: ${totalPct}% (${(bytesUploaded / 1048576).toFixed(2)}/${totalMB} MB)`,
+          );
+        },
+      });
+    }
+  };
+
+  await Promise.all(Array(CONCURRENCY).fill(null).map(worker));
+
+  // Cleanup & UI Update
+  document.getElementById("folderName").value = "";
+  document.getElementById("openFolderName").value = name;
+  await updateRegistryEntry(name, { encryptionType: null });
+  await logProgress("", true);
+  await listFolders();
+}
+
+async function writeStreamToOpfs(parentHandle, path, fileObj, options = {}) {
+  const { dirCache = null, onProgress = null } = options;
+  const lastSlashIndex = path.lastIndexOf("/");
+  let currentDir = parentHandle;
+
+  if (lastSlashIndex !== -1) {
+    const dirPath = path.slice(0, lastSlashIndex);
+    const fileName = path.slice(lastSlashIndex + 1);
+    if (dirCache && dirCache.has(dirPath)) {
+      currentDir = dirCache.get(dirPath);
+    } else {
+      let currentPathBuilder = "";
+      const parts = dirPath.split("/");
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        currentPathBuilder += (i === 0 ? "" : "/") + part;
+        if (dirCache && dirCache.has(currentPathBuilder)) {
+          currentDir = dirCache.get(currentPathBuilder);
+        } else {
+          currentDir = await currentDir.getDirectoryHandle(part, {
+            create: true,
+          });
+          if (dirCache) dirCache.set(currentPathBuilder, currentDir);
+        }
+      }
+    }
+    path = fileName;
+  }
+
+  const fileHandle = await currentDir.getFileHandle(path, { create: true });
+  const writable = await fileHandle.createWritable();
+
+  try {
+    if (!onProgress) {
+      await writable.write(fileObj);
+    } else {
+      const meter = new TransformStream({
+        transform(chunk, controller) {
+          controller.enqueue(chunk);
+          onProgress(chunk.byteLength);
+        },
+      });
+      await fileObj.stream().pipeThrough(meter).pipeTo(writable);
+    }
+  } finally {
+    try {
+      await writable.close();
+    } catch (e) {}
   }
 }
 
@@ -595,8 +572,6 @@ async function listFolders() {
       fragment.appendChild(li);
     });
     folderList.appendChild(fragment);
-  } catch (e) {
-    console.error("List failed:", e);
   } finally {
     isListingFolders = false;
   }
@@ -606,11 +581,10 @@ async function deleteFolder(folderNameToDelete, skipConfirm = false) {
   const folderName =
     folderNameToDelete ||
     document.getElementById("deleteFolderName").value.trim();
-  if (!folderName) return alert("Enter folder name!");
+  if (!folderName) return alert("Enter a folder name first.");
   if (!skipConfirm && !confirm(`Remove "${folderName}"?`)) return;
 
-  const progressElem = document.getElementById("progress");
-  progressElem.textContent = "Deleting...";
+  logProgress("Deleting...", true);
   setUiBusy(true);
   try {
     const root = await getOpfsRoot();
@@ -626,7 +600,7 @@ async function deleteFolder(folderNameToDelete, skipConfirm = false) {
   } catch (e) {
     alert("Delete failed: " + e.message);
   } finally {
-    progressElem.textContent = "";
+    logProgress("", true);
     if (!skipConfirm) setUiBusy(false);
   }
 }
@@ -669,8 +643,6 @@ async function openFile(overrideFolderName) {
 
     const encodedPath = fileName.split("/").map(encodeURIComponent).join("/");
     window.open(`n/${encodeURIComponent(folderName)}/${encodedPath}`, "_blank");
-  } catch (e) {
-    alert("Error: " + e);
   } finally {
     setUiBusy(false);
   }
@@ -678,7 +650,6 @@ async function openFile(overrideFolderName) {
 
 async function startImport(file) {
   setUiBusy(true);
-  const progressElem = document.getElementById("progress");
   const TEMP_BLOB_DIR = ".rfs_temp_blobs"; // Must match LittleExport
 
   try {
@@ -697,12 +668,8 @@ async function startImport(file) {
 
     // Yield to main thread to ensure file system operations flush
     await new Promise((resolve) => setTimeout(resolve, 50));
-
     await LittleExport.importData(file, {
-      logger: (msg) => {
-        if (progressElem) progressElem.textContent = msg;
-        console.log(msg);
-      },
+      logger: logProgress,
       onCustomItem: async (path, data) => {
         if (path === SYSTEM_FILE) {
           const decoder = new TextDecoder();
@@ -718,20 +685,16 @@ async function startImport(file) {
       });
     }
 
+    await listFolders();
     alert("Import complete!");
-  } catch (e) {
-    console.error(e);
-    alert("Import failed: " + e.message);
   } finally {
     setUiBusy(false);
-    if (progressElem) progressElem.textContent = "";
+    logProgress("", true);
   }
 }
 
 async function exportData() {
   setUiBusy(true);
-  const progressElem = document.getElementById("progress");
-  const updateProgress = (msg) => (progressElem.textContent = msg);
   let password = prompt("Enter a password (or leave blank for no encryption):");
 
   try {
@@ -748,13 +711,13 @@ async function exportData() {
 
       customItems: [{ path: SYSTEM_FILE, data: JSON.stringify(registry) }],
       exclude: { opfs: [SYSTEM_FILE] },
-      logger: updateProgress,
+      logger: logProgress,
     });
   } catch (e) {
     alert("Export failed: " + e.message);
   } finally {
     setUiBusy(false);
-    updateProgress("");
+    logProgress("", true);
   }
 }
 
@@ -803,17 +766,22 @@ async function deriveKeyFromPassword(password, salt) {
 
 async function uploadFolderFallback(e) {
   const name = document.getElementById("folderName").value.trim();
+  if (!name) return alert("Please enter a name.");
   const input = e.target;
   if (!input.files.length) {
     setUiBusy(false);
     return;
   }
-  await processFileListAndStore(name, input.files);
-  input.value = "";
-  setUiBusy(false);
+  setUiBusy(true);
+  try {
+    await processFileListAndStore(name, input.files);
+  } finally {
+    input.value = "";
+    setUiBusy(false);
+  }
 }
 
-var syncTimeout = -1;
+let syncTimeout = -1;
 async function syncFiles() {
   if (!folderName || !dirHandle)
     return alert(
@@ -822,9 +790,9 @@ async function syncFiles() {
   setUiBusy(true);
   if (changes.length > 0) {
     await performSyncToOpfs();
-    document.getElementById("syncInfo").textContent = "Sync complete found.";
+    document.getElementById("syncInfo").textContent = "Sync complete.";
   } else {
-    document.getElementById("syncInfo").textContent = "No sync changes.";
+    document.getElementById("syncInfo").textContent = "No changes to sync.";
   }
   clearTimeout(syncTimeout);
   syncTimeout = setTimeout(
@@ -842,9 +810,9 @@ async function syncAndOpenFile() {
   setUiBusy(true);
   if (changes.length > 0) {
     await performSyncToOpfs();
-    document.getElementById("syncInfo").textContent = "Sync complete found.";
+    document.getElementById("syncInfo").textContent = "Sync complete.";
   } else {
-    document.getElementById("syncInfo").textContent = "No sync changes.";
+    document.getElementById("syncInfo").textContent = "No changes to sync.";
   }
   clearTimeout(syncTimeout);
   syncTimeout = setTimeout(
@@ -856,48 +824,47 @@ async function syncAndOpenFile() {
 
 async function performSyncToOpfs() {
   console.log(`Syncing ${changes.length} changes...`);
-  const root = await getOpfsRoot();
-  const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX);
-  const folderHandle = await rfsRoot.getDirectoryHandle(folderName);
 
-  for (const change of changes) {
-    const pathArr = change.relativePathComponents;
-    if (!pathArr) continue;
-    const fileName = pathArr[pathArr.length - 1];
-    const dirPath = pathArr.slice(0, -1);
-    const pathStr = pathArr.join("/");
+  // Use a lock to prevent UI-SW conflict
+  await navigator.locks.request(`lock_rfs_${folderName}`, async () => {
+    const root = await getOpfsRoot();
+    const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX);
+    const folderHandle = await rfsRoot.getDirectoryHandle(folderName);
 
-    try {
-      if (change.type === "deleted") {
-        let cur = folderHandle;
-        try {
+    // Create a copy and clear global to prevent race conditions during sync
+    const processing = changes.slice(0);
+    changes.length = 0;
+
+    for (const change of processing) {
+      const pathArr = change.relativePathComponents;
+      if (!pathArr) continue;
+
+      const pathStr = pathArr.join("/");
+      try {
+        if (change.type === "deleted") {
+          let cur = folderHandle;
+          const dirPath = pathArr.slice(0, -1);
+          const fileName = pathArr[pathArr.length - 1];
           for (const p of dirPath) cur = await cur.getDirectoryHandle(p);
           await cur.removeEntry(fileName, { recursive: true });
-        } catch (e) {}
-      } else if (change.type === "modified" || change.type === "created") {
-        let srcHandle = dirHandle;
-        try {
-          for (const p of pathArr) {
-            if (p === fileName && p === pathArr[pathArr.length - 1]) {
-              srcHandle = await srcHandle.getFileHandle(p);
-            } else {
-              srcHandle = await srcHandle.getDirectoryHandle(p);
-            }
+        } else {
+          let src = dirHandle;
+          for (let i = 0; i < pathArr.length - 1; i++) {
+            src = await src.getDirectoryHandle(pathArr[i]);
           }
-        } catch (e) {
-          continue;
+          const fileEntry = await src.getFileHandle(
+            pathArr[pathArr.length - 1],
+          );
+          const f = await fileEntry.getFile();
+          await writeStreamToOpfs(folderHandle, pathStr, f, {
+            totalSize: f.size,
+          });
         }
-
-        if (srcHandle.kind === "file") {
-          const f = await srcHandle.getFile();
-          await writeStreamToOpfs(folderHandle, pathStr, f, f.size);
-        }
+      } catch (e) {
+        console.warn(`Sync failed for ${pathStr}:`, e);
       }
-    } catch (e) {
-      console.warn(`Sync failed for ${pathStr}`, e);
     }
-  }
-  changes.length = 0;
+  });
 }
 
 async function uploadAndEncryptWithPassword() {
@@ -906,7 +873,6 @@ async function uploadAndEncryptWithPassword() {
   if (!name || !password) return;
 
   setUiBusy(true);
-  const progressElem = document.getElementById("progress");
 
   try {
     const localDir = await window.showDirectoryPicker({ mode: "read" });
@@ -914,7 +880,13 @@ async function uploadAndEncryptWithPassword() {
     const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
     try {
       await rfsRoot.removeEntry(name, { recursive: true });
-    } catch (e) {}
+    } catch (e) {
+      if (e.name !== "NotFoundError")
+        alert(
+          "RuntimeFS cannot currently remove this folder; try closing other open RuntimeFS tabs.",
+        );
+      return;
+    }
 
     const destDir = await rfsRoot.getDirectoryHandle(name, { create: true });
     const contentDir = await destDir.getDirectoryHandle("content", {
@@ -931,7 +903,7 @@ async function uploadAndEncryptWithPassword() {
           ? `${relativePath}/${entry.name}`
           : entry.name;
         if (entry.kind === "file") {
-          progressElem.textContent = `Encrypting: ${entryPath}`;
+          logProgress(`Encrypting: ${entryPath}`);
           await yieldToMain();
 
           const fileId = crypto.randomUUID();
@@ -949,39 +921,75 @@ async function uploadAndEncryptWithPassword() {
 
           if (file.size > 0) {
             const reader = file.stream().getReader();
-            let totalProcessed = 0;
+            let lastYield = Date.now();
 
-            var lastYield = Date.now();
+            let pendingChunks = [];
+            let pendingSize = 0;
+
             while (true) {
-              let buffer = new Uint8Array(0);
-              while (buffer.length < CHUNK_SIZE) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                const temp = new Uint8Array(buffer.length + value.length);
-                temp.set(buffer);
-                temp.set(value, buffer.length);
-                buffer = temp;
+              const { done, value } = await reader.read();
+              if (value) {
+                pendingChunks.push(value);
+                pendingSize += value.byteLength;
               }
 
-              if (buffer.length === 0) break;
-              if (Date.now() - lastYield > 200) {
-                await yieldToMain();
-                lastYield = Date.now();
+              if (pendingSize >= CHUNK_SIZE || done) {
+                if (pendingSize > 0) {
+                  // One big buffer
+                  const buffer = new Uint8Array(pendingSize);
+                  let offset = 0;
+                  for (const c of pendingChunks) {
+                    buffer.set(c, offset);
+                    offset += c.byteLength;
+                  }
+
+                  pendingChunks = [];
+                  let cursor = 0;
+                  while (cursor < pendingSize) {
+                    const remaining = pendingSize - cursor;
+
+                    if (!done && remaining < CHUNK_SIZE) {
+                      const leftover = buffer.slice(cursor);
+                      pendingChunks = [leftover];
+                      pendingSize = leftover.byteLength;
+                      break;
+                    }
+
+                    // Encrypt a full chunk
+                    const sizeToEncrypt = Math.min(CHUNK_SIZE, remaining);
+                    const chunkToEncrypt = buffer.subarray(
+                      cursor,
+                      cursor + sizeToEncrypt,
+                    );
+
+                    const iv = crypto.getRandomValues(new Uint8Array(12));
+                    const encryptedChunk = await crypto.subtle.encrypt(
+                      { name: "AES-GCM", iv },
+                      key,
+                      chunkToEncrypt,
+                    );
+
+                    await writable.write(iv);
+                    await writable.write(new Uint8Array(encryptedChunk));
+
+                    cursor += sizeToEncrypt;
+
+                    // Yield every ~200ms to keep UI alive
+                    if (Date.now() - lastYield > 200) {
+                      await yieldToMain();
+                      lastYield = Date.now();
+                    }
+                  }
+
+                  // Reset pendingSize if we consumed everything
+                  if (cursor >= pendingSize) {
+                    pendingSize = 0;
+                  }
+                }
               }
-
-              const iv = crypto.getRandomValues(new Uint8Array(12));
-              const encryptedChunk = await crypto.subtle.encrypt(
-                { name: "AES-GCM", iv },
-                key,
-                buffer,
-              );
-
-              await writable.write(iv);
-              await writable.write(new Uint8Array(encryptedChunk));
-
-              totalProcessed += buffer.length;
-              if (totalProcessed >= file.size) break;
+              if (done) break;
             }
+            reader.releaseLock();
           }
           await writable.close();
         } else {
@@ -992,7 +1000,7 @@ async function uploadAndEncryptWithPassword() {
 
     await processHandle(localDir, "");
 
-    progressElem.textContent = "Saving manifest...";
+    logProgress("Saving manifest...");
     const manifestJson = JSON.stringify(manifestData);
     const manifestBuffer = new TextEncoder().encode(manifestJson);
     const manifestIv = crypto.getRandomValues(new Uint8Array(12));
@@ -1018,12 +1026,9 @@ async function uploadAndEncryptWithPassword() {
 
     document.getElementById("encryptFolderName").value = "";
     await listFolders();
-  } catch (e) {
-    alert("Error: " + e.message);
-    console.error(e);
   } finally {
     setUiBusy(false);
-    progressElem.textContent = "";
+    logProgress("", true);
   }
 }
 
@@ -1079,6 +1084,10 @@ document.addEventListener("DOMContentLoaded", () => {
     .getElementById("folderUploadFallbackInput")
     .addEventListener("change", uploadFolderFallback);
 
+  if (window.showSaveFilePicker) {
+    ocument.getElementById("encryptionSection").style.display = "revert";
+  }
+
   const dragZone = document.body;
   dragZone.addEventListener("dragover", (e) => {
     e.preventDefault();
@@ -1105,8 +1114,6 @@ document.addEventListener("DOMContentLoaded", () => {
       const name = prompt("Please choose a folder name:", entry.name);
       if (name) {
         setUiBusy(true);
-        const progressElem = document.getElementById("progress");
-        const logProgress = createProgressLogger(progressElem);
 
         try {
           // Scan iteratively
@@ -1147,7 +1154,7 @@ document.addEventListener("DOMContentLoaded", () => {
         } catch (err) {
           alert("Scan failed: " + err.message);
           setUiBusy(false);
-          if (progressElem) progressElem.textContent = "";
+          logProgress("", true);
         }
       }
     }
@@ -1178,24 +1185,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const rT = document.getElementById("regex");
   const hT = document.getElementById("headers");
-  if (rT) {
-    rT.value = localStorage.getItem("fsRegex") || "";
-    rT.addEventListener("input", () =>
-      localStorage.setItem("fsRegex", rT.value),
-    );
-  }
-  if (hT) {
-    hT.value = localStorage.getItem("fsHeaders") || "";
-    hT.addEventListener("input", () =>
-      localStorage.setItem("fsHeaders", hT.value),
-    );
-  }
-
-  if (!window.showDirectoryPicker) {
-    Array.from(document.body.getElementsByClassName("supportCheck")).forEach(
-      (elem) => (elem.style.display = "none"),
-    );
-  }
+  rT.value = localStorage.getItem("fsRegex") || "";
+  rT.addEventListener("input", () => localStorage.setItem("fsRegex", rT.value));
+  hT.value = localStorage.getItem("fsHeaders") || "";
+  hT.addEventListener("input", () =>
+    localStorage.setItem("fsHeaders", hT.value),
+  );
 });
 
 async function openFileInPlace() {
@@ -1245,7 +1240,7 @@ async function openFileInPlace() {
       }),
       new Promise((_, reject) =>
         setTimeout(
-          () => reject(new Error("Service Worker response timeout")),
+          () => reject(new Error("Service Worker response timed out.")),
           4000,
         ),
       ),
@@ -1262,7 +1257,7 @@ async function openFileInPlace() {
 
     if (!resp.ok) {
       if (resp.status === 403) return alert("Session authentication failed.");
-      throw new Error(`Failed to load app: ${resp.status} ${resp.statusText}`);
+      throw new Error(`Failed to load HTML: ${resp.status} ${resp.statusText}`);
     }
     let html = await resp.text();
 
@@ -1270,7 +1265,6 @@ async function openFileInPlace() {
     const baseTag = `<base href="${basePath}">`;
 
     let metaTags = "";
-    // FIXED: capture both value (val) and key (key)
     resp.headers.forEach((val, key) => {
       metaTags += `<meta http-equiv="${key.replace(
         /"/g,
@@ -1292,8 +1286,6 @@ async function openFileInPlace() {
     document.open();
     document.write(html);
     document.close();
-  } catch (e) {
-    alert("Error opening in-place: " + e.message);
   } finally {
     setUiBusy(false);
   }

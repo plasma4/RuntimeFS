@@ -87,6 +87,7 @@
 
 <body>
     <h1>RuntimeFS Plugin</h1>
+    <button onclick="update()">Update</button>
 
     <div class="warning">
         Warning: These actions affect the Service Worker Cache ("fc").
@@ -94,7 +95,7 @@
     </div>
 
     <h2>Patch Specific File</h2>
-    <label>Target File to Patch (e.g., ./main.js)</label>
+    <label>Target File to Patch (./main.min.js, ./sw.min.js, ./, and ./index.html)</label>
     <input type="text" id="targetPath" value="./main.js">
 
     <label>Select New File</label>
@@ -103,15 +104,53 @@
     <button onclick="patchCache()">Patch App Shell</button>
 
     <h2>Maintenance</h2>
-    <p>If you want to force an update for RuntimeFS itself, clear the cache (and uninstall the worker). Make sure to reload after!</p>
+    <p>
+        If you want to force an update for RuntimeFS itself, clear the cache (and uninstall the worker).
+        Make sure to reload after!
+    </p>
     <button class="danger" onclick="clearStuff()">Delete RuntimeFS Cache and Worker</button>
 
     <div class="log" id="log"></div>
 
     <script>
+        if (window.location.protocol === "file:") {
+            alert(
+                "RuntimeFS cannot run from a local file:// context; use an online version or localhost instead."
+            );
+            throw new Error("Can't run RuntimeFS here.");
+        }
+        if (!window.isSecureContext) {
+            alert("RuntimeFS cannot run in a non-secure context.");
+            throw new Error("Can't run RuntimeFS here.");
+        } else if (!("serviceWorker" in navigator)) {
+            alert("RuntimeFS cannot run without ServiceWorkers enabled.");
+            throw new Error("Can't run RuntimeFS here.");
+        }
+
         const logElem = document.getElementById("log")
         function log(msg) { logElem.textContent += msg + "\n" }
         const CACHE_NAME = "fc"
+        async function update() {
+            log("Starting RuntimeFS cache reset...")
+            if (window.caches) {
+                const success = await caches.delete('fc')
+                log(success ? `Deleted cache ${CACHE_NAME}.` : `Cache ${CACHE_NAME} not found or already deleted.`)
+            }
+
+            if (navigator.serviceWorker) {
+                const registrations = await navigator.serviceWorker.getRegistrations()
+                for (const registration of registrations) {
+                    await registration.unregister()
+                }
+                log("Service Worker unregistered.")
+            }
+
+            const match = location.pathname.match(/^(.*\/)n\//)
+            const rootPath = match ? match[1] : "/"
+            log(`Redirecting to ${rootPath} to re-initialize...`)
+            location = rootPath
+        }
+
         async function patchCache() {
             const targetPath = document.getElementById("targetPath").value.trim()
             const fileInput = document.getElementById("fileInput")

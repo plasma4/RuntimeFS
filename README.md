@@ -9,7 +9,7 @@ Imagine an offline localhost, in your browser with no server-based storage of fi
 After the initial page loads, RuntimeFS no longer needs internet connection to function. RuntimeFS also supports in-place opening of files, which doesn't require opening another tab.
 
 ## Setup
-RuntimeFS utilizes [cbor-x](https://github.com/kriszyp/cbor-x) and my own [LittleExport](https://github.com/plasma4/LittleExport) tool. Both are MIT Licensed. (LittleExport is integrated directly into RuntimeFS; no separate license file is required.) Only `main.min.js` and `sw.min.js` are required for RuntimeFS to work.
+RuntimeFS utilizes [cbor-x](https://github.com/kriszyp/cbor-x) and my own [LittleExport](https://github.com/plasma4/LittleExport) tool. Both are MIT Licensed. (LittleExport is integrated directly into RuntimeFS; no separate license file is required.) Only `main.min.js`, `sw.min.js`, and `index.html` are required for RuntimeFS to function.
 
 Make sure to modify `APP_SHELL_FILES` in the SW and `SW_LINK` in the main code if you are changing the file configuration for proper caching. (Code is minified by using [JSCompress](https://jscompress.com/), which uses `UglifyJS` 3 and `babel-minify`.)
 
@@ -18,7 +18,7 @@ You can use Enter on text inputs to perform actions, instead of clicking buttons
 
 Custom regex and headers save on reload and export but do not affect stored files, and only work when opening the file (in-place or new tab) from the RuntimeFS menu (reloading or navigating to the URL directly do not yet).
 
-To update to a newer version, a single-file plugin exists for customizing cache in `plugin/custom.html` (or simply to request an update), allowing for you to fully customize RuntimeFS from any site hosting it (although **it will clear the cache on hard reload**). If this isn't included in the way you use RuntimeFS, you can upload it as a virtual folder.
+To update to a newer version, a single-file plugin exists for customizing cache in `plugin/index.html` (or simply to request an update), allowing for you to fully customize RuntimeFS from any site hosting it. Note that simply hard reloading won't update the cache. If this isn't included in the way you use RuntimeFS, you can upload it as a virtual folder. Example link with the demo [here](https://plasma4.org/projects/RuntimeFS/plugin/).
 
 ## Browser Support
 File System API features (such as syncing or folder encryption) are Chromium-exclusive, and these options will be hidden in other browsers. RuntimeFS has been tested in Chromium, Firefox, and Safari.

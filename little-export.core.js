@@ -491,7 +491,9 @@
     };
     const logger = opts.logger || console.log;
 
-    let outputStream, downloadUrl;
+    let outputStream,
+      downloadUrl,
+      chunks = [];
     if (window.showSaveFilePicker && opts.download !== false) {
       try {
         const name = opts.password
@@ -506,15 +508,9 @@
     }
 
     if (!outputStream) {
-      const chunks = [];
       outputStream = new WritableStream({
         write(c) {
           chunks.push(c);
-        },
-        close() {
-          downloadUrl = URL.createObjectURL(
-            new Blob(chunks, { type: "application/octet-stream" }),
-          );
         },
       });
     }
@@ -527,28 +523,26 @@
       },
     });
 
-    const counterPromise = countingStream.readable.pipeTo(outputStream);
-    let targetWritable = countingStream.writable;
+    const gzip = new CompressionStream("gzip");
+
+    let pipeline = gzip.readable;
 
     if (opts.password) {
       logger("Encrypting...");
       const salt = crypto.getRandomValues(new Uint8Array(16));
-      const encStream = new TransformStream(
-        new EncryptionTransformer(opts.password, salt),
+      pipeline = pipeline.pipeThrough(
+        new TransformStream(new EncryptionTransformer(opts.password, salt)),
       );
-      encStream.readable.pipeTo(targetWritable);
-      targetWritable = encStream.writable;
     }
 
-    const gzip = new CompressionStream("gzip");
-    // We don't await this immediately, but checking errors is good
-    gzip.readable
-      .pipeTo(targetWritable)
-      .catch((e) => console.error("GZIP piping error:", e));
+    // Finalize the chain by adding the counter and piping to the sink (outputStream)
+    const exportFinishedPromise = pipeline
+      .pipeThrough(countingStream)
+      .pipeTo(outputStream);
 
     const tar = new TarWriter(gzip.writable);
     const reportProgress = () => {
-      logger(`Exporting (${(outputBytesWritten / 1048576).toFixed(2)} MB)...`);
+      logger(`Exporting... (${(outputBytesWritten / 1048576).toFixed(2)} MB)`);
     };
     const progressInterval = setInterval(reportProgress, opts.logSpeed);
 
@@ -755,7 +749,12 @@
       }
 
       await tar.close(); // Closes Gzip input
-      await counterPromise; // Waits for File stream to close
+      await exportFinishedPromise;
+      if (chunks.length > 0) {
+        downloadUrl = URL.createObjectURL(
+          new Blob(chunks, { type: "application/octet-stream" }),
+        );
+      }
 
       if (downloadUrl) {
         const a = document.createElement("a");

@@ -1085,7 +1085,7 @@ document.addEventListener("DOMContentLoaded", () => {
     .addEventListener("change", uploadFolderFallback);
 
   if (window.showSaveFilePicker) {
-    ocument.getElementById("encryptionSection").style.display = "revert";
+    document.getElementById("encryptionSection").style.display = "revert";
   }
 
   const dragZone = document.body;

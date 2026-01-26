@@ -1,28 +1,39 @@
 (function () {
   let blobIdCounter = 0;
-  // stolen from my FractalSky code
-  const fastScheduler = (function () {
-    if ("scheduler" in window && "postTask" in scheduler) {
-      return (cb) => scheduler.postTask(cb, { priority: "user-blocking" });
-    }
+  function createYielder(threshold = 100) {
+    let lastYield = Date.now();
     const channel = new MessageChannel();
-    const queue = [];
+    const resolvers = [];
+
     channel.port1.onmessage = () => {
-      const task = queue.shift();
-      if (task) task();
+      const res = resolvers.shift();
+      if (res) res();
     };
-    return (cb) => {
-      queue.push(cb);
-      channel.port2.postMessage(undefined);
+
+    return function (force = false) {
+      const now = Date.now();
+      if (force || now - lastYield > threshold) {
+        lastYield = now;
+        return (async () => {
+          if ("scheduler" in window && "yield" in scheduler) {
+            await scheduler.yield();
+          } else {
+            await new Promise((res) => {
+              resolvers.push(res);
+              channel.port2.postMessage(null);
+            });
+          }
+        })();
+      }
+      return null;
     };
-  })();
+  }
 
-  const yieldToMain = () => new Promise((resolve) => fastScheduler(resolve));
-
-  const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB
+  const CHUNK_SIZE = 4194304; // 4MB, for encryption
+  const TAR_BUFFER_SIZE = 65536; // 64KB, for optimization
   const ENC = new TextEncoder();
   const DEC = new TextDecoder();
-  const TEMP_BLOB_DIR = ".rfs_temp_blobs"; // Hidden temp dir for IDB restoration
+  const TEMP_BLOB_DIR = ".rfs_temp_blobs"; // Hidden temp dir for IDB restoring
 
   async function deriveKey(password, salt) {
     const km = await crypto.subtle.importKey(
@@ -215,45 +226,84 @@
   }
 
   class TarWriter {
-    constructor(writableStream) {
+    constructor(writableStream, yielder) {
       this.writer = writableStream.getWriter();
+      this.yielder = yielder;
       this.pos = 0;
       this.bytesWritten = 0;
       this.time = Math.floor(Date.now() / 1000);
+
+      this.buffer = new Uint8Array(TAR_BUFFER_SIZE);
+      this.bufferOffset = 0;
     }
+
     async writeEntry(path, data) {
       const bytes = typeof data === "string" ? ENC.encode(data) : data;
       const header = createTarHeader(path, bytes.length, this.time);
-      const paddingLen = (512 - ((this.pos + 512 + bytes.length) % 512)) % 512;
-      const totalLen = 512 + bytes.length + paddingLen;
-      const combined = new Uint8Array(totalLen);
 
-      combined.set(header, 0);
-      combined.set(bytes, 512);
-      await this.write(combined);
-    }
-    async writeStream(path, size, readableStream) {
-      await this.write(createTarHeader(path, size, this.time));
-      await readableStream.pipeTo(
-        new WritableStream({
-          write: async (chunk) => {
-            await this.write(chunk);
-          },
-        }),
-      );
+      await this.write(header);
+      await this.write(bytes);
       await this.pad();
     }
-    async write(chunk) {
-      await this.writer.write(chunk);
-      this.pos += chunk.byteLength;
-      this.bytesWritten += chunk.byteLength;
+
+    async writeStream(path, size, readableStream) {
+      await this.write(createTarHeader(path, size, this.time));
+      const reader = readableStream.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          await this.write(value);
+          const p = this.yielder();
+          if (p) await p;
+        }
+      } finally {
+        reader.releaseLock();
+      }
+
+      await this.pad();
     }
+
+    async write(chunk) {
+      const len = chunk.byteLength;
+
+      // If the chunk is larger than our buffer, bypass the buffer entirely (Zero-Copy)
+      if (len >= TAR_BUFFER_SIZE) {
+        await this.flush();
+        await this.writer.write(chunk);
+      } else if (this.bufferOffset + len > TAR_BUFFER_SIZE) {
+        await this.flush();
+        this.buffer.set(chunk, 0);
+        this.bufferOffset = len;
+      } else {
+        this.buffer.set(chunk, this.bufferOffset);
+        this.bufferOffset += len;
+      }
+
+      this.pos += len;
+      this.bytesWritten += len;
+    }
+
     async pad() {
       const padding = (512 - (this.pos % 512)) % 512;
-      if (padding > 0) await this.write(new Uint8Array(padding));
+      if (padding > 0) {
+        // Create padding array once
+        const pad = new Uint8Array(padding);
+        await this.write(pad);
+      }
     }
+
+    async flush() {
+      if (this.bufferOffset > 0) {
+        await this.writer.write(this.buffer.subarray(0, this.bufferOffset));
+        this.bufferOffset = 0;
+      }
+    }
+
     async close() {
+      // Write 2 empty blocks (standard TAR footer)
       await this.write(new Uint8Array(1024));
+      await this.flush();
       await this.writer.close();
     }
   }
@@ -490,6 +540,7 @@
       ...config,
     };
     const logger = opts.logger || console.log;
+    const yielder = createYielder(opts.logSpeed);
 
     let outputStream,
       downloadUrl,
@@ -502,8 +553,11 @@
         const handle = await window.showSaveFilePicker({ suggestedName: name });
         outputStream = await handle.createWritable();
       } catch (e) {
-        if (e.name === "AbortError") return logger("Export cancelled.");
-        console.warn("FS Picker failed, falling back.");
+        if (e.name === "AbortError") {
+          logger("Export cancelled.");
+          return;
+        }
+        console.warn("FileSystem picker failed, falling back.");
       }
     }
 
@@ -540,11 +594,7 @@
       .pipeThrough(countingStream)
       .pipeTo(outputStream);
 
-    const tar = new TarWriter(gzip.writable);
-    const reportProgress = () => {
-      logger(`Exporting... (${(outputBytesWritten / 1048576).toFixed(2)} MB)`);
-    };
-    const progressInterval = setInterval(reportProgress, opts.logSpeed);
+    const tar = new TarWriter(gzip.writable, yielder);
 
     try {
       for (const item of opts.customItems) {
@@ -632,76 +682,61 @@
 
           for (const sName of storeNames) {
             logger(`Archiving IDB: ${name}/${sName}`);
-            let chunkId = 0;
-            let lastKey = null;
-            let hasMore = true;
+            const tx = db.transaction(sName, "readonly");
+            const store = tx.objectStore(sName);
+            let cursorRequest = store.openCursor();
 
-            while (hasMore) {
-              // Open new transaction for each batch
-              const batchData = await new Promise((resolve, reject) => {
-                const tx = db.transaction(sName, "readonly");
-                const store = tx.objectStore(sName);
-                const range = lastKey
-                  ? IDBKeyRange.lowerBound(lastKey, true)
-                  : null;
-                const req = store.openCursor(range);
+            await new Promise((resolve, reject) => {
+              let chunkId = 0;
+              let currentBatch = [];
+              let batchSize = 0;
 
-                const items = [];
-                let batchSize = 0;
-                const MAX_ITEMS = 2000;
-                const MAX_BYTES = 5 * 1024 * 1024; // 5MB
+              cursorRequest.onsuccess = async (e) => {
+                const cursor = e.target.result;
+                if (cursor) {
+                  const val = cursor.value;
+                  const blobsInBatch = [];
+                  const encVal = prepForCBOR(val, blobsInBatch);
 
-                req.onsuccess = (e) => {
-                  const cursor = e.target.result;
-                  if (cursor) {
-                    items.push({ k: cursor.key, v: cursor.value });
-                    // Rough estimation
-                    batchSize += 200;
-                    if (cursor.value && typeof cursor.value === "string")
-                      batchSize += cursor.value.length;
+                  currentBatch.push({ k: cursor.key, v: encVal });
+                  batchSize += 1; // Or estimation
 
-                    if (items.length >= MAX_ITEMS || batchSize >= MAX_BYTES) {
-                      resolve({ items, next: cursor.key, done: false });
-                    } else {
-                      cursor.continue();
-                    }
-                  } else {
-                    resolve({ items, next: null, done: true });
+                  // Export blobs found in this item immediately
+                  for (const b of blobsInBatch) {
+                    await tar.writeStream(
+                      `data/blobs/${b.uuid}`,
+                      b.blob.size,
+                      b.blob.stream(),
+                    );
                   }
-                };
-                req.onerror = (e) => reject(e.target.error);
-              });
 
-              if (batchData.items.length > 0) {
-                const blobsInBatch = [];
-                const encBatch = [];
-                for (const item of batchData.items) {
-                  const val = prepForCBOR(item.v, blobsInBatch);
-                  encBatch.push({ k: item.k, v: val });
+                  // Every 1000 items, write a CBOR chunk and yield
+                  if (currentBatch.length >= 1000) {
+                    await tar.writeEntry(
+                      `data/idb/${safeName}/${encodeURIComponent(sName)}/${chunkId++}.cbor`,
+                      CBOR.encode(currentBatch),
+                    );
+                    currentBatch = [];
+                    logger(
+                      `Exporting IDB: ${name}/${sName} (chunk ${chunkId})`,
+                    );
+                    const p = yielder();
+                    if (p) await p;
+                  }
+                  cursor.continue();
+                } else {
+                  // Write final remainder
+                  if (currentBatch.length > 0) {
+                    await tar.writeEntry(
+                      `data/idb/${safeName}/${encodeURIComponent(sName)}/${chunkId++}.cbor`,
+                      CBOR.encode(currentBatch),
+                    );
+                  }
+                  resolve();
                 }
-
-                for (const b of blobsInBatch) {
-                  await tar.writeStream(
-                    `data/blobs/${b.uuid}`,
-                    b.blob.size,
-                    b.blob.stream(),
-                  );
-                }
-
-                await tar.writeEntry(
-                  `data/idb/${safeName}/${encodeURIComponent(sName)}/${chunkId++}.cbor`,
-                  CBOR.encode(encBatch),
-                );
-              }
-
-              if (batchData.done) {
-                hasMore = false;
-              } else {
-                lastKey = batchData.items[batchData.items.length - 1].k;
-                // Allow UI update
-                await yieldToMain();
-              }
-            }
+              };
+              cursorRequest.onerror = (e) => reject(e.target.error);
+            });
           }
           db.close();
         }
@@ -711,6 +746,8 @@
         for (const cacheName of await caches.keys()) {
           if (!isAllowed("cache", cacheName, opts)) continue;
           logger(`Archiving Cache: ${cacheName}`);
+          const p = yielder();
+          if (p) await p;
           const cache = await caches.open(cacheName);
           for (const req of await cache.keys()) {
             const res = await cache.match(req);
@@ -735,9 +772,11 @@
 
       if (opts.opfs && navigator.storage) {
         const root = await navigator.storage.getDirectory();
-        async function walk(dir, p) {
+        async function walk(dir, pStr) {
           for await (const entry of dir.values()) {
-            const fp = p ? `${p}/${entry.name}` : entry.name;
+            const p = yielder();
+            if (p) await p;
+            const fp = pStr ? `${pStr}/${entry.name}` : entry.name;
             if (!isAllowed("opfs", fp, opts)) continue;
             if (entry.kind === "file") {
               const f = await entry.getFile();
@@ -773,8 +812,6 @@
       try {
         await targetWritable.abort(e);
       } catch (z) {}
-    } finally {
-      clearInterval(progressInterval);
     }
   }
 
@@ -797,7 +834,7 @@
 
     const opts = { ...config };
     const logger = opts.logger || console.log;
-    const logSpeed = opts.logSpeed || 100;
+    const yielder = createYielder(opts.logSpeed || 100);
 
     try {
       let rawStream;
@@ -935,7 +972,6 @@
       } catch (e) {}
       const dbCache = {};
 
-      let lastLog = Date.now();
       while (true) {
         if (!(await ensure(512))) break;
         const header = streamBuffer.read(512);
@@ -946,13 +982,12 @@
           .replace(/\0/g, "")
           .trim();
         if (prefix) name = `${prefix}/${name}`;
-        var now = Date.now();
-        if (now - lastLog > logSpeed) {
+        const p = yielder();
+        if (p) {
           logger(
             `Importing (${(totalRead / 1048576).toFixed(2)} MB) ${name}...`,
           );
-          lastLog = now;
-          await yieldToMain();
+          await p;
         }
 
         const sizeStr = DEC.decode(header.slice(124, 136))
@@ -1064,7 +1099,13 @@
                     ),
                   );
                 } catch (e) {
-                  console.warn("IDB Import Error", e);
+                  console.error(e);
+                  alert(
+                    "IDB importing error for DB " +
+                      dbName +
+                      "(perhaps close other tabs?): " +
+                      e,
+                  );
                 }
               }
             }

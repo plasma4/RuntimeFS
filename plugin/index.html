@@ -9,68 +9,76 @@
         * {
             font-family: monospace;
             box-sizing: border-box;
+            font-size: 12px;
         }
 
         body {
             background-color: black;
             color: white;
-            padding: 20px;
+            padding: 24px;
             max-width: 600px;
             margin: 0 auto;
         }
 
         h1 {
-            color: #e1d5be;
+            color: #79bdf2;
+            font-size: 20px;
             border-bottom: 1px solid white;
             padding-bottom: 10px;
         }
 
         h2 {
-            color: #e1d5be;
+            color: #a9aaf8;
+            font-size: 18px;
             font-size: 1.2em;
             margin-top: 30px;
             border-bottom: 1px solid #555;
             padding-bottom: 5px;
         }
 
-        .warning {
-            color: #ff6b6b;
-            border: 1px solid #ff6b6b;
+        .note {
+            text-align: center;
+            font-size: 14px;
+            color: #f29aee;
+            border: 1px solid #751eef;
             padding: 10px;
             margin-bottom: 15px;
         }
 
+        .full {
+            width: 100%;
+        }
+
         input,
         button {
-            width: 100%;
             padding: 10px;
-            margin-bottom: 10px;
+            margin: 3px 0 10px 0;
             border-radius: 5px;
-            border: 1px solid #959595;
+            border: 1px solid #ccc;
             background: #3a5774;
             color: white;
         }
 
         button {
-            background-color: #15e264;
-            border-color: #3d4c3d;
+            transition: background-color 200ms;
+            background-color: #f871b4;
+            border: solid 1px white;
             cursor: pointer;
             color: black;
             font-weight: bold;
         }
 
         button:hover {
-            background-color: #14af50;
+            background-color: #ee2b73;
         }
 
         button.danger {
-            background-color: #d64545;
+            background-color: #ea2f45;
             color: white;
-            border-color: #8a2a2a;
         }
 
         button.danger:hover {
-            background-color: #b03636;
+            background-color: #bb1359;
         }
 
         .log {
@@ -87,11 +95,12 @@
 
 <body>
     <h1>RuntimeFS Plugin</h1>
-    <button onclick="update()">Update</button>
+    <button class="full" onclick="update()">Update</button>
 
-    <div class="warning">
-        Warning: These actions affect the Service Worker Cache ("fc").
-        Changes require a page reload to take effect.
+    <div class="note">
+        These actions affect the RuntimeFS cache ("fc").
+        <br>
+        Changes require a reload of RuntimeFS to update.
     </div>
 
     <h2>Patch Specific File</h2>
@@ -146,8 +155,8 @@
             }
 
             const match = location.pathname.match(/^(.*\/)n\//)
-            const rootPath = match ? match[1] : "/"
-            log(`Redirecting to ${rootPath} to re-initialize...`)
+            const rootPath = match ? match[1] : "../"
+            log(`Redirecting to ${rootPath} to update cache...`)
             location = rootPath
         }
 

@@ -741,9 +741,19 @@ async function generateResponseForVirtualFile(request, clientId) {
       isText &&
       totalSize < MAX_REGEX_SIZE;
 
+    const finalHeaders = applyCustomHeaders(
+      {
+        "Content-Type": contentType,
+        "Cache-Control": "no-store",
+        "Accept-Ranges": "bytes",
+      },
+      relativePath,
+      compiledHeaders,
+    );
+
     if (shouldApplyRegex) {
       let buffer = await file.arrayBuffer();
-      // Apply Regex
+      // Apply the regex
       buffer = applyRegexRules(
         relativePath,
         buffer,
@@ -754,7 +764,7 @@ async function generateResponseForVirtualFile(request, clientId) {
       const processedSize = buffer.byteLength;
       finalHeaders["Content-Length"] = processedSize.toString();
 
-      // Range Request on Modified Content (in-memory)
+      // Range request the new content (in-memory)
       const rangeHeader = request.headers.get("Range");
       if (rangeHeader) {
         const parts = rangeHeader.replace(/bytes=/, "").split("-");
@@ -781,16 +791,6 @@ async function generateResponseForVirtualFile(request, clientId) {
 
       return new Response(buffer, { headers: finalHeaders });
     }
-
-    const finalHeaders = applyCustomHeaders(
-      {
-        "Content-Type": contentType,
-        "Cache-Control": "no-store",
-        "Accept-Ranges": "bytes",
-      },
-      relativePath,
-      compiledHeaders,
-    );
 
     if (totalSize === 0)
       return new Response(new Uint8Array(0), { headers: finalHeaders });
@@ -820,7 +820,7 @@ async function generateResponseForVirtualFile(request, clientId) {
     finalHeaders["Content-Length"] = totalSize;
     return new Response(file, { headers: finalHeaders });
   } catch (e) {
-    console.error("SW Gen Error:", e);
-    return new Response("Internal Server Error", { status: 500 });
+    console.error("SW error:", e);
+    return new Response("Internal server error", { status: 500 });
   }
 }

@@ -218,7 +218,7 @@
                     for (const registration of registrations) {
                         const worker = registration.active || registration.waiting || registration.installing
                         scriptURL = worker.scriptURL
-                        if (worker && scriptURL.slice(-5) === "sw.js") {
+                        if (worker && scriptURL.slice(-9) === "sw.min.js") {
                             const success = await registration.unregister()
                             if (success) {
                                 log(`Unregistered RuntimeFS worker at: ${registration.scope}.`)

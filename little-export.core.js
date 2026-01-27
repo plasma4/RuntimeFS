@@ -139,13 +139,13 @@
     w("000000 \0", 108); // UID
     w("000000 \0", 116); // GID
     HEADER_TEMPLATE.set(TAR_CONSTANTS.EMPTY_SPACE, 148); // Checksum (spaces)
-    HEADER_TEMPLATE[156] = 48; // Typeflag '0'
+    HEADER_TEMPLATE[156] = 48; // Typeflag "0"
     HEADER_TEMPLATE.set(TAR_CONSTANTS.USTAR_MAGIC, 257);
     HEADER_TEMPLATE.set(TAR_CONSTANTS.USTAR_VER, 263);
   })();
 
   function createTarHeader(filename, size, time, isDir = false) {
-    // 1. Max Size Check (USTAR limit is 8^11 - 1 bytes, approx 8.5GB)
+    // Max size check (USTAR limit)
     if (size > 8589934591) {
       throw new Error(
         "File size exceeds USTAR 8GB limit. Extensions required.",
@@ -154,13 +154,13 @@
 
     const buffer = HEADER_TEMPLATE.slice(0); // Fast zero-copy clone
 
-    // 2. Handle Directory Conventions
+    // Directory conventions
     if (isDir) {
       if (!filename.endsWith("/")) filename += "/";
       buffer[156] = 53; // '5'
     }
 
-    // 3. Path Processing
+    // Paths
     const fullBytes = ENC.encode(filename);
 
     if (fullBytes.length <= 100) {
@@ -186,14 +186,13 @@
         buffer.set(fullBytes.subarray(bestSplit + 1), 0); // Name
         buffer.set(fullBytes.subarray(0, bestSplit), 345); // Prefix
       } else {
-        // Robustness: Throw rather than create a corrupt file
         throw new Error(
           `Filename too long or unsplittable for USTAR: ${filename}`,
         );
       }
     }
 
-    // 4. Helper to write octal safely
+    // Helper to write octal safely
     const writeOctal = (num, offset, len) => {
       const str = Math.floor(num)
         .toString(8)
@@ -208,20 +207,17 @@
     writeOctal(size, 124, 12);
     writeOctal(time, 136, 12);
 
-    // 5. Checksum Calculation
     // Treat checksum field (148-155) as spaces (ASCII 32)
     let sum = 0;
     for (let i = 0; i < 512; i++) {
       sum += buffer[i];
     }
 
-    // 6. Write Checksum (6 digits + null + space)
-    // This format is the most compatible (BSD/GNU standard)
+    // Finally write the checksum (6 digits + null + space)
     const cksumStr = sum.toString(8).padStart(6, "0");
     ENC.encodeInto(cksumStr, buffer.subarray(148));
-    buffer[154] = 0; // Null
-    buffer[155] = 32; // Space
-
+    buffer[154] = 0;
+    buffer[155] = 32; // space
     return buffer;
   }
 
@@ -431,36 +427,36 @@
   }
 
   class DecryptionSource {
-    constructor(readableStream, password) {
+    constructor(readableStream, password, yielder) {
       this.stream = readableStream;
       this.password = password;
+      this.yielder = yielder;
       this.buffer = new ChunkBuffer();
     }
     readable() {
-      const self = this;
       let reader;
       async function ensure(n) {
-        while (!self.buffer.has(n)) {
+        while (!this.buffer.has(n)) {
           const { value, done } = await reader.read();
           if (done) return false;
-          self.buffer.push(value);
+          this.buffer.push(value);
         }
         return true;
       }
       return new ReadableStream({
         async start(controller) {
-          reader = self.stream.getReader();
+          reader = this.stream.getReader();
           try {
             if (!(await ensure(22))) throw new Error("File too small");
-            const sig = new TextDecoder().decode(self.buffer.read(6));
+            const sig = new TextDecoder().decode(this.buffer.read(6));
             if (sig !== "LE_ENC") throw new Error("Not an encrypted archive");
 
-            const salt = self.buffer.read(16);
-            const key = await deriveKey(self.password, salt);
+            const salt = this.buffer.read(16);
+            const key = await deriveKey(this.password, salt);
 
             if (!(await ensure(16))) throw new Error("Corrupt header");
-            const initIV = self.buffer.read(12);
-            const initLenRaw = self.buffer.read(4);
+            const initIV = this.buffer.read(12);
+            const initLenRaw = this.buffer.read(4);
             const initLen = new DataView(
               initLenRaw.buffer,
               initLenRaw.byteOffset,
@@ -468,7 +464,7 @@
             ).getUint32(0, true);
 
             if (!(await ensure(initLen))) throw new Error("Corrupt header");
-            const initCipher = self.buffer.read(initLen);
+            const initCipher = this.buffer.read(initLen);
             try {
               await crypto.subtle.decrypt(
                 { name: "AES-GCM", iv: initIV },
@@ -480,29 +476,33 @@
             }
 
             while (true) {
-              if (!self.buffer.has(16)) {
+              const p = this.yielder();
+              if (p) await p;
+              if (!this.buffer.has(16)) {
                 const { value, done } = await reader.read();
                 if (done) {
-                  if (self.buffer.totalSize === 0) break;
+                  if (this.buffer.totalSize === 0) break;
                   throw new Error("Truncated encrypted stream");
                 }
-                self.buffer.push(value);
+                this.buffer.push(value);
                 continue;
               }
-              const iv = self.buffer.read(12);
-              const lenRaw = self.buffer.read(4);
+              const iv = this.buffer.read(12);
+              const lenRaw = this.buffer.read(4);
               const lenVal = new DataView(
                 lenRaw.buffer,
                 lenRaw.byteOffset,
                 lenRaw.byteLength,
               ).getUint32(0, true);
 
-              while (!self.buffer.has(lenVal)) {
+              while (!this.buffer.has(lenVal)) {
                 const { value, done } = await reader.read();
                 if (done) throw new Error("Unexpected EOF in ciphertext");
-                self.buffer.push(value);
+                this.buffer.push(value);
+                const p2 = this.yielder();
+                if (p2) await p2;
               }
-              const cipher = self.buffer.read(lenVal);
+              const cipher = this.buffer.read(lenVal);
               const plain = await crypto.subtle.decrypt(
                 { name: "AES-GCM", iv },
                 key,
@@ -646,17 +646,17 @@
           const safeName = encodeURIComponent(name);
           logger(`Scanning IDB: ${name}`);
 
-          const db = await new Promise((res, rej) => {
+          const dbForSchema = await new Promise((res, rej) => {
             const r = indexedDB.open(name);
             r.onsuccess = () => res(r.result);
             r.onerror = () => rej(r.error);
             r.onblocked = () => rej(new Error("IndexedDB open was blocked."));
           });
 
-          const storeNames = Array.from(db.objectStoreNames);
+          const storeNames = Array.from(dbForSchema.objectStoreNames);
           const stores = [];
           if (storeNames.length > 0) {
-            const tx = db.transaction(storeNames, "readonly");
+            const tx = dbForSchema.transaction(storeNames, "readonly");
             for (const sName of storeNames) {
               const s = tx.objectStore(sName);
               stores.push({
@@ -675,6 +675,8 @@
               });
             }
           }
+          dbForSchema.close(); // Close immediately after schema read
+
           await tar.writeEntry(
             `data/idb/${safeName}/schema.cbor`,
             CBOR.encode({ name, version, stores }),
@@ -682,26 +684,63 @@
 
           for (const sName of storeNames) {
             logger(`Archiving IDB: ${name}/${sName}`);
-            const tx = db.transaction(sName, "readonly");
-            const store = tx.objectStore(sName);
-            let cursorRequest = store.openCursor();
 
-            await new Promise((resolve, reject) => {
-              let chunkId = 0;
-              let currentBatch = [];
-              let batchSize = 0;
+            let lastKey = null;
+            let chunkId = 0;
+            let hasMore = true;
 
-              cursorRequest.onsuccess = async (e) => {
-                const cursor = e.target.result;
-                if (cursor) {
-                  const val = cursor.value;
+            while (hasMore) {
+              const batchData = await new Promise((resolve, reject) => {
+                const r = indexedDB.open(name);
+                r.onsuccess = (ev) => {
+                  const db = ev.target.result;
+                  try {
+                    const tx = db.transaction(sName, "readonly");
+                    const store = tx.objectStore(sName);
+                    const range = lastKey
+                      ? IDBKeyRange.lowerBound(lastKey, true)
+                      : null;
+                    const cursorReq = store.openCursor(range);
+
+                    const batch = [];
+                    const BATCH_LIMIT = 200; // Smaller batches prevent locking UI during synchronous fetch
+
+                    cursorReq.onsuccess = (e) => {
+                      const cursor = e.target.result;
+                      if (cursor && batch.length < BATCH_LIMIT) {
+                        batch.push({ k: cursor.key, v: cursor.value });
+                        lastKey = cursor.key;
+                        cursor.continue();
+                      } else {
+                        // Batch full or no more items
+                        db.close();
+                        resolve({
+                          items: batch,
+                          done: !cursor,
+                        });
+                      }
+                    };
+                    cursorReq.onerror = (e) => {
+                      db.close();
+                      reject(e);
+                    };
+                  } catch (err) {
+                    db.close();
+                    reject(err);
+                  }
+                };
+                r.onerror = (e) => reject(e);
+              });
+
+              hasMore = !batchData.done;
+
+              if (batchData.items.length > 0) {
+                const finalBatch = [];
+                for (const item of batchData.items) {
                   const blobsInBatch = [];
-                  const encVal = prepForCBOR(val, blobsInBatch);
+                  const encVal = prepForCBOR(item.v, blobsInBatch);
+                  finalBatch.push({ k: item.k, v: encVal });
 
-                  currentBatch.push({ k: cursor.key, v: encVal });
-                  batchSize += 1; // Or estimation
-
-                  // Export blobs found in this item immediately
                   for (const b of blobsInBatch) {
                     await tar.writeStream(
                       `data/blobs/${b.uuid}`,
@@ -709,36 +748,18 @@
                       b.blob.stream(),
                     );
                   }
-
-                  // Every 1000 items, write a CBOR chunk and yield
-                  if (currentBatch.length >= 1000) {
-                    await tar.writeEntry(
-                      `data/idb/${safeName}/${encodeURIComponent(sName)}/${chunkId++}.cbor`,
-                      CBOR.encode(currentBatch),
-                    );
-                    currentBatch = [];
-                    logger(
-                      `Exporting IDB: ${name}/${sName} (chunk ${chunkId})`,
-                    );
-                    const p = yielder();
-                    if (p) await p;
-                  }
-                  cursor.continue();
-                } else {
-                  // Write final remainder
-                  if (currentBatch.length > 0) {
-                    await tar.writeEntry(
-                      `data/idb/${safeName}/${encodeURIComponent(sName)}/${chunkId++}.cbor`,
-                      CBOR.encode(currentBatch),
-                    );
-                  }
-                  resolve();
                 }
-              };
-              cursorRequest.onerror = (e) => reject(e.target.error);
-            });
+
+                await tar.writeEntry(
+                  `data/idb/${safeName}/${encodeURIComponent(sName)}/${chunkId++}.cbor`,
+                  CBOR.encode(finalBatch),
+                );
+
+                const p = yielder();
+                if (p) await p;
+              }
+            }
           }
-          db.close();
         }
       }
 
@@ -898,7 +919,7 @@
         let password = opts.password || prompt("Enter the password:");
         if (!password)
           throw new Error("A password is required to decrypt this data.");
-        inputStream = new DecryptionSource(combinedStream, password)
+        inputStream = new DecryptionSource(combinedStream, password, yielder)
           .readable()
           .pipeThrough(new DecompressionStream("gzip"));
       } else if (probeHeader[0] === 0x1f && probeHeader[1] === 0x8b) {
@@ -940,6 +961,8 @@
       async function streamToWriter(writer, size) {
         let remaining = size;
         while (remaining > 0) {
+          const p = yielder();
+          if (p) await p;
           if (streamBuffer.totalSize > 0) {
             const chunk = streamBuffer.read(
               Math.min(remaining, streamBuffer.totalSize),

@@ -31,7 +31,7 @@ File System API features (such as syncing or folder encryption) are Chromium-exc
 
 Firefox with Private browsing is known not allow folder uploading, and similar issues might occur in "hardened" browsers or browsing modes.
 
-(Firefox had a very specific issue involving initially loading JS scripts in `generateResponseForVirtualFile`, so an automatic reload is performed that injects `?boot=1` to the end of the URL. However, this issue seems to no longer happen in the newest versions of Firefox so see `reloadOnRequest` in `sw.js` and its comment to re-enable `?boot=1` injection.)
+(Firefox had a very specific issue involving initially loading JS scripts in `generateResponseForVirtualFile`, so an automatic reload is performed that injects `?boot=1` to the end of the URL. However, this issue seems to no longer happen in the newest versions of Firefox so see `reloadOnRequest` in the SW code and its comment to re-enable `?boot=1` injection.)
 
 In the future, non-Chromium browsers might adopt parts of the File System API that allow for streamed exports. The RAM-only fallback should still work for exporting a few hundred MBs.
 | Feature | 🟢 Chromium | 🟡 Firefox/Safari/Brave |

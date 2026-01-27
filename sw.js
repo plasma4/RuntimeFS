@@ -468,11 +468,15 @@ self.addEventListener("fetch", (e) => {
   }
 
   if (url.pathname.startsWith(virtualPathPrefix)) {
-    e.respondWith(generateResponseForVirtualFile(request, clientId));
+    e.respondWith(
+      generateResponseForVirtualFile(request, clientId, e.resultingClientId),
+    );
     return;
   }
 
-  e.respondWith(fetch(request));
+  e.respondWith(
+    fetch(request).catch(() => new Response(null, { status: 400 })),
+  );
 });
 
 async function handleEncryptedRequest(
@@ -630,7 +634,11 @@ async function handleEncryptedRequest(
   }
 }
 
-async function generateResponseForVirtualFile(request, clientId) {
+async function generateResponseForVirtualFile(
+  request,
+  clientId,
+  resultingClientId,
+) {
   try {
     const url = new URL(request.url);
     const { mode } = request;
@@ -663,13 +671,18 @@ async function generateResponseForVirtualFile(request, clientId) {
     }
 
     // Session managing
-    let session = clientSessionStore.get(clientId);
+    const effectiveClientId = resultingClientId || clientId;
+    let session = clientSessionStore.get(effectiveClientId);
+    if (!session && clientId) session = clientSessionStore.get(clientId);
+
     if (!session && pendingNavData && pendingNavData[folderName]) {
       session = pendingNavData[folderName];
     }
     if (session) {
       session.timestamp = Date.now();
-      clientSessionStore.set(clientId, session);
+      if (effectiveClientId) {
+        clientSessionStore.set(effectiveClientId, session);
+      }
     }
     session = session || {};
 

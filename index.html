@@ -107,6 +107,10 @@
             }
 
             alert("A script error occurred: " + errorMessage + "\r\nStack trace:\r\n" + stackTrace);
+            try {
+                setUiBusy(false)
+                logProgress("", true)
+            } finally { }
         }
         window.onunhandledrejection = function (e) {
             var reason = e.reason
@@ -131,6 +135,10 @@
             }
 
             alert("An unhandled rejection occurred:\r\n" + errorMessage)
+            try {
+                setUiBusy(false)
+                logProgress("", true)
+            } finally { }
         }
     </script>
     <script src="main.min.js" defer></script>

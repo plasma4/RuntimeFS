@@ -5,21 +5,23 @@ View the [working demo](https://plasma4.org/projects/RuntimeFS/)!
 
 RuntimeFS is a no-nonsense `OPFS` and `ServiceWorker` file-system, served in your browser, allowing you to import custom folders and access them like a localhost. It allows you to open HTML projects, use some encryption techniques, and comes with **full offline** and **complete .tar.gz or encrypted data export** functionality.
 
-Imagine an offline localhost, in your browser with no server-based storage of files. It saves all files and data locally, and can easily be integrated within an existing website too (the code is MIT Licensed, and only around 100KB).
+Imagine an offline localhost, in your browser with no server-based storage of files. It saves all files and data locally, and can easily be integrated within an existing website too (the code is MIT Licensed, and less than 100KB).
 
 After the initial page loads, RuntimeFS no longer needs internet connection to function. RuntimeFS also supports in-place opening of files, which doesn't require opening another tab.
 
-## Setup
+## Dependencies and Requirements
 
-RuntimeFS utilizes [cbor-x](https://github.com/kriszyp/cbor-x) and my own [LittleExport](https://github.com/plasma4/LittleExport) tool. Both are MIT Licensed. (LittleExport is integrated directly into RuntimeFS; no separate license file is required.) Only `main.min.js`, `sw.min.js`, and `index.html` are required for RuntimeFS to function.
+RuntimeFS utilizes [cbor-x](https://github.com/kriszyp/cbor-x) and my own [LittleExport](https://github.com/plasma4/LittleExport) tool. The entire application is MIT-Licensed. (LittleExport is integrated directly into RuntimeFS; no so separate license file is required for that.) Only `main.min.js`, `sw.min.js`, and `index.html` are required for RuntimeFS to function.
 
 Make sure to modify `APP_SHELL_FILES` in the SW and `SW_LINK` in the main code if you are changing the file configuration for proper caching. (Code is minified by using [JSCompress](https://jscompress.com/), which uses `UglifyJS` 3 and `babel-minify`.)
 
 ## Usage
 
-You can use Enter on text inputs to perform actions, instead of clicking buttons. On the Folder to Open section text inputs you can use Shift+Enter to open in-place and Ctrl/Cmd+Enter to sync and open. (Syncing will only show up after uploading a folder, not dragging, through a supported browser.)
+You can use Enter on text inputs to perform actions, instead of clicking buttons. On the Folder to Open section text inputs you can use Shift+Enter to open in-place and Ctrl/Cmd+Enter to sync and open. (Syncing will only show up after uploading a folder, through a supported browser. Drag-and-drop should work for all browsers but won't allow syncing.)
 
-Custom regex and headers save on reload and export but do not affect stored files, and only work when opening the file (in-place or new tab) from the RuntimeFS menu (reloading or navigating to the URL directly do not yet).
+Custom regex and headers save on reload or export but do not affect stored files; they simply modify headers when opening a file in the `/n/` virtual path from the RuntimeFS menu (reloading or navigating to the URL directly do not yet). Many headers won't work when opening in-place like CORS.
+
+It's possible to import or export specified data types in the Data Management menu, and you can also drag-and-drop import files (.tar.gz or .enc).
 
 To update to a newer version, a single-file plugin exists for customizing cache in `plugin/index.html` (or simply to request an update), allowing for you to fully customize RuntimeFS from any site hosting it. Note that simply hard reloading won't update the cache. If this isn't included in the way you use RuntimeFS, you can upload it as a virtual folder. Example link with the demo [here](https://plasma4.org/projects/RuntimeFS/plugin/).
 
@@ -29,12 +31,12 @@ File System API features (such as syncing or folder encryption) are Chromium-exc
 
 Firefox with Private browsing is known not allow folder uploading, and similar issues might occur in "hardened" browsers or browsing modes.
 
-(Firefox has a very specific issue involving initially loading JS scripts in `generateResponseForVirtualFile`, so an automatic reload is performed that injects `?boot=1` to the end of the URL. This also means that headers won't work.)
+(Firefox had a very specific issue involving initially loading JS scripts in `generateResponseForVirtualFile`, so an automatic reload is performed that injects `?boot=1` to the end of the URL. However, this issue seems to no longer happen in the newest versions of Firefox so see `reloadOnRequest` in `sw.js` and its comment to re-enable `?boot=1` injection.)
 
-In the future, non-Chromium browsers might adopt parts of the File System API that allow for streamed exports. The RAM-only fallback should still work for a few hundred MBs.
+In the future, non-Chromium browsers might adopt parts of the File System API that allow for streamed exports. The RAM-only fallback should still work for exporting a few hundred MBs.
 | Feature | 🟢 Chromium | 🟡 Firefox/Safari/Brave |
 | :--- | :--- | :--- |
-| **Folder Upload** | ✅ Yes | ⚠️ `<input>` fallback, no sync |
+| **Folder Upload** | ✅ Yes | ⚠️ `<input>` or drag-and-drop fallback, no sync |
 | **Encryption (folder-based)** | ✅ Yes | ❌ No |
 | **Export (including encryption)** | ✅ Mostly streamed to disk | ⚠️ RAM-only |
 
@@ -42,7 +44,7 @@ In the future, non-Chromium browsers might adopt parts of the File System API th
 
 URL Persistence is an informal term that means that websites store data along with URLs. Examples include the Ruffle emulator (in `localStorage`) and Unity (in `IndexedDB`). If you export data from `example.com/v1/` and try to import it to `example.com/v2/` (or to different domains), it probably won't work.
 
-Because of this problem, you must normalize these URL keys during exporting or importing with a mock location object (and replace `document.URL` if needed). See a **standardized** RuntimeFS location spoofer in [LittleExport](https://github.com/plasma4/LittleExport).
+Because of this problem, you must normalize these URL keys during exporting or importing with a mock location object (and replace `document.URL` if needed). See a **standardized** RuntimeFS location spoofer and explanation in the [LittleExport](https://github.com/plasma4/LittleExport) repo.
 
 ## Notes
 
@@ -77,6 +79,7 @@ Also note:
 
 ### TODO
 
-- Devtools panel (for some cases where Inspect is unavailable, using something like Eruda)
+- RuntimeCode, an MIT-licensed fork of VSCode that integrates with RuntimeFS with dedicated web development components, plus Eruda to act as a fake inspector
+- More plugin features with granular export options
 - LittleExport improvements (see its [dedicated repo](https://github.com/plasma4/LittleExport))
 - More complete documentation

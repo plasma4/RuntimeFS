@@ -190,7 +190,7 @@ async function uploadFolder() {
       document.getElementById("folderUploadFallbackInput").click();
     }
   } catch (e) {
-    if (e.name !== "AbortError") alert("Upload error: " + e.message);
+    if (e.name !== "AbortError") throw e;
   }
 }
 
@@ -318,7 +318,6 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
 
       try {
         while (chunkIndex < totalEncChunks) {
-          // Inner loops of heavy processing should yield
           const p = checkYield();
           if (p) await p;
 
@@ -405,7 +404,7 @@ async function processFileListAndStore(name, fileList) {
   }
 
   const updateProgress = () => {
-    // Only log if we've moved significantly or it's the end
+    // Only log if we've moved significantly, or it's the end
     if (bytesUploaded - lastLoggedBytes < 524288 && bytesUploaded !== totalSize)
       return null;
     lastLoggedBytes = bytesUploaded;
@@ -490,26 +489,23 @@ async function processAndStoreFolderStreaming(name, srcHandle) {
     while (true) {
       if (uploadQueue.length > 0) {
         const task = uploadQueue.shift();
-        try {
-          const file = await task.entry.getFile();
-          totalBytesDiscovered += file.size;
+        const file = await task.entry.getFile();
+        totalBytesDiscovered += file.size;
 
-          await writeStreamToOpfs(task.dest, task.entry.name, file, {
-            dirCache,
-            onProgress: (delta) => {
-              bytesUploaded += delta;
-              updateUI();
-            },
-          });
-        } catch (err) {
-          console.error("Upload error:", err);
-        }
+        await writeStreamToOpfs(task.dest, task.entry.name, file, {
+          dirCache,
+          onProgress: (delta) => {
+            bytesUploaded += delta;
+            updateUI();
+          },
+        });
       } else {
         if (scanComplete) break;
         // Wait for scanner to provide more work
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
-      // Cooperative yield to let other workers/UI run
+
+      // Let other workers/UI run
       await checkYield();
     }
   };
@@ -629,27 +625,30 @@ async function deleteFolder(folderNameToDelete, skipConfirm = false) {
     folderNameToDelete ||
     document.getElementById("deleteFolderName").value.trim();
   if (!folderName) return alert("Enter a folder name first.");
+  // skipConfirm no longer used but whatever
   if (!skipConfirm && !confirm(`Remove "${folderName}"?`)) return;
 
   setUiBusy(true);
   logProgress("Deleting...", true);
+  const root = await getOpfsRoot();
   try {
-    const root = await getOpfsRoot();
-    try {
-      const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX);
-      await rfsRoot.removeEntry(folderName, { recursive: true });
-    } catch (e) {}
-
-    await updateRegistryEntry(folderName, null);
-    if (!folderNameToDelete)
-      document.getElementById("deleteFolderName").value = "";
-    await listFolders();
+    const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX);
+    await rfsRoot.removeEntry(folderName, { recursive: true });
   } catch (e) {
-    alert("Delete failed: " + e.message);
-  } finally {
-    logProgress("", true);
-    if (!skipConfirm) setUiBusy(false);
+    if (e.name !== "NotFoundError") {
+      alert(
+        "RuntimeFS cannot currently remove this folder; try closing other open RuntimeFS tabs.",
+      );
+      return;
+    }
   }
+
+  await updateRegistryEntry(folderName, null);
+  if (!folderNameToDelete)
+    document.getElementById("deleteFolderName").value = "";
+  await listFolders();
+  logProgress("", true);
+  if (!skipConfirm) setUiBusy(false);
 }
 
 async function openFile(overrideFolderName) {
@@ -660,110 +659,98 @@ async function openFile(overrideFolderName) {
   if (!folderName) return alert("Provide a folder name.");
 
   setUiBusy(true);
-  try {
-    const registry = await getRegistry();
-    const meta = registry[folderName];
-    if (!meta) return alert("Folder not found.");
+  const registry = await getRegistry();
+  const meta = registry[folderName];
+  if (!meta) return alert("Folder not found.");
 
-    const rules = document.getElementById("regex").value.trim();
-    const headers = document.getElementById("headers").value.trim();
+  const rules = document.getElementById("regex").value.trim();
+  const headers = document.getElementById("headers").value.trim();
 
-    if (meta.rules !== rules || meta.headers !== headers) {
-      await updateRegistryEntry(folderName, { rules, headers });
-    }
-
-    let key = null;
-    if (meta.encryptionType === "password") {
-      const password = prompt(`Enter password for "${folderName}":`);
-      if (!password) return setUiBusy(false);
-      key = await deriveKeyFromPassword(password, base64ToBuffer(meta.salt));
-    }
-
-    const sw = await waitForController();
-    await new Promise((resolve) => {
-      const channel = new MessageChannel();
-      channel.port1.onmessage = () => resolve();
-      sw.postMessage({ type: "SET_RULES", rules, headers, key, folderName }, [
-        channel.port2,
-      ]);
-    });
-
-    const encodedPath = fileName.split("/").map(encodeURIComponent).join("/");
-    window.open(`n/${encodeURIComponent(folderName)}/${encodedPath}`, "_blank");
-  } finally {
-    setUiBusy(false);
+  if (meta.rules !== rules || meta.headers !== headers) {
+    await updateRegistryEntry(folderName, { rules, headers });
   }
+
+  let key = null;
+  if (meta.encryptionType === "password") {
+    const password = prompt(`Enter password for "${folderName}":`);
+    if (!password) return setUiBusy(false);
+    key = await deriveKeyFromPassword(password, base64ToBuffer(meta.salt));
+  }
+
+  const sw = await waitForController();
+  await new Promise((resolve) => {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => resolve();
+    sw.postMessage({ type: "SET_RULES", rules, headers, key, folderName }, [
+      channel.port2,
+    ]);
+  });
+
+  const encodedPath = fileName.split("/").map(encodeURIComponent).join("/");
+  window.open(`n/${encodeURIComponent(folderName)}/${encodedPath}`, "_blank");
+  setUiBusy(false);
 }
 
 async function startImport(file) {
   setUiBusy(true);
   const TEMP_BLOB_DIR = ".rfs_temp_blobs"; // Must match LittleExport
 
+  const root = await navigator.storage.getDirectory();
+
   try {
-    const root = await navigator.storage.getDirectory();
+    await root.removeEntry(RFS_PREFIX, { recursive: true });
+  } catch (e) {}
+  try {
+    await root.removeEntry(SYSTEM_FILE);
+  } catch (e) {}
+  try {
+    await root.removeEntry(TEMP_BLOB_DIR, { recursive: true });
+  } catch (e) {}
 
-    // Safety check before nuking
-    try {
-      await root.removeEntry(RFS_PREFIX, { recursive: true });
-    } catch (e) {}
-    try {
-      await root.removeEntry(SYSTEM_FILE);
-    } catch (e) {}
-    try {
-      await root.removeEntry(TEMP_BLOB_DIR, { recursive: true });
-    } catch (e) {}
+  await LittleExport.importData(file, {
+    logger: logProgress,
+    onCustomItem: async (path, data) => {
+      if (path === SYSTEM_FILE) {
+        const decoder = new TextDecoder();
+        const registry = JSON.parse(decoder.decode(data));
+        await saveRegistry(registry);
+      }
+    },
+  });
 
-    await LittleExport.importData(file, {
-      logger: logProgress,
-      onCustomItem: async (path, data) => {
-        if (path === SYSTEM_FILE) {
-          const decoder = new TextDecoder();
-          const registry = JSON.parse(decoder.decode(data));
-          await saveRegistry(registry);
-        }
-      },
+  if (navigator.serviceWorker.controller) {
+    navigator.serviceWorker.controller.postMessage({
+      type: "INVALIDATE_CACHE",
     });
-
-    if (navigator.serviceWorker.controller) {
-      navigator.serviceWorker.controller.postMessage({
-        type: "INVALIDATE_CACHE",
-      });
-    }
-
-    await listFolders();
-    alert("Import complete!");
-  } finally {
-    setUiBusy(false);
-    logProgress("", true);
   }
+
+  await listFolders();
+  alert("Import complete!");
+  setUiBusy(false);
+  logProgress("", true);
 }
 
 async function exportData() {
   setUiBusy(true);
   let password = prompt("Enter a password (or leave blank for no encryption):");
 
-  try {
-    const registry = await getRegistry();
-    await LittleExport.exportData({
-      fileName: "result",
-      password: password,
-      cookies: document.getElementById("c1").checked,
-      localStorage: document.getElementById("c2").checked,
-      idb: document.getElementById("c3").checked,
-      opfs: document.getElementById("c5").checked,
-      cache: document.getElementById("c6").checked,
-      session: document.getElementById("c7").checked,
+  const registry = await getRegistry();
+  await LittleExport.exportData({
+    fileName: "result",
+    password: password,
+    cookies: document.getElementById("c1").checked,
+    localStorage: document.getElementById("c2").checked,
+    idb: document.getElementById("c3").checked,
+    opfs: document.getElementById("c5").checked,
+    cache: document.getElementById("c6").checked,
+    session: document.getElementById("c7").checked,
 
-      customItems: [{ path: SYSTEM_FILE, data: JSON.stringify(registry) }],
-      exclude: { opfs: [SYSTEM_FILE] },
-      logger: logProgress,
-    });
-  } catch (e) {
-    alert("Export failed: " + e.message);
-  } finally {
-    setUiBusy(false);
-    logProgress("", true);
-  }
+    customItems: [{ path: SYSTEM_FILE, data: JSON.stringify(registry) }],
+    exclude: { opfs: [SYSTEM_FILE] },
+    logger: logProgress,
+  });
+  setUiBusy(false);
+  logProgress("", true);
 }
 
 async function importData() {
@@ -818,20 +805,15 @@ async function uploadFolderFallback(e) {
     return;
   }
   setUiBusy(true);
-  try {
-    await processFileListAndStore(name, input.files);
-  } finally {
-    input.value = "";
-    setUiBusy(false);
-  }
+  await processFileListAndStore(name, input.files);
+  input.value = "";
+  setUiBusy(false);
 }
 
 let syncTimeout = -1;
 async function syncFiles() {
   if (!folderName || !dirHandle)
-    return alert(
-      "Upload a folder to sync changes (drag and drop not supported).",
-    );
+    return alert("It seems that syncing isn't supported for your browser.");
   setUiBusy(true);
   if (changes.length > 0) {
     await performSyncToOpfs();
@@ -849,9 +831,7 @@ async function syncFiles() {
 
 async function syncAndOpenFile() {
   if (!folderName || !dirHandle)
-    return alert(
-      "Upload a folder to sync changes (drag and drop not supported).",
-    );
+    return alert("It seems that syncing isn't supported for your browser.");
   setUiBusy(true);
   if (changes.length > 0) {
     await performSyncToOpfs();
@@ -918,194 +898,190 @@ async function uploadAndEncryptWithPassword() {
   if (!name || !password) return;
 
   setUiBusy(true);
+  const localDir = await window.showDirectoryPicker({ mode: "read" });
+  const root = await getOpfsRoot();
+  const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
 
   try {
-    const localDir = await window.showDirectoryPicker({ mode: "read" });
-    const root = await getOpfsRoot();
-    const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
-
-    try {
-      await rfsRoot.removeEntry(name, { recursive: true });
-    } catch (e) {
-      if (e.name !== "NotFoundError") {
-        alert(
-          "RuntimeFS cannot currently remove this folder; try closing other open RuntimeFS tabs.",
-        );
-        return;
-      }
+    await rfsRoot.removeEntry(name, { recursive: true });
+  } catch (e) {
+    if (e.name !== "NotFoundError") {
+      alert(
+        "RuntimeFS cannot currently remove this folder; try closing other open RuntimeFS tabs.",
+      );
+      return;
     }
+  }
 
-    const destDir = await rfsRoot.getDirectoryHandle(name, { create: true });
-    const contentDir = await destDir.getDirectoryHandle("content", {
-      create: true,
-    });
+  const destDir = await rfsRoot.getDirectoryHandle(name, { create: true });
+  const contentDir = await destDir.getDirectoryHandle("content", {
+    create: true,
+  });
 
-    const salt = crypto.getRandomValues(new Uint8Array(16));
-    const key = await deriveKeyFromPassword(password, salt);
-    const manifestData = {};
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const key = await deriveKeyFromPassword(password, salt);
+  const manifestData = {};
 
-    const queue = [];
-    const scanQueue = [{ dir: localDir, path: "" }];
-    let scanning = true;
+  const queue = [];
+  const scanQueue = [{ dir: localDir, path: "" }];
+  let scanning = true;
 
-    const scanner = async () => {
-      while (scanQueue.length > 0) {
-        const { dir, path } = scanQueue.shift();
-        for await (const entry of dir.values()) {
-          const entryPath = path ? `${path}/${entry.name}` : entry.name;
-          if (entry.kind === "file") {
-            const fileId = crypto.randomUUID();
-            queue.push({ entry, entryPath, fileId });
-            while (queue.length > 500) {
-              await new Promise((resolve) => setTimeout(resolve, 20));
-            }
-          } else {
-            scanQueue.push({ dir: entry, path: entryPath });
-          }
-        }
-      }
-      scanning = false;
-    };
-
-    const worker = async () => {
-      while (true) {
-        if (queue.length === 0) {
-          if (!scanning) break;
-          // Yield or micro-sleep if empty but still scanning
-          const p = checkYield();
-          if (p) await p;
-          continue;
-        }
-
-        const task = queue.shift();
-        const { entry, entryPath, fileId } = task;
-
-        const p = logProgress(`Encrypting: ${task.entryPath}`);
-        if (p) await p;
-
-        const file = await entry.getFile();
-        manifestData[entryPath] = {
-          id: fileId,
-          size: file.size,
-          type: file.type,
-        };
-
-        const destFileHandle = await contentDir.getFileHandle(fileId, {
-          create: true,
-        });
-        const writable = await destFileHandle.createWritable();
-
-        if (file.size > 0) {
-          const reader = file.stream().getReader();
-          let pendingChunks = [];
-          let pendingSize = 0;
-
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (value) {
-                pendingChunks.push(value);
-                pendingSize += value.byteLength;
-              }
-
-              if (done || pendingSize >= CHUNK_SIZE) {
-                if (pendingSize > 0) {
-                  const buffer = new Uint8Array(pendingSize);
-                  let offset = 0;
-                  for (const c of pendingChunks) {
-                    buffer.set(c, offset);
-                    offset += c.byteLength;
-                  }
-
-                  let cursor = 0;
-                  while (cursor < pendingSize) {
-                    const remaining = pendingSize - cursor;
-                    if (!done && remaining < CHUNK_SIZE) {
-                      const leftover = buffer.slice(cursor);
-                      pendingChunks = [leftover];
-                      pendingSize = leftover.byteLength;
-                      break;
-                    }
-
-                    // Worker loop yield check
-                    const p = checkYield();
-                    if (p) await p;
-
-                    const sizeToEncrypt = Math.min(CHUNK_SIZE, remaining);
-                    const chunkToEncrypt = buffer.subarray(
-                      cursor,
-                      cursor + sizeToEncrypt,
-                    );
-
-                    const iv = crypto.getRandomValues(new Uint8Array(12));
-                    const encryptedChunk = await crypto.subtle.encrypt(
-                      { name: "AES-GCM", iv },
-                      key,
-                      chunkToEncrypt,
-                    );
-
-                    await writable.write(iv);
-                    await writable.write(new Uint8Array(encryptedChunk));
-
-                    cursor += sizeToEncrypt;
-                  }
-
-                  if (cursor >= pendingSize) {
-                    pendingChunks = [];
-                    pendingSize = 0;
-                  }
-                }
-              }
-              if (done) break;
-            }
-          } finally {
-            reader.releaseLock();
-            await writable.close();
+  const scanner = async () => {
+    while (scanQueue.length > 0) {
+      const { dir, path } = scanQueue.shift();
+      for await (const entry of dir.values()) {
+        const entryPath = path ? `${path}/${entry.name}` : entry.name;
+        if (entry.kind === "file") {
+          const fileId = crypto.randomUUID();
+          queue.push({ entry, entryPath, fileId });
+          while (queue.length > 500) {
+            await new Promise((resolve) => setTimeout(resolve, 20));
           }
         } else {
-          await writable.close();
+          scanQueue.push({ dir: entry, path: entryPath });
         }
       }
-    };
+    }
+    scanning = false;
+  };
 
-    const scanPromise = scanner();
-    const workers = Array(CONCURRENCY).fill(null).map(worker);
+  const worker = async () => {
+    while (true) {
+      if (queue.length === 0) {
+        if (!scanning) break;
+        // Yield or micro-sleep if empty but still scanning
+        const p = checkYield();
+        if (p) await p;
+        continue;
+      }
 
-    await scanPromise;
-    await Promise.all(workers);
+      const task = queue.shift();
+      const { entry, entryPath, fileId } = task;
 
-    const p = logProgress("Saving manifest...");
-    if (p) await p;
+      const p = logProgress(`Encrypting: ${task.entryPath}`);
+      if (p) await p;
 
-    const manifestJson = JSON.stringify(manifestData);
-    const manifestBuffer = new TextEncoder().encode(manifestJson);
-    const manifestIv = crypto.getRandomValues(new Uint8Array(12));
-    const encManifest = await crypto.subtle.encrypt(
-      { name: "AES-GCM", iv: manifestIv },
-      key,
-      manifestBuffer,
-    );
+      const file = await entry.getFile();
+      manifestData[entryPath] = {
+        id: fileId,
+        size: file.size,
+        type: file.type,
+      };
 
-    const manifestHandle = await destDir.getFileHandle("manifest.enc", {
-      create: true,
-    });
-    const mw = await manifestHandle.createWritable();
-    await mw.write(salt);
-    await mw.write(manifestIv);
-    await mw.write(new Uint8Array(encManifest));
-    await mw.close();
+      const destFileHandle = await contentDir.getFileHandle(fileId, {
+        create: true,
+      });
+      const writable = await destFileHandle.createWritable();
 
-    await updateRegistryEntry(name, {
-      encryptionType: "password",
-      salt: bufferToBase64(salt),
-    });
+      if (file.size > 0) {
+        const reader = file.stream().getReader();
+        let pendingChunks = [];
+        let pendingSize = 0;
 
-    document.getElementById("encryptFolderName").value = "";
-    await listFolders();
-  } finally {
-    setUiBusy(false);
-    logProgress("", true);
-  }
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (value) {
+              pendingChunks.push(value);
+              pendingSize += value.byteLength;
+            }
+
+            if (done || pendingSize >= CHUNK_SIZE) {
+              if (pendingSize > 0) {
+                const buffer = new Uint8Array(pendingSize);
+                let offset = 0;
+                for (const c of pendingChunks) {
+                  buffer.set(c, offset);
+                  offset += c.byteLength;
+                }
+
+                let cursor = 0;
+                while (cursor < pendingSize) {
+                  const remaining = pendingSize - cursor;
+                  if (!done && remaining < CHUNK_SIZE) {
+                    const leftover = buffer.slice(cursor);
+                    pendingChunks = [leftover];
+                    pendingSize = leftover.byteLength;
+                    break;
+                  }
+
+                  // Worker loop yield check
+                  const p = checkYield();
+                  if (p) await p;
+
+                  const sizeToEncrypt = Math.min(CHUNK_SIZE, remaining);
+                  const chunkToEncrypt = buffer.subarray(
+                    cursor,
+                    cursor + sizeToEncrypt,
+                  );
+
+                  const iv = crypto.getRandomValues(new Uint8Array(12));
+                  const encryptedChunk = await crypto.subtle.encrypt(
+                    { name: "AES-GCM", iv },
+                    key,
+                    chunkToEncrypt,
+                  );
+
+                  await writable.write(iv);
+                  await writable.write(new Uint8Array(encryptedChunk));
+
+                  cursor += sizeToEncrypt;
+                }
+
+                if (cursor >= pendingSize) {
+                  pendingChunks = [];
+                  pendingSize = 0;
+                }
+              }
+            }
+            if (done) break;
+          }
+        } finally {
+          reader.releaseLock();
+          await writable.close();
+        }
+      } else {
+        await writable.close();
+      }
+    }
+  };
+
+  const scanPromise = scanner();
+  const workers = Array(CONCURRENCY).fill(null).map(worker);
+
+  await scanPromise;
+  await Promise.all(workers);
+
+  const p = logProgress("Saving manifest...");
+  if (p) await p;
+
+  const manifestJson = JSON.stringify(manifestData);
+  const manifestBuffer = new TextEncoder().encode(manifestJson);
+  const manifestIv = crypto.getRandomValues(new Uint8Array(12));
+  const encManifest = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: manifestIv },
+    key,
+    manifestBuffer,
+  );
+
+  const manifestHandle = await destDir.getFileHandle("manifest.enc", {
+    create: true,
+  });
+  const mw = await manifestHandle.createWritable();
+  await mw.write(salt);
+  await mw.write(manifestIv);
+  await mw.write(new Uint8Array(encManifest));
+  await mw.close();
+
+  await updateRegistryEntry(name, {
+    encryptionType: "password",
+    salt: bufferToBase64(salt),
+  });
+
+  document.getElementById("encryptFolderName").value = "";
+  await listFolders();
+  setUiBusy(false);
+  logProgress("", true);
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -1176,63 +1152,68 @@ document.addEventListener("DOMContentLoaded", () => {
     e.preventDefault();
     dragZone.style.backgroundColor = "";
     if (currentlyBusy) return;
-    const items = [...e.dataTransfer.items].filter((i) => i.kind === "file");
+
+    const items = Array.from(e.dataTransfer.items);
     if (!items.length) return;
+    const entry = items[0].webkitGetAsEntry
+      ? items[0].webkitGetAsEntry()
+      : null;
+
+    if (entry && entry.isDirectory) {
+      const name = prompt("Please choose a folder name:", entry.name);
+      if (name) {
+        setUiBusy(true);
+        // Scan iteratively
+        const files = [];
+        const queue = [
+          {
+            entry,
+            path: "",
+          },
+        ];
+
+        let scannedCount = 0;
+        while (queue.length > 0) {
+          const { entry: curr, path } = queue.shift();
+
+          if (curr.isFile) {
+            const f = await new Promise((res, rej) => curr.file(res, rej));
+            Object.defineProperty(f, "webkitRelativePath", {
+              value: path + f.name,
+            });
+            files.push(f);
+            scannedCount++;
+          } else if (curr.isDirectory) {
+            const reader = curr.createReader();
+            let batch;
+            do {
+              batch = await new Promise((res, rej) =>
+                reader.readEntries(res, rej),
+              );
+              for (const child of batch) {
+                queue.push({
+                  entry: child,
+                  path: path + curr.name + "/",
+                });
+              }
+            } while (batch.length > 0);
+          }
+
+          if (scannedCount % 50 === 0) {
+            await logProgress(`Scanned ${scannedCount} files...`);
+          }
+        }
+
+        await logProgress(`Processed ${files.length} files...`);
+        await processFileListAndStore(name, files);
+        setUiBusy(false);
+      }
+      return;
+    }
 
     const first = items[0].getAsFile();
     if (items.length === 1 && first) {
       if (confirm(`Import "${first.name}"?`)) startImport(first);
-      return;
-    }
-
-    const entry = items[0].webkitGetAsEntry();
-    if (entry.isDirectory) {
-      const name = prompt("Please choose a folder name:", entry.name);
-      if (name) {
-        setUiBusy(true);
-
-        try {
-          // Scan iteratively
-          const files = [];
-          const queue = [{ entry, path: "" }];
-
-          let scannedCount = 0;
-          while (queue.length > 0) {
-            const { entry: curr, path } = queue.shift();
-
-            if (curr.isFile) {
-              const f = await new Promise((res, rej) => curr.file(res, rej));
-              Object.defineProperty(f, "webkitRelativePath", {
-                value: path + f.name,
-              });
-              files.push(f);
-              scannedCount++;
-            } else if (curr.isDirectory) {
-              const reader = curr.createReader();
-              let batch;
-              do {
-                batch = await new Promise((res, rej) =>
-                  reader.readEntries(res, rej),
-                );
-                for (const child of batch) {
-                  queue.push({ entry: child, path: path + curr.name + "/" });
-                }
-              } while (batch.length > 0);
-            }
-
-            if (scannedCount % 50 === 0) {
-              await logProgress(`Scanned ${scannedCount} files...`);
-            }
-          }
-
-          await logProgress(`Processed ${files.length} files...`);
-          await processFileListAndStore(name, files);
-        } catch (err) {
-          alert("Scan failed: " + err.message);
-          setUiBusy(false);
-          logProgress("", true);
-        }
-      }
     }
   });
 
@@ -1281,88 +1262,85 @@ async function openFileInPlace() {
   if (!folderName) return alert("Provide a folder name.");
 
   setUiBusy(true);
-  try {
-    const registry = await getRegistry();
-    const meta = registry[folderName];
-    if (!meta) {
-      return alert("Folder not found.");
-    }
-
-    const rules = document.getElementById("regex").value.trim();
-    const headers = document.getElementById("headers").value.trim();
-
-    if (meta.rules !== rules || meta.headers !== headers) {
-      await updateRegistryEntry(folderName, { rules, headers });
-    }
-
-    let key = null;
-    if (meta.encryptionType === "password") {
-      const password = prompt(`Enter password for "${folderName}":`);
-      if (!password) {
-        return setUiBusy(false);
-      }
-      key = await deriveKeyFromPassword(password, base64ToBuffer(meta.salt));
-    }
-
-    const sw = await waitForController();
-    // Wrap SW communication in a race to ensure we don't hang forever
-    await Promise.race([
-      new Promise((resolve) => {
-        const channel = new MessageChannel();
-        channel.port1.onmessage = () => resolve();
-        sw.postMessage({ type: "SET_RULES", rules, headers, key, folderName }, [
-          channel.port2,
-        ]);
-      }),
-      new Promise((_, reject) =>
-        setTimeout(
-          () => reject(new Error("Service Worker response timed out.")),
-          4000,
-        ),
-      ),
-    ]);
-
-    const encodedPath = fileName
-      ? fileName.split("/").map(encodeURIComponent).join("/")
-      : "index.html";
-    const virtualUrl = `n/${encodeURIComponent(folderName)}/${encodedPath}`;
-
-    const resp = await fetch(virtualUrl, {
-      headers: { Accept: "text/html" },
-    });
-
-    if (!resp.ok) {
-      if (resp.status === 403) return alert("Session authentication failed.");
-      throw new Error(`Failed to load HTML: ${resp.status} ${resp.statusText}`);
-    }
-    let html = await resp.text();
-
-    const basePath = virtualUrl.substring(0, virtualUrl.lastIndexOf("/") + 1);
-    const baseTag = `<base href="${basePath}">`;
-
-    let metaTags = "";
-    resp.headers.forEach((val, key) => {
-      metaTags += `<meta http-equiv="${key.replace(
-        /"/g,
-        "&quot;",
-      )}" content="${val.replace(/"/g, "&quot;")}">\n`;
-    });
-
-    if (/<head\b[^>]*>/i.test(html)) {
-      html = html.replace(/(<head\b[^>]*>)/i, `$1${baseTag}${metaTags}`);
-    } else if (/<html\b[^>]*>/i.test(html)) {
-      html = html.replace(
-        /(<html\b[^>]*>)/i,
-        `$1<head>${baseTag}${metaTags}</head>`,
-      );
-    } else {
-      html = `<head>${baseTag}${metaTags}</head>${html}`;
-    }
-
-    document.open();
-    document.write(html);
-    document.close();
-  } finally {
-    setUiBusy(false);
+  const registry = await getRegistry();
+  const meta = registry[folderName];
+  if (!meta) {
+    return alert("Folder not found.");
   }
+
+  const rules = document.getElementById("regex").value.trim();
+  const headers = document.getElementById("headers").value.trim();
+
+  if (meta.rules !== rules || meta.headers !== headers) {
+    await updateRegistryEntry(folderName, { rules, headers });
+  }
+
+  let key = null;
+  if (meta.encryptionType === "password") {
+    const password = prompt(`Enter password for "${folderName}":`);
+    if (!password) {
+      return setUiBusy(false);
+    }
+    key = await deriveKeyFromPassword(password, base64ToBuffer(meta.salt));
+  }
+
+  const sw = await waitForController();
+  // Wrap SW communication in a race to ensure we don't hang forever
+  await Promise.race([
+    new Promise((resolve) => {
+      const channel = new MessageChannel();
+      channel.port1.onmessage = () => resolve();
+      sw.postMessage({ type: "SET_RULES", rules, headers, key, folderName }, [
+        channel.port2,
+      ]);
+    }),
+    new Promise((_, reject) =>
+      setTimeout(
+        () => reject(new Error("Service Worker response timed out.")),
+        4000,
+      ),
+    ),
+  ]);
+
+  const encodedPath = fileName
+    ? fileName.split("/").map(encodeURIComponent).join("/")
+    : "index.html";
+  const virtualUrl = `n/${encodeURIComponent(folderName)}/${encodedPath}`;
+
+  const resp = await fetch(virtualUrl, {
+    headers: { Accept: "text/html" },
+  });
+
+  if (!resp.ok) {
+    if (resp.status === 403) return alert("Session authentication failed.");
+    throw new Error(`Failed to load HTML: ${resp.status} ${resp.statusText}`);
+  }
+  let html = await resp.text();
+
+  const basePath = virtualUrl.substring(0, virtualUrl.lastIndexOf("/") + 1);
+  const baseTag = `<base href="${basePath}">`;
+
+  let metaTags = "";
+  resp.headers.forEach((val, key) => {
+    metaTags += `<meta http-equiv="${key.replace(
+      /"/g,
+      "&quot;",
+    )}" content="${val.replace(/"/g, "&quot;")}">\n`;
+  });
+
+  if (/<head\b[^>]*>/i.test(html)) {
+    html = html.replace(/(<head\b[^>]*>)/i, `$1${baseTag}${metaTags}`);
+  } else if (/<html\b[^>]*>/i.test(html)) {
+    html = html.replace(
+      /(<html\b[^>]*>)/i,
+      `$1<head>${baseTag}${metaTags}</head>`,
+    );
+  } else {
+    html = `<head>${baseTag}${metaTags}</head>${html}`;
+  }
+
+  document.open();
+  document.write(html);
+  document.close();
+  setUiBusy(false);
 }

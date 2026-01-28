@@ -133,7 +133,6 @@ async function saveRegistry(registry) {
   );
 }
 
-let _registryWriteQueue = Promise.resolve();
 async function updateRegistryEntry(name, data) {
   return navigator.locks.request(
     "rfs_registry_lock",
@@ -191,6 +190,8 @@ async function uploadFolder() {
     }
   } catch (e) {
     if (e.name !== "AbortError") throw e;
+  } finally {
+    setUiBusy(false);
   }
 }
 
@@ -349,11 +350,11 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
           }
           if (buffer.length < encSize) break;
 
-          const chunkData = buffer.slice(0, encSize);
-          buffer = buffer.slice(encSize);
+          const chunkData = buffer.subarray(0, encSize);
+          buffer = buffer.subarray(encSize);
 
-          const chunkIv = chunkData.slice(0, 12);
-          const chunkCipher = chunkData.slice(12);
+          const chunkIv = chunkData.subarray(0, 12);
+          const chunkCipher = chunkData.subarray(12);
 
           try {
             const plainChunk = await crypto.subtle.decrypt(
@@ -384,59 +385,87 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
   await logProgress("", true);
 }
 
-async function processFileListAndStore(name, fileList) {
+async function processFileListAndStore(name, srcHandle) {
   const root = await getOpfsRoot();
   const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
   try {
     await rfsRoot.removeEntry(name, { recursive: true });
   } catch (e) {}
-  const folderHandle = await rfsRoot.getDirectoryHandle(name, { create: true });
 
-  const files = Array.from(fileList);
-  const totalSize = files.reduce((acc, f) => acc + f.size, 0);
-  const totalMB = (totalSize / 1048576).toFixed(2);
+  const destRoot = await rfsRoot.getDirectoryHandle(name, { create: true });
+  const uploadQueue = [];
+  let scanComplete = false;
+  let totalFilesDiscovered = 0;
   let bytesUploaded = 0;
-  let lastLoggedBytes = 0;
 
-  let basePath = "";
-  if (files[0]?.webkitRelativePath?.includes("/")) {
-    basePath = files[0].webkitRelativePath.split("/")[0] + "/";
-  }
+  // Shared state for logging context
+  let currentFile = "";
 
-  const updateProgress = () => {
-    // Only log if we've moved significantly, or it's the end
-    if (bytesUploaded - lastLoggedBytes < 524288 && bytesUploaded !== totalSize)
-      return null;
-    lastLoggedBytes = bytesUploaded;
-
-    const uploadedMB = (bytesUploaded / 1048576).toFixed(2);
-    const pct = totalSize > 0 ? (bytesUploaded / totalSize) * 100 : 0;
-    return logProgress(
-      `Uploading: ${pct.toFixed(2)}% (${uploadedMB}/${totalMB} MB)`,
-    );
+  const updateUI = async (force = false) => {
+    // Only construct string if necessary
+    const p = checkYield(force);
+    if (p) {
+      const mb = (bytesUploaded / 1048576).toFixed(2);
+      await logProgress(
+        `Uploading: ${mb} MB (${currentFile || "Scanning..."})`,
+      );
+      await p;
+    }
   };
 
   const worker = async () => {
     const dirCache = new Map();
-    while (files.length > 0) {
-      const file = files.shift();
-      if (!file) break;
+    while (true) {
+      if (uploadQueue.length > 0) {
+        const task = uploadQueue.shift();
+        currentFile = task.entry.name; // Update context for UI
 
-      let path = file.webkitRelativePath || file.name;
-      if (basePath && path.startsWith(basePath))
-        path = path.substring(basePath.length);
-
-      await writeStreamToOpfs(folderHandle, path, file, {
-        dirCache,
-        onProgress: (delta) => {
-          bytesUploaded += delta;
-          return updateProgress();
-        },
-      });
+        const file = await task.entry.getFile();
+        await writeStreamToOpfs(task.dest, task.entry.name, file, {
+          dirCache,
+          onProgress: async (delta) => {
+            bytesUploaded += delta;
+            await updateUI();
+          },
+        });
+      } else {
+        if (scanComplete) break;
+        await new Promise((res) => setTimeout(res, 10));
+      }
+      // Idle yield
+      const p = checkYield();
+      if (p) await p;
     }
   };
 
-  await Promise.all(Array(CONCURRENCY).fill(null).map(worker));
+  const workerPromises = Array(CONCURRENCY).fill(null).map(worker);
+  const scanStack = [{ source: srcHandle, dest: destRoot }];
+
+  while (scanStack.length > 0) {
+    const { source, dest } = scanStack.shift();
+    // Optimization: Use for await to be non-blocking on huge folders if supported
+    for await (const entry of source.values()) {
+      if (entry.kind === "file") {
+        totalFilesDiscovered++;
+        uploadQueue.push({ dest, entry });
+        if (totalFilesDiscovered % 50 === 0) await updateUI();
+
+        // Backpressure if queue is too large
+        if (uploadQueue.length > 1000) {
+          const p = checkYield(true); // Force yield to let workers catch up
+          if (p) await p;
+        }
+      } else {
+        const nextDest = await dest.getDirectoryHandle(entry.name, {
+          create: true,
+        });
+        scanStack.push({ source: entry, dest: nextDest });
+      }
+    }
+  }
+
+  scanComplete = true;
+  await Promise.all(workerPromises);
 
   document.getElementById("folderName").value = "";
   document.getElementById("openFolderName").value = name;
@@ -652,16 +681,19 @@ async function deleteFolder(folderNameToDelete, skipConfirm = false) {
 }
 
 async function openFile(overrideFolderName) {
-  const folderName =
-    overrideFolderName ||
-    document.getElementById("openFolderName").value.trim();
+  const folderName = (
+    overrideFolderName || document.getElementById("openFolderName").value
+  ).trim();
   const fileName = document.getElementById("fileName").value.trim();
   if (!folderName) return alert("Provide a folder name.");
 
   setUiBusy(true);
   const registry = await getRegistry();
   const meta = registry[folderName];
-  if (!meta) return alert("Folder not found.");
+  if (!meta) {
+    setUiBusy(false);
+    return alert("Folder not found.");
+  }
 
   const rules = document.getElementById("regex").value.trim();
   const headers = document.getElementById("headers").value.trim();
@@ -691,66 +723,79 @@ async function openFile(overrideFolderName) {
   setUiBusy(false);
 }
 
-async function startImport(file) {
-  setUiBusy(true);
-  const TEMP_BLOB_DIR = ".rfs_temp_blobs"; // Must match LittleExport
-
-  const root = await navigator.storage.getDirectory();
-
-  try {
-    await root.removeEntry(RFS_PREFIX, { recursive: true });
-  } catch (e) {}
-  try {
-    await root.removeEntry(SYSTEM_FILE);
-  } catch (e) {}
-  try {
-    await root.removeEntry(TEMP_BLOB_DIR, { recursive: true });
-  } catch (e) {}
-
-  await LittleExport.importData(file, {
-    logger: logProgress,
-    onCustomItem: async (path, data) => {
-      if (path === SYSTEM_FILE) {
-        const decoder = new TextDecoder();
-        const registry = JSON.parse(decoder.decode(data));
-        await saveRegistry(registry);
-      }
-    },
-  });
-
-  if (navigator.serviceWorker.controller) {
-    navigator.serviceWorker.controller.postMessage({
-      type: "INVALIDATE_CACHE",
-    });
-  }
-
-  await listFolders();
-  alert("Import complete!");
-  setUiBusy(false);
-  logProgress("", true);
-}
-
 async function exportData() {
   setUiBusy(true);
-  let password = prompt("Enter a password (or leave blank for no encryption):");
 
-  const registry = await getRegistry();
-  await LittleExport.exportData({
-    fileName: "result",
-    password: password,
-    cookies: document.getElementById("c1").checked,
-    localStorage: document.getElementById("c2").checked,
-    idb: document.getElementById("c3").checked,
-    opfs: document.getElementById("c5").checked,
-    cache: document.getElementById("c6").checked,
-    session: document.getElementById("c7").checked,
+  try {
+    let password = prompt(
+      "Enter a password (or leave blank for no encryption):",
+    );
+    if (password === null) {
+      // User cancelled prompt
+      setUiBusy(false);
+      return;
+    }
+    password = password || undefined; // Convert empty string to undefined
 
-    customItems: [{ path: SYSTEM_FILE, data: JSON.stringify(registry) }],
-    exclude: { opfs: [SYSTEM_FILE] },
-    logger: logProgress,
-  });
-  setUiBusy(false);
-  logProgress("", true);
+    const exportCookies = document.getElementById("c1").checked;
+    const exportLS = document.getElementById("c2").checked;
+    const exportIDB = document.getElementById("c3").checked;
+    const exportRFS = document.getElementById("c4").checked;
+    const exportOPFS = document.getElementById("c5").checked;
+    const exportCache = document.getElementById("c6").checked;
+    const exportSession = document.getElementById("c7").checked;
+
+    const customItems = [];
+    if (exportRFS) {
+      const registry = await getRegistry();
+      const sanitizedRegistry = {};
+      for (const [folderName, meta] of Object.entries(registry)) {
+        sanitizedRegistry[folderName] = { ...meta };
+      }
+      customItems.push({
+        path: SYSTEM_FILE,
+        data: JSON.stringify(sanitizedRegistry),
+      });
+    }
+
+    const exclude = { opfs: [SYSTEM_FILE, ".rfs_temp_blobs"] };
+    const include = { opfs: [] };
+
+    if (exportRFS && !exportOPFS) {
+      include.opfs.push(RFS_PREFIX);
+    } else if (!exportRFS && exportOPFS) {
+      exclude.opfs.push(RFS_PREFIX);
+    }
+    // If both or neither, include.opfs stays empty (export all / export none based on opts.opfs)
+
+    await LittleExport.exportData({
+      fileName: "result",
+      password: password,
+      cookies: exportCookies,
+      localStorage: exportLS,
+      idb: exportIDB,
+      opfs: exportRFS || exportOPFS,
+      cache: exportCache,
+      session: exportSession,
+      customItems: customItems,
+      include: include.opfs.length > 0 ? include : {},
+      exclude: exclude,
+      graceful: true, // Continue on non-fatal errors
+      logger: logProgress,
+      onerror: (e) => {
+        console.error("Error while exporting:", e);
+        alert("Error while exporting: " + e);
+      },
+      onsuccess: () => {
+        logProgress("Export complete!", true);
+      },
+    });
+  } catch (e) {
+    console.error("Export failed:", e);
+    alert("Export failed: " + e.message);
+  } finally {
+    setUiBusy(false);
+  }
 }
 
 async function importData() {
@@ -760,6 +805,52 @@ async function importData() {
     if (e.target.files[0]) startImport(e.target.files[0]);
   };
   input.click();
+}
+
+async function startImport(file) {
+  setUiBusy(true);
+  const TEMP_BLOB_DIR = ".rfs_temp_blobs";
+
+  try {
+    const root = await navigator.storage.getDirectory();
+
+    // Clean up before import
+    await Promise.allSettled([
+      root.removeEntry(RFS_PREFIX, { recursive: true }),
+      root.removeEntry(SYSTEM_FILE),
+      root.removeEntry(TEMP_BLOB_DIR, { recursive: true }),
+    ]);
+
+    await LittleExport.importData({
+      source: file,
+      graceful: true,
+      logger: logProgress,
+      onerror: (e) => {
+        console.warn("Import warning:", e.message);
+      },
+      onCustomItem: async (path, data) => {
+        if (path === SYSTEM_FILE) {
+          const registry = JSON.parse(new TextDecoder().decode(data));
+          await saveRegistry(registry);
+        }
+      },
+      onsuccess: async () => {
+        if (navigator.serviceWorker.controller) {
+          navigator.serviceWorker.controller.postMessage({
+            type: "INVALIDATE_CACHE",
+          });
+        }
+        await listFolders();
+        alert("Import complete! Reload to fix any issues.");
+      },
+    });
+  } catch (e) {
+    console.error("Import failed:", e);
+    alert("Import failed: " + e.message);
+  } finally {
+    setUiBusy(false);
+    logProgress("", true);
+  }
 }
 
 function base64ToBuffer(base64) {
@@ -898,7 +989,16 @@ async function uploadAndEncryptWithPassword() {
   if (!name || !password) return;
 
   setUiBusy(true);
-  const localDir = await window.showDirectoryPicker({ mode: "read" });
+
+  let localDir;
+  try {
+    localDir = await window.showDirectoryPicker({ mode: "read" });
+  } catch (e) {
+    if (e.name !== "AbortError") throw e;
+  } finally {
+    setUiBusy(false);
+  }
+
   const root = await getOpfsRoot();
   const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
 
@@ -925,6 +1025,7 @@ async function uploadAndEncryptWithPassword() {
   const queue = [];
   const scanQueue = [{ dir: localDir, path: "" }];
   let scanning = true;
+  let totalBytesProcessed = 0;
 
   const scanner = async () => {
     while (scanQueue.length > 0) {
@@ -934,6 +1035,7 @@ async function uploadAndEncryptWithPassword() {
         if (entry.kind === "file") {
           const fileId = crypto.randomUUID();
           queue.push({ entry, entryPath, fileId });
+          // Backpressure during scan
           while (queue.length > 500) {
             await new Promise((resolve) => setTimeout(resolve, 20));
           }
@@ -949,7 +1051,6 @@ async function uploadAndEncryptWithPassword() {
     while (true) {
       if (queue.length === 0) {
         if (!scanning) break;
-        // Yield or micro-sleep if empty but still scanning
         const p = checkYield();
         if (p) await p;
         continue;
@@ -958,10 +1059,18 @@ async function uploadAndEncryptWithPassword() {
       const task = queue.shift();
       const { entry, entryPath, fileId } = task;
 
-      const p = logProgress(`Encrypting: ${task.entryPath}`);
-      if (p) await p;
+      // Check yield first, then construct string
+      const p = checkYield();
+      if (p) {
+        const mb = (totalBytesProcessed / 1048576).toFixed(2);
+        // Standardized: [Action] [Type]: [Size] ([Detail])
+        await logProgress(`Encrypting Folder: ${mb} MB (${task.entryPath})`);
+        await p;
+      }
 
       const file = await entry.getFile();
+      totalBytesProcessed += file.size; // Update tracker
+
       manifestData[entryPath] = {
         id: fileId,
         size: file.size,
@@ -1005,9 +1114,8 @@ async function uploadAndEncryptWithPassword() {
                     break;
                   }
 
-                  // Worker loop yield check
-                  const p = checkYield();
-                  if (p) await p;
+                  const pSub = checkYield();
+                  if (pSub) await pSub;
 
                   const sizeToEncrypt = Math.min(CHUNK_SIZE, remaining);
                   const chunkToEncrypt = buffer.subarray(
@@ -1022,10 +1130,9 @@ async function uploadAndEncryptWithPassword() {
                     chunkToEncrypt,
                   );
 
+                  cursor += sizeToEncrypt;
                   await writable.write(iv);
                   await writable.write(new Uint8Array(encryptedChunk));
-
-                  cursor += sizeToEncrypt;
                 }
 
                 if (cursor >= pendingSize) {
@@ -1052,8 +1159,7 @@ async function uploadAndEncryptWithPassword() {
   await scanPromise;
   await Promise.all(workers);
 
-  const p = logProgress("Saving manifest...");
-  if (p) await p;
+  await logProgress("Saving manifest...", true);
 
   const manifestJson = JSON.stringify(manifestData);
   const manifestBuffer = new TextEncoder().encode(manifestJson);
@@ -1081,7 +1187,7 @@ async function uploadAndEncryptWithPassword() {
   document.getElementById("encryptFolderName").value = "";
   await listFolders();
   setUiBusy(false);
-  logProgress("", true);
+  await logProgress("", true);
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -1199,12 +1305,13 @@ document.addEventListener("DOMContentLoaded", () => {
             } while (batch.length > 0);
           }
 
-          if (scannedCount % 50 === 0) {
-            await logProgress(`Scanned ${scannedCount} files...`);
+          let p = logProgress(`Scanned ${scannedCount} files...`);
+          if (p) {
+            await p;
           }
         }
 
-        await logProgress(`Processed ${files.length} files...`);
+        await logProgress(`Processed ${files.length} files...`, true);
         await processFileListAndStore(name, files);
         setUiBusy(false);
       }
@@ -1265,6 +1372,7 @@ async function openFileInPlace() {
   const registry = await getRegistry();
   const meta = registry[folderName];
   if (!meta) {
+    setUiBusy(false);
     return alert("Folder not found.");
   }
 
@@ -1312,7 +1420,10 @@ async function openFileInPlace() {
   });
 
   if (!resp.ok) {
-    if (resp.status === 403) return alert("Session authentication failed.");
+    if (resp.status === 403) {
+      setUiBusy(false);
+      return alert("Session authentication failed.");
+    }
     throw new Error(`Failed to load HTML: ${resp.status} ${resp.statusText}`);
   }
   let html = await resp.text();

@@ -34,6 +34,9 @@ Firefox with Private browsing is known not allow folder uploading, and similar i
 (Firefox had a very specific issue involving initially loading JS scripts in `generateResponseForVirtualFile`, so an automatic reload is performed that injects `?boot=1` to the end of the URL. However, this issue seems to no longer happen in the newest versions of Firefox so see `reloadOnRequest` in the SW code and its comment to re-enable `?boot=1` injection.)
 
 In the future, non-Chromium browsers might adopt parts of the File System API that allow for streamed exports. The RAM-only fallback should still work for exporting a few hundred MBs.
+
+RuntimeFS requires ES11 or later (supported by over 95% of all browsers).
+
 | Feature | 🟢 Chromium | 🟡 Firefox/Safari/Brave |
 | :--- | :--- | :--- |
 | **Folder Upload** | ✅ Yes | ⚠️ `<input>` or drag-and-drop fallback, no sync |
@@ -74,6 +77,7 @@ Also note:
 - The most likely reason that data export fails when transferring between sites is because those websites use URL properties as part of the key (either from `document.URL` or `location`). You might be able to force a site to use a hardcoded URL for storage with clever regex or code changes.
 - Using regex requires any matched files to be fully loaded into memory, reducing performance. Be careful!
 - Exporting any single files with very large sizes not from OPFS (such as from IndexedDB, or cache storage) might result in crashes.
+- Regex attempts to only operate on text files; the checking should be performant and accurate for almost all cases. You can customize the `isActuallyText` function in the SW if necessary.
 - Check `getMimeType` in the ServiceWorker for the supported MIME types; you may need to add your own in some cases.
 - You might encounter freezing of all RuntimeFS-related tabs if any tab is stuck or waiting for something (such as making a IndexedDB writable). RuntimeFS might also encounter a QuotaExceededError in certain situations (like running out of memory or private tabs).
 

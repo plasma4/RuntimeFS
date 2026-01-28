@@ -1,5 +1,9 @@
 (function () {
+  const TYPE = { OPFS: 1, IDB: 2, LS: 4, SS: 8, COOKIE: 16, CACHE: 32 };
+  const DECISION = { SKIP: 0, PROCESS: 1, TRUST: 2, ABORT: 3 };
+
   let blobIdCounter = 0;
+
   function createYielder(threshold = 100) {
     let lastYield = Date.now();
     const channel = new MessageChannel();
@@ -29,11 +33,11 @@
     };
   }
 
-  const CHUNK_SIZE = 4194304; // 4MB, for encryption
-  const TAR_BUFFER_SIZE = 65536; // 64KB, for optimization
+  const CHUNK_SIZE = 4194304;
+  const TAR_BUFFER_SIZE = 65536;
   const ENC = new TextEncoder();
   const DEC = new TextDecoder();
-  const TEMP_BLOB_DIR = ".rfs_temp_blobs"; // Hidden temp dir for IDB restoring
+  const TEMP_BLOB_DIR = ".rfs_temp_blobs";
 
   async function deriveKey(password, salt) {
     const km = await crypto.subtle.importKey(
@@ -52,23 +56,54 @@
     );
   }
 
-  function isAllowed(category, path, config) {
-    if (
-      config.exclude?.[category]?.some(
-        (t) => path === t || path.startsWith(t + "/"),
-      )
-    )
-      return false;
-    if (config.include?.[category]?.length > 0) {
-      return config.include[category].some(
-        (t) => path === t || path.startsWith(t + "/"),
-      );
+  // Simple mode filter, supports functions and arrays
+  function checkSimpleFilter(category, pathStr, config) {
+    const { include, exclude } = config;
+
+    // Check exclude first (blacklist)
+    if (exclude && exclude[category]) {
+      const filter = exclude[category];
+      if (typeof filter === "function") {
+        if (filter(pathStr)) return false;
+      } else if (Array.isArray(filter)) {
+        // For arrays: exact match or prefix match
+        if (
+          filter.some(
+            (t) =>
+              pathStr === t ||
+              pathStr.startsWith(t + "/") ||
+              pathStr.startsWith(t),
+          )
+        )
+          return false;
+      }
     }
+
+    // Check include (whitelist), only if specified
+    if (include && include[category]) {
+      const filter = include[category];
+      if (typeof filter === "function") {
+        return filter(pathStr);
+      } else if (Array.isArray(filter) && filter.length > 0) {
+        return filter.some(
+          (t) =>
+            pathStr === t ||
+            pathStr.startsWith(t + "/") ||
+            pathStr.startsWith(t),
+        );
+      }
+    }
+
     return true;
   }
 
-  function prepForCBOR(item, externalBlobs) {
+  function prepForCBOR(item, externalBlobs, seen) {
     if (!item || typeof item !== "object") return item;
+
+    // Circular reference protection
+    if (!seen) seen = new WeakSet();
+    if (seen.has(item)) return { __le_circular: true };
+
     if (item instanceof Blob) {
       const id = (blobIdCounter++).toString(36);
       externalBlobs.push({ uuid: id, blob: item });
@@ -84,18 +119,22 @@
       return item;
     }
 
+    seen.add(item);
+
     if (Array.isArray(item)) {
       const len = item.length;
       const res = new Array(len);
       for (let i = 0; i < len; i++) {
-        res[i] = prepForCBOR(item[i], externalBlobs);
+        res[i] = prepForCBOR(item[i], externalBlobs, seen);
       }
       return res;
     }
 
     const res = {};
     for (const k in item) {
-      res[k] = prepForCBOR(item[k], externalBlobs);
+      if (Object.prototype.hasOwnProperty.call(item, k)) {
+        res[k] = prepForCBOR(item[k], externalBlobs, seen);
+      }
     }
     return res;
   }
@@ -103,17 +142,30 @@
   async function restoreFromCBOR(item, tempBlobDir) {
     if (!item || typeof item !== "object") return item;
     if (item.__le_blob_ref) {
-      const fh = await tempBlobDir.getFileHandle(item.__le_blob_ref);
-      const file = await fh.getFile();
-      // Use slice to set the correct MIME type without wrapping the Blob in another Blob
-      return file.slice(0, file.size, item.type);
+      if (!tempBlobDir) return null;
+      try {
+        const fh = await tempBlobDir.getFileHandle(item.__le_blob_ref);
+        const file = await fh.getFile();
+        return file.slice(0, file.size, item.type);
+      } catch (e) {
+        return null; // Blob not found, gracefully return null
+      }
     }
     if (item.__le_blob) {
       return new Blob([item.data], { type: item.type });
     }
-    if (Array.isArray(item)) {
-      return Promise.all(item.map((i) => restoreFromCBOR(i, tempBlobDir)));
+    if (item.__le_circular) {
+      return null; // Can't restore circular references
     }
+
+    if (Array.isArray(item)) {
+      const res = new Array(item.length);
+      for (let i = 0; i < item.length; i++) {
+        res[i] = await restoreFromCBOR(item[i], tempBlobDir);
+      }
+      return res;
+    }
+
     if (item.constructor === Object) {
       const n = {};
       for (const k in item) {
@@ -125,57 +177,47 @@
   }
 
   const TAR_CONSTANTS = {
-    USTAR_MAGIC: new Uint8Array([117, 115, 116, 97, 114, 0]), // "ustar\0"
-    USTAR_VER: new Uint8Array([48, 48]), // "00"
-    EMPTY_SPACE: new Uint8Array(8).fill(32), // 8 spaces
+    USTAR_MAGIC: new Uint8Array([117, 115, 116, 97, 114, 0]),
+    USTAR_VER: new Uint8Array([48, 48]),
+    EMPTY_SPACE: new Uint8Array(8).fill(32),
   };
 
-  // Pre-compute a clean header template
   const HEADER_TEMPLATE = new Uint8Array(512);
   (function initTemplate() {
     const w = (str, off) => ENC.encodeInto(str, HEADER_TEMPLATE.subarray(off));
-    // Default values
-    w("000664 \0", 100); // Mode
-    w("000000 \0", 108); // UID
-    w("000000 \0", 116); // GID
-    HEADER_TEMPLATE.set(TAR_CONSTANTS.EMPTY_SPACE, 148); // Checksum (spaces)
-    HEADER_TEMPLATE[156] = 48; // Typeflag "0"
+    w("000664 \0", 100);
+    w("000000 \0", 108);
+    w("000000 \0", 116);
+    HEADER_TEMPLATE.set(TAR_CONSTANTS.EMPTY_SPACE, 148);
+    HEADER_TEMPLATE[156] = 48;
     HEADER_TEMPLATE.set(TAR_CONSTANTS.USTAR_MAGIC, 257);
     HEADER_TEMPLATE.set(TAR_CONSTANTS.USTAR_VER, 263);
   })();
 
   function createTarHeader(filename, size, time, isDir = false) {
-    // Max size check (USTAR limit)
     if (size > 8589934591) {
-      throw new Error(
-        "File size exceeds USTAR 8GB limit. Extensions required.",
-      );
+      throw new Error("File size exceeds USTAR 8GB limit.");
     }
 
-    const buffer = HEADER_TEMPLATE.slice(0); // Fast zero-copy clone
+    const buffer = HEADER_TEMPLATE.slice(0);
 
-    // Directory conventions
     if (isDir) {
       if (!filename.endsWith("/")) filename += "/";
-      buffer[156] = 53; // '5'
+      buffer[156] = 53;
     }
 
-    // Paths
     const fullBytes = ENC.encode(filename);
 
     if (fullBytes.length <= 100) {
       buffer.set(fullBytes, 0);
     } else {
-      // Split logic: Prefix (155) + Name (100)
       let bestSplit = -1;
 
       for (let i = 0; i < fullBytes.length; i++) {
-        // Split strictly on slash
         if (fullBytes[i] === 47) {
           const prefixLen = i;
           const nameLen = fullBytes.length - 1 - i;
 
-          // Check if both parts fit their respective fields
           if (prefixLen <= 155 && nameLen <= 100 && nameLen > 0) {
             bestSplit = i;
           }
@@ -183,41 +225,32 @@
       }
 
       if (bestSplit !== -1) {
-        buffer.set(fullBytes.subarray(bestSplit + 1), 0); // Name
-        buffer.set(fullBytes.subarray(0, bestSplit), 345); // Prefix
+        buffer.set(fullBytes.subarray(bestSplit + 1), 0);
+        buffer.set(fullBytes.subarray(0, bestSplit), 345);
       } else {
-        throw new Error(
-          `Filename too long or unsplittable for USTAR: ${filename}`,
-        );
+        throw new Error(`Filename too long for USTAR: ${filename}`);
       }
     }
 
-    // Helper to write octal safely
     const writeOctal = (num, offset, len) => {
       const str = Math.floor(num)
         .toString(8)
         .padStart(len - 1, "0");
-      // Ensure we don't overflow the field width (already checked size, but good practice)
       if (str.length >= len) throw new Error("Octal field overflow");
-
       ENC.encodeInto(str, buffer.subarray(offset, offset + len - 1));
-      buffer[offset + len - 1] = 0; // Null terminate
+      buffer[offset + len - 1] = 0;
     };
 
     writeOctal(size, 124, 12);
     writeOctal(time, 136, 12);
 
-    // Treat checksum field (148-155) as spaces (ASCII 32)
     let sum = 0;
-    for (let i = 0; i < 512; i++) {
-      sum += buffer[i];
-    }
+    for (let i = 0; i < 512; i++) sum += buffer[i];
 
-    // Finally write the checksum (6 digits + null + space)
     const cksumStr = sum.toString(8).padStart(6, "0");
     ENC.encodeInto(cksumStr, buffer.subarray(148));
     buffer[154] = 0;
-    buffer[155] = 32; // space
+    buffer[155] = 32;
     return buffer;
   }
 
@@ -228,7 +261,6 @@
       this.pos = 0;
       this.bytesWritten = 0;
       this.time = Math.floor(Date.now() / 1000);
-
       this.buffer = new Uint8Array(TAR_BUFFER_SIZE);
       this.bufferOffset = 0;
     }
@@ -236,7 +268,6 @@
     async writeEntry(path, data) {
       const bytes = typeof data === "string" ? ENC.encode(data) : data;
       const header = createTarHeader(path, bytes.length, this.time);
-
       await this.write(header);
       await this.write(bytes);
       await this.pad();
@@ -256,14 +287,12 @@
       } finally {
         reader.releaseLock();
       }
-
       await this.pad();
     }
 
     async write(chunk) {
       const len = chunk.byteLength;
 
-      // If the chunk is larger than our buffer, bypass the buffer entirely (Zero-Copy)
       if (len >= TAR_BUFFER_SIZE) {
         await this.flush();
         await this.writer.write(chunk);
@@ -283,10 +312,13 @@
     async pad() {
       const padding = (512 - (this.pos % 512)) % 512;
       if (padding > 0) {
-        // Create padding array once
-        const pad = new Uint8Array(padding);
-        await this.write(pad);
+        await this.write(new Uint8Array(padding));
       }
+    }
+
+    async writeDir(path) {
+      const header = createTarHeader(path, 0, this.time, true);
+      await this.write(header);
     }
 
     async flush() {
@@ -297,7 +329,6 @@
     }
 
     async close() {
-      // Write 2 empty blocks (standard TAR footer)
       await this.write(new Uint8Array(1024));
       await this.flush();
       await this.writer.close();
@@ -326,7 +357,6 @@
       this.chunks.push(chunk);
       this.currentSize += chunk.byteLength;
 
-      // Buffer chunks until we hit 4MB to ensure efficient encryption block sizes
       if (this.currentSize >= CHUNK_SIZE) {
         const fullBuffer = new Uint8Array(this.currentSize);
         let offset = 0;
@@ -337,7 +367,6 @@
 
         const key = await this.keyPromise;
         let pos = 0;
-        // Process complete 4MB chunks
         while (pos + CHUNK_SIZE <= fullBuffer.length) {
           await this.encryptAndPush(
             fullBuffer.subarray(pos, pos + CHUNK_SIZE),
@@ -347,7 +376,6 @@
           pos += CHUNK_SIZE;
         }
 
-        // Keep the remainder for the next transform call
         const remainder = fullBuffer.subarray(pos);
         this.chunks = remainder.length > 0 ? [remainder] : [];
         this.currentSize = remainder.length;
@@ -355,7 +383,6 @@
     }
 
     async flush(controller) {
-      // Write whatever is left in the buffer
       if (this.currentSize > 0) {
         const finalBuffer = new Uint8Array(this.currentSize);
         let offset = 0;
@@ -386,7 +413,6 @@
     }
   }
 
-  // A zero-copy-friendly buffer that manages a queue of chunks
   class ChunkBuffer {
     constructor() {
       this.chunks = [];
@@ -433,30 +459,34 @@
       this.yielder = yielder;
       this.buffer = new ChunkBuffer();
     }
+
     readable() {
+      const self = this;
       let reader;
+
       async function ensure(n) {
-        while (!this.buffer.has(n)) {
+        while (!self.buffer.has(n)) {
           const { value, done } = await reader.read();
           if (done) return false;
-          this.buffer.push(value);
+          self.buffer.push(value);
         }
         return true;
       }
+
       return new ReadableStream({
         async start(controller) {
-          reader = this.stream.getReader();
+          reader = self.stream.getReader();
           try {
             if (!(await ensure(22))) throw new Error("File too small");
-            const sig = new TextDecoder().decode(this.buffer.read(6));
+            const sig = DEC.decode(self.buffer.read(6));
             if (sig !== "LE_ENC") throw new Error("Not an encrypted archive");
 
-            const salt = this.buffer.read(16);
-            const key = await deriveKey(this.password, salt);
+            const salt = self.buffer.read(16);
+            const key = await deriveKey(self.password, salt);
 
             if (!(await ensure(16))) throw new Error("Corrupt header");
-            const initIV = this.buffer.read(12);
-            const initLenRaw = this.buffer.read(4);
+            const initIV = self.buffer.read(12);
+            const initLenRaw = self.buffer.read(4);
             const initLen = new DataView(
               initLenRaw.buffer,
               initLenRaw.byteOffset,
@@ -464,7 +494,7 @@
             ).getUint32(0, true);
 
             if (!(await ensure(initLen))) throw new Error("Corrupt header");
-            const initCipher = this.buffer.read(initLen);
+            const initCipher = self.buffer.read(initLen);
             try {
               await crypto.subtle.decrypt(
                 { name: "AES-GCM", iv: initIV },
@@ -476,38 +506,43 @@
             }
 
             while (true) {
-              const p = this.yielder();
+              const p = self.yielder();
               if (p) await p;
-              if (!this.buffer.has(16)) {
+
+              if (!self.buffer.has(16)) {
                 const { value, done } = await reader.read();
                 if (done) {
-                  if (this.buffer.totalSize === 0) break;
+                  if (self.buffer.totalSize === 0) break;
                   throw new Error("Truncated encrypted stream");
                 }
-                this.buffer.push(value);
+                self.buffer.push(value);
                 continue;
               }
-              const iv = this.buffer.read(12);
-              const lenRaw = this.buffer.read(4);
+              const iv = self.buffer.read(12);
+              const lenRaw = self.buffer.read(4);
               const lenVal = new DataView(
                 lenRaw.buffer,
                 lenRaw.byteOffset,
                 lenRaw.byteLength,
               ).getUint32(0, true);
 
-              while (!this.buffer.has(lenVal)) {
+              while (!self.buffer.has(lenVal)) {
                 const { value, done } = await reader.read();
                 if (done) throw new Error("Unexpected EOF in ciphertext");
-                this.buffer.push(value);
-                const p2 = this.yielder();
+                self.buffer.push(value);
+                const p2 = self.yielder();
                 if (p2) await p2;
               }
-              const cipher = this.buffer.read(lenVal);
+              const cipher = self.buffer.read(lenVal);
               const plain = await crypto.subtle.decrypt(
                 { name: "AES-GCM", iv },
                 key,
                 cipher,
               );
+
+              const pForce = self.yielder(true);
+              if (pForce) await pForce;
+
               controller.enqueue(new Uint8Array(plain));
             }
             controller.close();
@@ -524,6 +559,7 @@
   async function exportData(config = {}) {
     blobIdCounter = 0;
     const CBOR = window.CBOR;
+
     const opts = {
       fileName: "archive",
       opfs: true,
@@ -536,15 +572,43 @@
       customItems: [],
       include: {},
       exclude: {},
-      dbFilter: () => true,
+      graceful: false,
+      download: true,
       ...config,
     };
-    const logger = opts.logger || console.log;
+
+    const logger = opts.logger || (() => {});
     const yielder = createYielder(opts.logSpeed);
+    const graceful = opts.graceful;
+    const useOnVisit = typeof opts.onVisit === "function";
+    const onVisit = opts.onVisit;
+
+    let aborted = false;
+
+    function getDecision(type, path, meta) {
+      if (!useOnVisit) return DECISION.TRUST;
+      return onVisit(type, path, meta);
+    }
+
+    async function tryGraceful(fn, context) {
+      try {
+        return await fn();
+      } catch (e) {
+        if (graceful) {
+          if (opts.onerror) opts.onerror(e);
+          logger(`Warning: ${context} - ${e.message}`);
+          return null;
+        }
+        throw e;
+      }
+    }
+
+    const status = { category: "Init", detail: "preparing..." };
 
     let outputStream,
       downloadUrl,
       chunks = [];
+
     if (window.showSaveFilePicker && opts.download !== false) {
       try {
         const name = opts.password
@@ -566,250 +630,564 @@
         write(c) {
           chunks.push(c);
         },
+        close() {},
       });
     }
 
     let outputBytesWritten = 0;
     const countingStream = new TransformStream({
-      transform(chunk, controller) {
+      async transform(chunk, controller) {
         outputBytesWritten += chunk.byteLength;
+        const p = yielder();
+        if (p) {
+          logger(
+            `Exporting ${status.category}: ${(outputBytesWritten / 1048576).toFixed(2)} MB (${status.detail})`,
+          );
+          await p;
+        }
         controller.enqueue(chunk);
       },
     });
 
     const gzip = new CompressionStream("gzip");
-
     let pipeline = gzip.readable;
 
     if (opts.password) {
-      logger("Encrypting...");
+      status.category = "Setup";
+      status.detail = "Encrypting...";
       const salt = crypto.getRandomValues(new Uint8Array(16));
       pipeline = pipeline.pipeThrough(
         new TransformStream(new EncryptionTransformer(opts.password, salt)),
       );
     }
 
-    // Finalize the chain by adding the counter and piping to the sink (outputStream)
     const exportFinishedPromise = pipeline
       .pipeThrough(countingStream)
       .pipeTo(outputStream);
-
     const tar = new TarWriter(gzip.writable, yielder);
 
     try {
+      // Custom items (always processed)
       for (const item of opts.customItems) {
-        logger(`Archiving custom: ${item.path}`);
+        if (aborted) break;
+        status.category = "Custom";
+        status.detail = item.path;
         const path = `data/custom/${item.path}`;
-        if (item.data instanceof Blob)
+        if (item.data instanceof Blob) {
           await tar.writeStream(path, item.data.size, item.data.stream());
-        else
+        } else {
           await tar.writeEntry(
             path,
             typeof item.data === "string"
               ? item.data
               : JSON.stringify(item.data),
           );
-      }
-
-      if (opts.localStorage) {
-        const d = {};
-        for (let i = 0; i < localStorage.length; i++) {
-          const k = localStorage.key(i);
-          if (isAllowed("localStorage", k, opts))
-            d[k] = localStorage.getItem(k);
         }
-        await tar.writeEntry("data/ls.json", JSON.stringify(d));
       }
 
-      if (opts.session) {
-        const d = {};
-        for (let i = 0; i < sessionStorage.length; i++) {
-          const k = sessionStorage.key(i);
-          if (isAllowed("session", k, opts)) d[k] = sessionStorage.getItem(k);
-        }
-        await tar.writeEntry("data/ss.json", JSON.stringify(d));
-      }
+      // OPFS
+      if (!aborted && opts.opfs && navigator.storage) {
+        let categoryDecision = getDecision(TYPE.OPFS, undefined, undefined);
+        if (categoryDecision && typeof categoryDecision.then === "function")
+          categoryDecision = await categoryDecision;
 
-      if (opts.cookies) {
-        const c = document.cookie.split(";").reduce((acc, v) => {
-          const [key, val] = v.split("=").map((s) => s.trim());
-          if (key) acc[key] = val;
-          return acc;
-        }, {});
-        await tar.writeEntry("data/cookies.json", JSON.stringify(c));
-      }
+        if (categoryDecision === DECISION.ABORT) aborted = true;
 
-      if (opts.idb && window.indexedDB && CBOR) {
-        const dbs = await window.indexedDB.databases();
-        for (const { name, version } of dbs) {
-          if (!isAllowed("idb", name, opts) || !opts.dbFilter(name)) continue;
-          const safeName = encodeURIComponent(name);
-          logger(`Scanning IDB: ${name}`);
+        if (!aborted && categoryDecision !== DECISION.SKIP) {
+          status.category = "OPFS";
+          const root = await navigator.storage.getDirectory();
+          const trustAll = categoryDecision === DECISION.TRUST;
 
-          const dbForSchema = await new Promise((res, rej) => {
-            const r = indexedDB.open(name);
-            r.onsuccess = () => res(r.result);
-            r.onerror = () => rej(r.error);
-            r.onblocked = () => rej(new Error("IndexedDB open was blocked."));
-          });
+          async function walkOpfs(dir, pathArray, inherited) {
+            for await (const entry of dir.values()) {
+              if (aborted) return;
 
-          const storeNames = Array.from(dbForSchema.objectStoreNames);
-          const stores = [];
-          if (storeNames.length > 0) {
-            const tx = dbForSchema.transaction(storeNames, "readonly");
-            for (const sName of storeNames) {
-              const s = tx.objectStore(sName);
-              stores.push({
-                name: sName,
-                keyPath: s.keyPath,
-                autoIncrement: s.autoIncrement,
-                indexes: Array.from(s.indexNames).map((i) => {
-                  const idx = s.index(i);
-                  return {
-                    name: idx.name,
-                    keyPath: idx.keyPath,
-                    unique: idx.unique,
-                    multiEntry: idx.multiEntry,
-                  };
-                }),
-              });
+              const currentPath = [...pathArray, entry.name];
+              const pathStr = currentPath.join("/");
+              let decision = inherited;
+
+              status.detail = pathStr;
+
+              if (!inherited) {
+                if (useOnVisit) {
+                  let raw = getDecision(TYPE.OPFS, currentPath, {
+                    kind: entry.kind,
+                    handle: entry,
+                  });
+                  if (raw && typeof raw.then === "function") raw = await raw;
+                  decision = raw;
+
+                  if (decision === DECISION.ABORT) {
+                    aborted = true;
+                    return;
+                  }
+                  if (decision === DECISION.SKIP) continue;
+                } else {
+                  if (!checkSimpleFilter("opfs", pathStr, opts)) continue;
+                  decision = DECISION.TRUST;
+                }
+              }
+
+              const trustChildren = decision === DECISION.TRUST;
+
+              if (entry.kind === "file") {
+                await tryGraceful(async () => {
+                  const f = await entry.getFile();
+                  await tar.writeStream(`opfs/${pathStr}`, f.size, f.stream());
+                }, `OPFS file ${pathStr}`);
+              } else {
+                await tar.writeDir(`opfs/${pathStr}`);
+                await walkOpfs(
+                  entry,
+                  currentPath,
+                  trustChildren ? DECISION.TRUST : false,
+                );
+              }
+
+              const p = yielder();
+              if (p) await p;
             }
           }
-          dbForSchema.close(); // Close immediately after schema read
 
-          await tar.writeEntry(
-            `data/idb/${safeName}/schema.cbor`,
-            CBOR.encode({ name, version, stores }),
-          );
+          await walkOpfs(root, [], trustAll ? DECISION.TRUST : false);
+        }
+      }
 
-          for (const sName of storeNames) {
-            logger(`Archiving IDB: ${name}/${sName}`);
+      // IndexedDB
+      if (!aborted && opts.idb && window.indexedDB && CBOR) {
+        let categoryDecision = getDecision(TYPE.IDB, undefined, undefined);
+        if (categoryDecision && typeof categoryDecision.then === "function")
+          categoryDecision = await categoryDecision;
 
-            let lastKey = null;
-            let chunkId = 0;
-            let hasMore = true;
+        if (categoryDecision === DECISION.ABORT) aborted = true;
 
-            while (hasMore) {
-              const batchData = await new Promise((resolve, reject) => {
-                const r = indexedDB.open(name);
-                r.onsuccess = (ev) => {
-                  const db = ev.target.result;
-                  try {
-                    const tx = db.transaction(sName, "readonly");
-                    const store = tx.objectStore(sName);
-                    const range = lastKey
-                      ? IDBKeyRange.lowerBound(lastKey, true)
-                      : null;
-                    const cursorReq = store.openCursor(range);
+        if (!aborted && categoryDecision !== DECISION.SKIP) {
+          status.category = "IndexedDB";
+          const trustAllDbs = categoryDecision === DECISION.TRUST;
+          const dbs = await window.indexedDB.databases();
 
-                    const batch = [];
-                    const BATCH_LIMIT = 200; // Smaller batches prevent locking UI during synchronous fetch
+          for (const { name, version } of dbs) {
+            if (aborted) break;
 
-                    cursorReq.onsuccess = (e) => {
-                      const cursor = e.target.result;
-                      if (cursor && batch.length < BATCH_LIMIT) {
-                        batch.push({ k: cursor.key, v: cursor.value });
-                        lastKey = cursor.key;
-                        cursor.continue();
-                      } else {
-                        // Batch full or no more items
-                        db.close();
-                        resolve({
-                          items: batch,
-                          done: !cursor,
-                        });
-                      }
-                    };
-                    cursorReq.onerror = (e) => {
-                      db.close();
-                      reject(e);
-                    };
-                  } catch (err) {
-                    db.close();
-                    reject(err);
-                  }
+            status.detail = name;
+            const safeName = encodeURIComponent(name);
+
+            const db = await tryGraceful(async () => {
+              return await new Promise((resolve, reject) => {
+                const req = indexedDB.open(name);
+                const timeout = setTimeout(
+                  () => reject(new Error(`Database ${name} timed out`)),
+                  5000,
+                );
+                req.onblocked = () => {
+                  clearTimeout(timeout);
+                  reject(new Error(`Database ${name} blocked`));
                 };
-                r.onerror = (e) => reject(e);
+                req.onsuccess = () => {
+                  clearTimeout(timeout);
+                  resolve(req.result);
+                };
+                req.onerror = () => {
+                  clearTimeout(timeout);
+                  reject(req.error);
+                };
               });
+            }, `Opening IDB ${name}`);
 
-              hasMore = !batchData.done;
+            if (!db) continue;
 
-              if (batchData.items.length > 0) {
-                const finalBatch = [];
-                for (const item of batchData.items) {
-                  const blobsInBatch = [];
-                  const encVal = prepForCBOR(item.v, blobsInBatch);
-                  finalBatch.push({ k: item.k, v: encVal });
+            let dbDecision = trustAllDbs ? DECISION.TRUST : DECISION.PROCESS;
 
-                  for (const b of blobsInBatch) {
-                    await tar.writeStream(
-                      `data/blobs/${b.uuid}`,
-                      b.blob.size,
-                      b.blob.stream(),
-                    );
+            if (!trustAllDbs) {
+              if (useOnVisit) {
+                let raw = getDecision(TYPE.IDB, [name], { database: db });
+                if (raw && typeof raw.then === "function") raw = await raw;
+                dbDecision = raw;
+
+                if (dbDecision === DECISION.ABORT) {
+                  aborted = true;
+                  db.close();
+                  break;
+                }
+                if (dbDecision === DECISION.SKIP) {
+                  db.close();
+                  continue;
+                }
+              } else {
+                if (!checkSimpleFilter("idb", name, opts)) {
+                  db.close();
+                  continue;
+                }
+              }
+            }
+
+            const trustAllStores = dbDecision === DECISION.TRUST;
+
+            try {
+              const storeNames = Array.from(db.objectStoreNames);
+
+              if (storeNames.length === 0) {
+                await tar.writeEntry(
+                  `data/idb/${safeName}/schema.cbor`,
+                  CBOR.encode({ name, version, stores: [] }),
+                );
+                continue;
+              }
+
+              const stores = [];
+              const tx = db.transaction(storeNames, "readonly");
+
+              for (const sName of storeNames) {
+                const s = tx.objectStore(sName);
+                stores.push({
+                  name: sName,
+                  keyPath: s.keyPath,
+                  autoIncrement: s.autoIncrement,
+                  indexes: Array.from(s.indexNames).map((i) => {
+                    const idx = s.index(i);
+                    return {
+                      name: idx.name,
+                      keyPath: idx.keyPath,
+                      unique: idx.unique,
+                      multiEntry: idx.multiEntry,
+                    };
+                  }),
+                });
+              }
+
+              await tar.writeEntry(
+                `data/idb/${safeName}/schema.cbor`,
+                CBOR.encode({ name, version, stores }),
+              );
+
+              for (const sName of storeNames) {
+                if (aborted) break;
+
+                let storeDecision = trustAllStores
+                  ? DECISION.TRUST
+                  : DECISION.PROCESS;
+
+                if (!trustAllStores) {
+                  if (useOnVisit) {
+                    let raw = getDecision(TYPE.IDB, [name, sName], {
+                      database: db,
+                    });
+                    if (raw && typeof raw.then === "function") raw = await raw;
+                    storeDecision = raw;
+
+                    if (storeDecision === DECISION.ABORT) {
+                      aborted = true;
+                      break;
+                    }
+                    if (storeDecision === DECISION.SKIP) continue;
+                  } else {
+                    if (!checkSimpleFilter("idb", `${name}/${sName}`, opts))
+                      continue;
                   }
                 }
 
-                await tar.writeEntry(
-                  `data/idb/${safeName}/${encodeURIComponent(sName)}/${chunkId++}.cbor`,
-                  CBOR.encode(finalBatch),
-                );
+                status.detail = `${name} / ${sName}`;
 
-                const p = yielder();
-                if (p) await p;
+                let lastKey = null;
+                let chunkId = 0;
+                let hasMore = true;
+
+                while (hasMore && !aborted) {
+                  const batch = await tryGraceful(async () => {
+                    const batchSizeLimit = 100;
+                    return await new Promise((resolve, reject) => {
+                      const innerTx = db.transaction(sName, "readonly");
+                      const store = innerTx.objectStore(sName);
+                      const range =
+                        lastKey !== null
+                          ? IDBKeyRange.lowerBound(lastKey, true)
+                          : null;
+                      const request = store.openCursor(range);
+                      const keys = [];
+                      const values = [];
+
+                      request.onsuccess = (e) => {
+                        const cursor = e.target.result;
+                        if (cursor && keys.length < batchSizeLimit) {
+                          keys.push(cursor.key);
+                          values.push(cursor.value);
+                          lastKey = cursor.key;
+                          cursor.continue();
+                        } else {
+                          resolve({ keys, values, done: !cursor });
+                        }
+                      };
+                      request.onerror = () => reject(request.error);
+                    });
+                  }, `Reading IDB ${name}/${sName}`);
+
+                  if (!batch) break;
+                  hasMore = !batch.done;
+
+                  if (batch.keys.length > 0) {
+                    const processedValues = [];
+                    for (let i = 0; i < batch.values.length; i++) {
+                      const blobsInItem = [];
+                      const cleanValue = prepForCBOR(
+                        batch.values[i],
+                        blobsInItem,
+                      );
+                      processedValues.push(cleanValue);
+                      for (const b of blobsInItem) {
+                        await tar.writeStream(
+                          `data/blobs/${b.uuid}`,
+                          b.blob.size,
+                          b.blob.stream(),
+                        );
+                      }
+                    }
+
+                    await tar.writeEntry(
+                      `data/idb/${safeName}/${encodeURIComponent(sName)}/${chunkId++}.cbor`,
+                      CBOR.encode([batch.keys, processedValues]),
+                    );
+                    const p = yielder();
+                    if (p) await p;
+                  }
+                }
               }
+            } finally {
+              db.close();
             }
           }
         }
       }
 
-      if (opts.cache && window.caches && CBOR) {
-        for (const cacheName of await caches.keys()) {
-          if (!isAllowed("cache", cacheName, opts)) continue;
-          logger(`Archiving Cache: ${cacheName}`);
-          const p = yielder();
-          if (p) await p;
-          const cache = await caches.open(cacheName);
-          for (const req of await cache.keys()) {
-            const res = await cache.match(req);
-            if (!res) continue;
-            const blob = await res.blob();
-            const safeHash = btoa(req.url).slice(0, 50).replace(/\//g, "_");
-            await tar.writeEntry(
-              `data/cache/${encodeURIComponent(cacheName)}/${safeHash}.cbor`,
-              CBOR.encode({
-                meta: {
-                  url: req.url,
-                  status: res.status,
-                  headers: Object.fromEntries(res.headers),
-                  type: blob.type,
-                },
-                data: new Uint8Array(await blob.arrayBuffer()),
-              }),
-            );
+      // localStorage
+      if (!aborted && opts.localStorage) {
+        let categoryDecision = getDecision(TYPE.LS, undefined, undefined);
+        if (categoryDecision && typeof categoryDecision.then === "function")
+          categoryDecision = await categoryDecision;
+
+        if (categoryDecision === DECISION.ABORT) aborted = true;
+
+        if (!aborted && categoryDecision !== DECISION.SKIP) {
+          status.category = "Storage";
+          status.detail = "Local Storage";
+          const d = {};
+          const trustAll = categoryDecision === DECISION.TRUST;
+
+          for (let i = 0; i < localStorage.length && !aborted; i++) {
+            const k = localStorage.key(i);
+            status.detail = `localStorage: ${k}`;
+
+            let shouldInclude = trustAll;
+
+            if (!shouldInclude) {
+              if (useOnVisit) {
+                let keyDecision = getDecision(TYPE.LS, [k], {
+                  value: localStorage.getItem(k),
+                });
+                if (keyDecision && typeof keyDecision.then === "function")
+                  keyDecision = await keyDecision;
+
+                if (keyDecision === DECISION.ABORT) {
+                  aborted = true;
+                  break;
+                }
+                shouldInclude = keyDecision !== DECISION.SKIP;
+              } else {
+                shouldInclude = checkSimpleFilter("localStorage", k, opts);
+              }
+            }
+
+            if (shouldInclude) {
+              d[k] = localStorage.getItem(k);
+            }
+          }
+
+          if (!aborted && Object.keys(d).length > 0) {
+            await tar.writeEntry("data/ls.json", JSON.stringify(d));
           }
         }
       }
 
-      if (opts.opfs && navigator.storage) {
-        const root = await navigator.storage.getDirectory();
-        async function walk(dir, pStr) {
-          for await (const entry of dir.values()) {
+      // sessionStorage
+      if (!aborted && opts.session) {
+        let categoryDecision = getDecision(TYPE.SS, undefined, undefined);
+        if (categoryDecision && typeof categoryDecision.then === "function")
+          categoryDecision = await categoryDecision;
+
+        if (categoryDecision === DECISION.ABORT) aborted = true;
+
+        if (!aborted && categoryDecision !== DECISION.SKIP) {
+          status.category = "Storage";
+          status.detail = "Session Storage";
+          const d = {};
+          const trustAll = categoryDecision === DECISION.TRUST;
+
+          for (let i = 0; i < sessionStorage.length && !aborted; i++) {
+            const k = sessionStorage.key(i);
+            status.detail = `sessionStorage: ${k}`;
+
+            let shouldInclude = trustAll;
+
+            if (!shouldInclude) {
+              if (useOnVisit) {
+                let keyDecision = getDecision(TYPE.SS, [k], {
+                  value: sessionStorage.getItem(k),
+                });
+                if (keyDecision && typeof keyDecision.then === "function")
+                  keyDecision = await keyDecision;
+
+                if (keyDecision === DECISION.ABORT) {
+                  aborted = true;
+                  break;
+                }
+                shouldInclude = keyDecision !== DECISION.SKIP;
+              } else {
+                shouldInclude = checkSimpleFilter("session", k, opts);
+              }
+            }
+
+            if (shouldInclude) {
+              d[k] = sessionStorage.getItem(k);
+            }
+          }
+
+          if (!aborted && Object.keys(d).length > 0) {
+            await tar.writeEntry("data/ss.json", JSON.stringify(d));
+          }
+        }
+      }
+
+      // Cookies
+      if (!aborted && opts.cookies) {
+        let categoryDecision = getDecision(TYPE.COOKIE, undefined, undefined);
+        if (categoryDecision && typeof categoryDecision.then === "function")
+          categoryDecision = await categoryDecision;
+
+        if (categoryDecision === DECISION.ABORT) aborted = true;
+
+        if (!aborted && categoryDecision !== DECISION.SKIP) {
+          status.category = "Storage";
+          status.detail = "Cookies";
+          const c = {};
+          const trustAll = categoryDecision === DECISION.TRUST;
+
+          const cookiePairs = document.cookie
+            .split(";")
+            .map((s) => s.trim())
+            .filter(Boolean);
+
+          for (const pair of cookiePairs) {
+            if (aborted) break;
+
+            const eqIndex = pair.indexOf("=");
+            const key =
+              eqIndex > -1 ? pair.slice(0, eqIndex).trim() : pair.trim();
+            const val = eqIndex > -1 ? pair.slice(eqIndex + 1).trim() : "";
+
+            if (!key) continue;
+
+            status.detail = `cookie: ${key}`;
+
+            let shouldInclude = trustAll;
+
+            if (!shouldInclude) {
+              if (useOnVisit) {
+                let keyDecision = getDecision(TYPE.COOKIE, [key], {
+                  value: val,
+                });
+                if (keyDecision && typeof keyDecision.then === "function")
+                  keyDecision = await keyDecision;
+
+                if (keyDecision === DECISION.ABORT) {
+                  aborted = true;
+                  break;
+                }
+                shouldInclude = keyDecision !== DECISION.SKIP;
+              } else {
+                shouldInclude = checkSimpleFilter("cookies", key, opts);
+              }
+            }
+
+            if (shouldInclude) {
+              c[key] = val;
+            }
+          }
+
+          if (!aborted && Object.keys(c).length > 0) {
+            await tar.writeEntry("data/cookies.json", JSON.stringify(c));
+          }
+        }
+      }
+
+      // Cache storage
+      if (!aborted && opts.cache && window.caches && CBOR) {
+        let categoryDecision = getDecision(TYPE.CACHE, undefined, undefined);
+        if (categoryDecision && typeof categoryDecision.then === "function")
+          categoryDecision = await categoryDecision;
+
+        if (categoryDecision === DECISION.ABORT) aborted = true;
+
+        if (!aborted && categoryDecision !== DECISION.SKIP) {
+          status.category = "Cache";
+          const cacheNames = await caches.keys();
+          const trustAll = categoryDecision === DECISION.TRUST;
+
+          for (const cacheName of cacheNames) {
+            if (aborted) break;
+
+            let shouldProcess = trustAll;
+
+            if (!shouldProcess) {
+              if (useOnVisit) {
+                let cacheDecision = getDecision(TYPE.CACHE, [cacheName], null);
+                if (cacheDecision && typeof cacheDecision.then === "function")
+                  cacheDecision = await cacheDecision;
+
+                if (cacheDecision === DECISION.ABORT) {
+                  aborted = true;
+                  break;
+                }
+                shouldProcess = cacheDecision !== DECISION.SKIP;
+              } else {
+                shouldProcess = checkSimpleFilter("cache", cacheName, opts);
+              }
+            }
+
+            if (!shouldProcess) continue;
+
+            status.detail = cacheName;
             const p = yielder();
             if (p) await p;
-            const fp = pStr ? `${pStr}/${entry.name}` : entry.name;
-            if (!isAllowed("opfs", fp, opts)) continue;
-            if (entry.kind === "file") {
-              const f = await entry.getFile();
-              await tar.writeStream(`opfs/${fp}`, f.size, f.stream());
-            } else await walk(entry, fp);
+
+            await tryGraceful(async () => {
+              const cache = await caches.open(cacheName);
+              for (const req of await cache.keys()) {
+                const res = await cache.match(req);
+                if (!res) continue;
+                const blob = await res.blob();
+                const safeHash = btoa(req.url).slice(0, 50).replace(/\//g, "_");
+                await tar.writeEntry(
+                  `data/cache/${encodeURIComponent(cacheName)}/${safeHash}.cbor`,
+                  CBOR.encode({
+                    meta: {
+                      url: req.url,
+                      status: res.status,
+                      headers: Object.fromEntries(res.headers),
+                      type: blob.type,
+                    },
+                    data: new Uint8Array(await blob.arrayBuffer()),
+                  }),
+                );
+              }
+            }, `Cache ${cacheName}`);
           }
         }
-        await walk(root, "");
       }
 
-      await tar.close(); // Closes Gzip input
+      status.category = "Finishing";
+      status.detail = "compressing...";
+      await tar.close();
       await exportFinishedPromise;
+
       if (chunks.length > 0) {
         downloadUrl = URL.createObjectURL(
           new Blob(chunks, { type: "application/octet-stream" }),
@@ -817,45 +1195,131 @@
       }
 
       if (downloadUrl) {
-        const a = document.createElement("a");
-        a.href = downloadUrl;
-        a.download = opts.password
-          ? `${opts.fileName}.enc`
-          : `${opts.fileName}.tar.gz`;
-        a.click();
-        setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
+        if (opts.download !== false) {
+          const a = document.createElement("a");
+          a.href = downloadUrl;
+          a.download = opts.password
+            ? `${opts.fileName}.enc`
+            : `${opts.fileName}.tar.gz`;
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
+        }
+        if (opts.onsuccess) opts.onsuccess(downloadUrl);
+      } else if (!opts.download && opts.onsuccess) {
+        opts.onsuccess(null);
       }
-      reportProgress();
+
       logger("Export complete!");
     } catch (e) {
-      logger("Export error: " + e.message);
-      console.error(e);
       try {
-        await targetWritable.abort(e);
+        await outputStream.abort(e).catch(() => {});
       } catch (z) {}
+      if (opts.onerror) opts.onerror(e);
+      else throw e;
     }
   }
 
-  async function importData(arg1, arg2 = {}) {
+  async function importData(config = {}) {
     const CBOR = window.CBOR;
-    let config = arg2;
-    let sourceInput = arg1;
 
-    if (
-      arg1 &&
-      typeof arg1 === "object" &&
-      !arg1.stream &&
-      !arg1.arrayBuffer &&
-      !arg1.slice &&
-      (arg1.source || arg1.include || arg1.exclude)
-    ) {
-      config = arg1;
-      sourceInput = config.source;
+    const opts = {
+      opfs: true,
+      localStorage: true,
+      session: true,
+      cookies: true,
+      idb: true,
+      cache: true,
+      logSpeed: 100,
+      graceful: false,
+      ...config,
+    };
+
+    const sourceInput = opts.source;
+    if (!sourceInput) {
+      throw new Error(
+        "No source provided. Pass a URL, Blob, or File via the 'source' property.",
+      );
     }
 
-    const opts = { ...config };
-    const logger = opts.logger || console.log;
-    const yielder = createYielder(opts.logSpeed || 100);
+    const logger = opts.logger || (() => {});
+    const yielder = createYielder(opts.logSpeed);
+    const graceful = opts.graceful;
+    const useOnVisit = typeof opts.onVisit === "function";
+    const onVisit = opts.onVisit;
+
+    let aborted = false;
+    const categoryDecisions = {};
+    const trustedPaths = {};
+
+    function getDecision(type, path, meta) {
+      if (!useOnVisit) return DECISION.TRUST;
+      return onVisit(type, path, meta);
+    }
+
+    async function tryGraceful(fn, context) {
+      try {
+        return await fn();
+      } catch (e) {
+        if (graceful) {
+          if (opts.onerror) opts.onerror(e);
+          logger(`Warning: ${context} - ${e.message}`);
+          return null;
+        }
+        throw e;
+      }
+    }
+
+    async function shouldProcess(type, pathArray, pathStr, categoryKey) {
+      if (aborted) return false;
+
+      if (categoryDecisions[categoryKey] === undefined) {
+        if (useOnVisit) {
+          let decision = getDecision(type, undefined, undefined);
+          if (decision && typeof decision.then === "function")
+            decision = await decision;
+          categoryDecisions[categoryKey] = decision;
+
+          if (categoryDecisions[categoryKey] === DECISION.ABORT) {
+            aborted = true;
+            return false;
+          }
+        } else {
+          categoryDecisions[categoryKey] = DECISION.TRUST;
+        }
+      }
+
+      if (categoryDecisions[categoryKey] === DECISION.SKIP) return false;
+      if (categoryDecisions[categoryKey] === DECISION.TRUST) return true;
+
+      if (useOnVisit && pathArray) {
+        if (!trustedPaths[categoryKey]) trustedPaths[categoryKey] = new Set();
+
+        for (let i = 1; i <= pathArray.length; i++) {
+          const parentKey = pathArray.slice(0, i).join("/");
+          if (trustedPaths[categoryKey].has(parentKey)) return true;
+        }
+
+        let decision = getDecision(type, pathArray, null);
+        if (decision && typeof decision.then === "function")
+          decision = await decision;
+
+        if (decision === DECISION.ABORT) {
+          aborted = true;
+          return false;
+        }
+        if (decision === DECISION.SKIP) return false;
+        if (decision === DECISION.TRUST) {
+          trustedPaths[categoryKey].add(pathArray.join("/"));
+        }
+        return true;
+      } else if (!useOnVisit) {
+        return checkSimpleFilter(categoryKey, pathStr, opts);
+      }
+
+      return true;
+    }
+
+    let currentContext = { category: "Init", detail: "..." };
 
     try {
       let rawStream;
@@ -951,39 +1415,47 @@
         while (n > 0) {
           if (streamBuffer.totalSize === 0 && !done) await ensure(1);
           if (streamBuffer.totalSize === 0) break;
-          const avail = streamBuffer.totalSize;
-          const toSkip = Math.min(avail, n);
+          const toSkip = Math.min(streamBuffer.totalSize, n);
           streamBuffer.read(toSkip);
           n -= toSkip;
         }
       }
 
       async function streamToWriter(writer, size) {
-        let remaining = size;
-        while (remaining > 0) {
-          const p = yielder();
-          if (p) await p;
-          if (streamBuffer.totalSize > 0) {
-            const chunk = streamBuffer.read(
-              Math.min(remaining, streamBuffer.totalSize),
-            );
-            await writer.write(chunk);
-            remaining -= chunk.byteLength;
-          } else {
-            const { value, done: d } = await reader.read();
-            if (d) throw new Error("Unexpected EOF");
-            totalRead += value.byteLength;
-            if (value.byteLength <= remaining) {
-              await writer.write(value);
-              remaining -= value.byteLength;
+        try {
+          let remaining = size;
+          while (remaining > 0) {
+            const p = yielder();
+            if (p) {
+              const mb = (totalRead / 1048576).toFixed(2);
+              logger(
+                `Importing ${currentContext.category}: ${mb} MB (${currentContext.detail})`,
+              );
+              await p;
+            }
+            if (streamBuffer.totalSize > 0) {
+              let chunk = streamBuffer.read(
+                Math.min(remaining, streamBuffer.totalSize),
+              );
+              await writer.write(chunk);
+              remaining -= chunk.byteLength;
             } else {
-              await writer.write(value.subarray(0, remaining));
-              streamBuffer.push(value.subarray(remaining));
-              remaining = 0;
+              let { value, done: d } = await reader.read();
+              if (d) throw new Error("Unexpected EOF");
+              totalRead += value.byteLength;
+              if (value.byteLength <= remaining) {
+                await writer.write(value);
+                remaining -= value.byteLength;
+              } else {
+                await writer.write(value.subarray(0, remaining));
+                streamBuffer.push(value.subarray(remaining));
+                remaining = 0;
+              }
             }
           }
+        } finally {
+          await writer.close();
         }
-        await writer.close();
       }
 
       const rootOpfs = await navigator.storage.getDirectory();
@@ -993,9 +1465,11 @@
           create: true,
         });
       } catch (e) {}
-      const dbCache = {};
 
-      while (true) {
+      const dbCache = {};
+      const processedDbSchemas = new Set();
+
+      while (!aborted) {
         if (!(await ensure(512))) break;
         const header = streamBuffer.read(512);
         if (header.every((b) => b === 0)) break;
@@ -1005,10 +1479,34 @@
           .replace(/\0/g, "")
           .trim();
         if (prefix) name = `${prefix}/${name}`;
+
+        if (name.startsWith("data/idb/")) {
+          currentContext.category = "IndexedDB";
+          const parts = name.split("/");
+          currentContext.detail = parts[2]
+            ? decodeURIComponent(parts[2])
+            : "data";
+        } else if (name.startsWith("data/cache/")) {
+          currentContext.category = "Cache";
+          const parts = name.split("/");
+          currentContext.detail = parts[2]
+            ? decodeURIComponent(parts[2])
+            : "item";
+        } else if (name.startsWith("opfs/")) {
+          currentContext.category = "OPFS";
+          currentContext.detail = name.replace("opfs/", "");
+        } else if (name.startsWith("data/blobs/")) {
+          currentContext.category = "Blobs";
+          currentContext.detail = "restoring...";
+        } else {
+          currentContext.category = "Config";
+          currentContext.detail = name;
+        }
+
         const p = yielder();
         if (p) {
           logger(
-            `Importing (${(totalRead / 1048576).toFixed(2)} MB) ${name}...`,
+            `Importing ${currentContext.category}: ${(totalRead / 1048576).toFixed(2)} MB (${currentContext.detail})`,
           );
           await p;
         }
@@ -1023,11 +1521,22 @@
           if (name.startsWith("data/blobs/")) {
             const uuid = name.split("/").pop();
             if (tempBlobDir) {
-              const fh = await tempBlobDir.getFileHandle(uuid, {
-                create: true,
-              });
-              await streamToWriter(await fh.createWritable(), size);
-            } else await skip(size);
+              let dataConsumed = false;
+              await tryGraceful(async () => {
+                const fh = await tempBlobDir.getFileHandle(uuid, {
+                  create: true,
+                });
+                dataConsumed = true;
+                await streamToWriter(await fh.createWritable(), size);
+              }, `Blob ${uuid}`);
+              if (!dataConsumed) {
+                await skip(size);
+              }
+            } else {
+              await skip(size);
+            }
+            await skip(padding);
+            continue;
           } else {
             if (size === 0) {
               await skip(padding);
@@ -1037,18 +1546,120 @@
               throw new Error("Unexpected EOF for metadata");
             const d = streamBuffer.read(size);
 
-            if (name === "data/ls.json")
-              Object.assign(localStorage, JSON.parse(DEC.decode(d)));
-            else if (name === "data/ss.json") {
-              const s = JSON.parse(DEC.decode(d));
-              for (const k in s) sessionStorage.setItem(k, s[k]);
-            } else if (name === "data/cookies.json") {
-              const c = JSON.parse(DEC.decode(d));
-              for (const k in c)
-                document.cookie = `${k}=${c[k]}; path=/; max-age=31536000`;
-            } else if (name.startsWith("data/custom/") && opts.onCustomItem) {
+            // localStorage
+            if (name === "data/ls.json" && opts.localStorage !== false) {
+              if (await shouldProcess(TYPE.LS, null, null, "localStorage")) {
+                const data = JSON.parse(DEC.decode(d));
+                const trustAll =
+                  categoryDecisions["localStorage"] === DECISION.TRUST;
+
+                for (const k in data) {
+                  if (aborted) break;
+
+                  let shouldSet = trustAll;
+
+                  if (!shouldSet) {
+                    if (useOnVisit) {
+                      let keyDecision = getDecision(TYPE.LS, [k], {
+                        value: data[k],
+                      });
+                      if (keyDecision && typeof keyDecision.then === "function")
+                        keyDecision = await keyDecision;
+
+                      if (keyDecision === DECISION.ABORT) {
+                        aborted = true;
+                        break;
+                      }
+                      shouldSet = keyDecision !== DECISION.SKIP;
+                    } else {
+                      shouldSet = checkSimpleFilter("localStorage", k, opts);
+                    }
+                  }
+
+                  if (shouldSet) {
+                    localStorage.setItem(k, data[k]);
+                  }
+                }
+              }
+            }
+            // sessionStorage
+            else if (name === "data/ss.json" && opts.session !== false) {
+              if (await shouldProcess(TYPE.SS, null, null, "session")) {
+                const data = JSON.parse(DEC.decode(d));
+                const trustAll =
+                  categoryDecisions["session"] === DECISION.TRUST;
+
+                for (const k in data) {
+                  if (aborted) break;
+
+                  let shouldSet = trustAll;
+
+                  if (!shouldSet) {
+                    if (useOnVisit) {
+                      let keyDecision = getDecision(TYPE.SS, [k], {
+                        value: data[k],
+                      });
+                      if (keyDecision && typeof keyDecision.then === "function")
+                        keyDecision = await keyDecision;
+
+                      if (keyDecision === DECISION.ABORT) {
+                        aborted = true;
+                        break;
+                      }
+                      shouldSet = keyDecision !== DECISION.SKIP;
+                    } else {
+                      shouldSet = checkSimpleFilter("session", k, opts);
+                    }
+                  }
+
+                  if (shouldSet) {
+                    sessionStorage.setItem(k, data[k]);
+                  }
+                }
+              }
+            }
+            // Cookies
+            else if (name === "data/cookies.json" && opts.cookies !== false) {
+              if (await shouldProcess(TYPE.COOKIE, null, null, "cookies")) {
+                const c = JSON.parse(DEC.decode(d));
+                const trustAll =
+                  categoryDecisions["cookies"] === DECISION.TRUST;
+
+                for (const k in c) {
+                  if (aborted) break;
+
+                  let shouldSet = trustAll;
+
+                  if (!shouldSet) {
+                    if (useOnVisit) {
+                      let keyDecision = getDecision(TYPE.COOKIE, [k], {
+                        value: c[k],
+                      });
+                      if (keyDecision && typeof keyDecision.then === "function")
+                        keyDecision = await keyDecision;
+
+                      if (keyDecision === DECISION.ABORT) {
+                        aborted = true;
+                        break;
+                      }
+                      shouldSet = keyDecision !== DECISION.SKIP;
+                    } else {
+                      shouldSet = checkSimpleFilter("cookies", k, opts);
+                    }
+                  }
+
+                  if (shouldSet) {
+                    document.cookie = `${k}=${c[k]}; path=/; max-age=31536000`;
+                  }
+                }
+              }
+            }
+            // Custom items
+            else if (name.startsWith("data/custom/") && opts.onCustomItem) {
               await opts.onCustomItem(name.replace("data/custom/", ""), d);
-            } else if (
+            }
+            // IndexedDB
+            else if (
               name.startsWith("data/idb/") &&
               CBOR &&
               opts.idb !== false
@@ -1057,114 +1668,203 @@
               const dbName = decodeURIComponent(parts[2]);
 
               if (name.endsWith("schema.cbor")) {
+                if (!(await shouldProcess(TYPE.IDB, [dbName], dbName, "idb")))
+                  continue;
+
                 const schema = CBOR.decode(d);
+                processedDbSchemas.add(dbName);
+
                 if (dbCache[dbName]) {
                   dbCache[dbName].close();
                   delete dbCache[dbName];
                 }
-                await new Promise((r) => {
-                  const q = indexedDB.deleteDatabase(schema.name);
-                  q.onsuccess = r;
-                  q.onerror = r;
-                });
-                await new Promise((res, rej) => {
-                  const req = indexedDB.open(schema.name, schema.version);
-                  req.onupgradeneeded = (e) => {
-                    const db = e.target.result;
-                    schema.stores.forEach((s) => {
-                      if (!db.objectStoreNames.contains(s.name)) {
-                        const st = db.createObjectStore(s.name, {
-                          keyPath: s.keyPath,
-                          autoIncrement: s.autoIncrement,
-                        });
-                        s.indexes.forEach((i) =>
-                          st.createIndex(i.name, i.keyPath, {
-                            unique: i.unique,
-                            multiEntry: i.multiEntry,
-                          }),
-                        );
-                      }
-                    });
-                  };
-                  req.onsuccess = (e) => {
-                    e.target.result.close();
-                    res();
-                  };
-                  req.onerror = rej;
-                });
+
+                await tryGraceful(async () => {
+                  await new Promise((r) => {
+                    const q = indexedDB.deleteDatabase(schema.name);
+                    q.onsuccess = r;
+                    q.onerror = r;
+                  });
+                  await new Promise((res, rej) => {
+                    const req = indexedDB.open(schema.name, schema.version);
+                    req.onupgradeneeded = (e) => {
+                      const db = e.target.result;
+                      schema.stores.forEach((s) => {
+                        if (!db.objectStoreNames.contains(s.name)) {
+                          const st = db.createObjectStore(s.name, {
+                            keyPath: s.keyPath,
+                            autoIncrement: s.autoIncrement,
+                          });
+                          s.indexes.forEach((i) =>
+                            st.createIndex(i.name, i.keyPath, {
+                              unique: i.unique,
+                              multiEntry: i.multiEntry,
+                            }),
+                          );
+                        }
+                      });
+                    };
+                    req.onsuccess = (e) => {
+                      e.target.result.close();
+                      res();
+                    };
+                    req.onerror = rej;
+                  });
+                }, `IDB schema ${dbName}`);
               } else {
                 const storeName = decodeURIComponent(parts[3]);
-                const records = await restoreFromCBOR(
-                  CBOR.decode(d),
+
+                if (!processedDbSchemas.has(dbName)) continue;
+
+                if (
+                  !(await shouldProcess(
+                    TYPE.IDB,
+                    [dbName, storeName],
+                    `${dbName}/${storeName}`,
+                    "idb",
+                  ))
+                )
+                  continue;
+
+                const decoded = CBOR.decode(d);
+                const [keys, values] = await restoreFromCBOR(
+                  decoded,
                   tempBlobDir,
                 );
+
                 if (!dbCache[dbName]) {
-                  dbCache[dbName] = await new Promise((res, rej) => {
-                    const r = indexedDB.open(dbName);
-                    r.onsuccess = () => res(r.result);
-                    r.onerror = rej;
-                  });
+                  const db = await tryGraceful(async () => {
+                    return await new Promise((resolve, reject) => {
+                      const req = indexedDB.open(dbName);
+                      const timeout = setTimeout(
+                        () => reject(new Error(`Database ${dbName} timed out`)),
+                        5000,
+                      );
+                      req.onblocked = () => {
+                        clearTimeout(timeout);
+                        reject(new Error(`Database ${dbName} blocked`));
+                      };
+                      req.onsuccess = () => {
+                        clearTimeout(timeout);
+                        resolve(req.result);
+                      };
+                      req.onerror = () => {
+                        clearTimeout(timeout);
+                        reject(req.error);
+                      };
+                    });
+                  }, `Opening IDB ${dbName}`);
+
+                  if (!db) continue;
+                  dbCache[dbName] = db;
                 }
-                try {
+
+                await tryGraceful(async () => {
                   const tx = dbCache[dbName].transaction(
                     storeName,
                     "readwrite",
                   );
                   const st = tx.objectStore(storeName);
-                  await Promise.all(
-                    records.map(
-                      (r) =>
-                        new Promise((res) => {
-                          const q = st.put(r.v, st.keyPath ? undefined : r.k);
-                          q.onsuccess = res;
-                          q.onerror = res;
-                        }),
-                    ),
-                  );
-                } catch (e) {
-                  console.error(e);
-                  alert(
-                    "IDB importing error for DB " +
-                      dbName +
-                      "(perhaps close other tabs?): " +
-                      e,
-                  );
-                }
+                  for (let i = 0; i < keys.length; i++) {
+                    st.put(values[i], st.keyPath ? undefined : keys[i]);
+                  }
+                  await new Promise((res, rej) => {
+                    tx.oncomplete = res;
+                    tx.onerror = () => rej(tx.error);
+                    tx.onabort = () => rej(new Error("Transaction aborted"));
+                  });
+                }, `IDB ${dbName}/${storeName}`);
+              }
+            }
+            // Cache storage
+            else if (
+              name.startsWith("data/cache/") &&
+              CBOR &&
+              opts.cache !== false
+            ) {
+              const parts = name.split("/");
+              const cacheName = decodeURIComponent(parts[2]);
+
+              if (
+                await shouldProcess(TYPE.CACHE, [cacheName], cacheName, "cache")
+              ) {
+                await tryGraceful(async () => {
+                  const data = CBOR.decode(d);
+                  const cache = await caches.open(cacheName);
+                  const response = new Response(data.data, {
+                    status: data.meta.status,
+                    headers: data.meta.headers,
+                  });
+                  await cache.put(data.meta.url, response);
+                }, `Cache ${cacheName}`);
               }
             }
           }
         } else {
+          // OPFS files and directories
           if (opts.opfs !== false) {
-            const cleanName = name.startsWith("opfs/")
-              ? name.replace("opfs/", "")
-              : name;
-            const parts = cleanName.split("/").filter((p) => p.length);
+            const cleanName = name.startsWith("opfs/") ? name.slice(5) : name;
+            const isDirectory = cleanName.endsWith("/") || header[156] === 53;
+            const normalizedName = cleanName.replace(/\/$/, "");
+            const parts = normalizedName.split("/").filter((p) => p.length);
+
             if (parts.length > 0) {
-              const fname = parts.pop();
-              let dir = rootOpfs;
-              for (const p of parts)
-                dir = await dir.getDirectoryHandle(p, { create: true });
-              const fh = await dir.getFileHandle(fname, { create: true });
-              if (size > 0)
-                await streamToWriter(await fh.createWritable(), size);
-              else {
-                const w = await fh.createWritable();
-                await w.close();
+              const pathArray = [...parts];
+
+              if (
+                await shouldProcess(
+                  TYPE.OPFS,
+                  pathArray,
+                  normalizedName,
+                  "opfs",
+                )
+              ) {
+                await tryGraceful(async () => {
+                  let dir = rootOpfs;
+                  if (isDirectory) {
+                    for (const p of parts) {
+                      dir = await dir.getDirectoryHandle(p, { create: true });
+                    }
+                  } else {
+                    const fname = parts[parts.length - 1];
+                    const dirParts = parts.slice(0, -1);
+                    for (const p of dirParts) {
+                      dir = await dir.getDirectoryHandle(p, { create: true });
+                    }
+                    const fh = await dir.getFileHandle(fname, { create: true });
+                    if (size > 0) {
+                      await streamToWriter(await fh.createWritable(), size);
+                    } else {
+                      const w = await fh.createWritable();
+                      await w.close();
+                    }
+                  }
+                }, `OPFS ${normalizedName}`);
+              } else {
+                await skip(size);
               }
-            } else await skip(size);
-          } else await skip(size);
+            } else {
+              await skip(size);
+            }
+          } else {
+            await skip(size);
+          }
         }
         await skip(padding);
       }
 
       Object.values(dbCache).forEach((d) => d.close());
-      if (tempBlobDir)
+
+      if (tempBlobDir) {
         try {
           await rootOpfs.removeEntry(TEMP_BLOB_DIR, { recursive: true });
         } catch (e) {}
+      }
 
-      logger("Import complete!");
-      if (opts.onsuccess) opts.onsuccess();
+      if (!aborted) {
+        logger("Import complete!");
+        if (opts.onsuccess) opts.onsuccess();
+      }
     } catch (e) {
       logger("Error: " + e.message);
       if (opts.onerror) opts.onerror(e);
@@ -1172,5 +1872,5 @@
     }
   }
 
-  window.LittleExport = { importData, exportData, deriveKey };
+  window.LittleExport = { importData, exportData, deriveKey, TYPE, DECISION };
 })();

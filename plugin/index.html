@@ -212,7 +212,7 @@
                 } else {
                     log("Cache not found!")
                 }
-                var scriptURL = null
+                let scriptURL = null
                 navigator.serviceWorker.getRegistrations().then(async registrations => {
                     let count = 0
                     for (const registration of registrations) {

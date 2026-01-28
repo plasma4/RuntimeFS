@@ -1,6 +1,6 @@
 const APP_SHELL_FILES = ["./", "./index.html", "./main.min.js", "sw.min.js"]; // If you're using .php or some other configuration, make sure to change this!
 const NETWORK_ALLOWLIST_PREFIXES = []; // For custom bypassing of the virtual file system (not used by default)
-// SpiderMonkey check because Firefox has weird SW header issues. ?boot=1 is used to ensure the context is "clean" and controlled for Firefox because Firefox sometimes acts strangely with SWs. Use `typeof InternalError !== "undefined"` to enable with Firefox.
+// Old SpiderMonkey check, because Firefox previously had weird SW header issues. ?boot=1 is used to ensure the context is "clean" and controlled because Firefox acted strangely with SWs in older versions; use `typeof InternalError !== "undefined"` to re-enable with Firefox.
 let reloadOnRequest = false;
 
 let pendingNavData = null; // for next navigation request
@@ -277,7 +277,7 @@ self.addEventListener("activate", (e) => {
       registryCache = null;
       try {
         await getOpfsRoot();
-      } catch (err) {}
+      } catch (e) {}
       const allClients = await self.clients.matchAll({
         includeUncontrolled: true,
       });
@@ -434,7 +434,7 @@ self.addEventListener("fetch", (e) => {
           virtualReferrerPath = pathParts[0];
         }
       }
-    } catch (err) {}
+    } catch (e) {}
   }
 
   if (virtualReferrerPath && !url.pathname.startsWith(virtualPathPrefix)) {
@@ -634,6 +634,47 @@ async function handleEncryptedRequest(
   }
 }
 
+const TEXT_MIME_REGEX =
+  /^(text\/|application\/(javascript|json|xml|x-javascript|typescript|x-sh|x-httpd-php|ld\+json|manifest\+json|svg\+xml))/i;
+const TEXT_EXTENSIONS =
+  /\.(txt|html|htm|js|mjs|css|json|md|xml|svg|sh|php|py|rb|c|cpp|h|ts|sql|ini|yaml|yml)$/i;
+
+function isLikelyText(type, path) {
+  return TEXT_MIME_REGEX.test(type) || TEXT_EXTENSIONS.test(path);
+}
+
+function isActuallyTextSniff(buffer) {
+  const view = new Uint8Array(buffer.slice(0, 4096));
+  if (view.length === 0 || view.includes(0)) return true;
+
+  // Check for BOMs (UTF-8, UTF-16LE, UTF-16BE)
+  if (
+    (view[0] === 0xef && view[1] === 0xbb && view[2] === 0xbf) ||
+    (view[0] === 0xff && view[1] === 0xfe) ||
+    (view[0] === 0xfe && view[1] === 0xff)
+  ) {
+    return true;
+  }
+
+  try {
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    decoder.decode(view);
+    return true;
+  } catch (e) {
+    // If UTF-8 fails, check for legacy encodings (Latin-1)
+    let suspiciousBytes = 0;
+    for (let i = 0; i < view.length; i++) {
+      const byte = view[i];
+      // Check for common binary control characters (except TAB, LF, CR, etc.)
+      if (byte < 7 || (byte > 14 && byte < 32)) {
+        suspiciousBytes++;
+      }
+    }
+    // If more than 5% of the sample is "garbage" control chars, it's binary probably
+    return suspiciousBytes / view.length < 0.05;
+  }
+}
+
 async function generateResponseForVirtualFile(
   request,
   clientId,
@@ -658,6 +699,7 @@ async function generateResponseForVirtualFile(
     const registry = registryCache || {};
     const folderData = registry[folderName] || {};
 
+    // Here the boot-up logic happens if the flag is enabled
     if (
       reloadOnRequest &&
       mode === "navigate" &&
@@ -670,19 +712,17 @@ async function generateResponseForVirtualFile(
       );
     }
 
-    // Session managing
     const effectiveClientId = resultingClientId || clientId;
-    let session = clientSessionStore.get(effectiveClientId);
-    if (!session && clientId) session = clientSessionStore.get(clientId);
+    let session =
+      clientSessionStore.get(effectiveClientId) ||
+      (clientId ? clientSessionStore.get(clientId) : null);
 
     if (!session && pendingNavData && pendingNavData[folderName]) {
       session = pendingNavData[folderName];
     }
     if (session) {
       session.timestamp = Date.now();
-      if (effectiveClientId) {
-        clientSessionStore.set(effectiveClientId, session);
-      }
+      if (effectiveClientId) clientSessionStore.set(effectiveClientId, session);
     }
     session = session || {};
 
@@ -692,15 +732,14 @@ async function generateResponseForVirtualFile(
 
     if (folderData.encryptionType === "password") {
       if (!session.key) return new Response("Session locked", { status: 403 });
-      let compiledHeaders =
+      const compiledHeaders =
         session.compiledHeaders || parseCustomHeaders(folderData.headers);
-      const baseHeaders = {
-        "Content-Type": getMimeType(relativePath),
-        "Cache-Control": "no-store",
-        "Accept-Ranges": "bytes",
-      };
-      const finalHeaders = applyCustomHeaders(
-        baseHeaders,
+      const headers = applyCustomHeaders(
+        {
+          "Content-Type": getMimeType(relativePath),
+          "Cache-Control": "no-store",
+          "Accept-Ranges": "bytes",
+        },
         relativePath,
         compiledHeaders,
       );
@@ -711,11 +750,13 @@ async function generateResponseForVirtualFile(
         relativePath,
         session.key,
         request,
-        finalHeaders,
+        headers,
       );
     }
 
     let handle = await getCachedFileHandle(root, folderName, relativePath);
+
+    // Fallback to index.html for navigation requests (SPA)
     if (
       !handle &&
       (mode === "navigate" ||
@@ -741,20 +782,12 @@ async function generateResponseForVirtualFile(
     const contentType =
       file.type || getMimeType(relativePath) || "application/octet-stream";
 
-    let compiledHeaders =
+    const compiledHeaders =
       session.compiledHeaders || parseCustomHeaders(folderData.headers);
-    let compiledRules = session.compiledRules || compileRules(folderData.rules);
-    const isText =
-      /^(text\/|application\/(javascript|json|xml|x-javascript|typescript))/.test(
-        contentType,
-      );
-    const shouldApplyRegex =
-      compiledRules &&
-      compiledRules.length > 0 &&
-      isText &&
-      totalSize < MAX_REGEX_SIZE;
+    const compiledRules =
+      session.compiledRules || compileRules(folderData.rules);
 
-    const finalHeaders = applyCustomHeaders(
+    let finalHeaders = applyCustomHeaders(
       {
         "Content-Type": contentType,
         "Cache-Control": "no-store",
@@ -764,76 +797,69 @@ async function generateResponseForVirtualFile(
       compiledHeaders,
     );
 
-    if (shouldApplyRegex) {
-      let buffer = await file.arrayBuffer();
-      // Apply the regex
-      buffer = applyRegexRules(
-        relativePath,
-        buffer,
-        contentType,
-        compiledRules,
-      );
+    let responseBody = file; // Default is the streaming File object (Zero RAM)
+    let processedSize = totalSize;
 
-      const processedSize = buffer.byteLength;
-      finalHeaders["Content-Length"] = processedSize.toString();
+    if (
+      compiledRules &&
+      compiledRules.length > 0 &&
+      totalSize > 0 &&
+      totalSize < MAX_REGEX_SIZE
+    ) {
+      if (isLikelyText(contentType, relativePath)) {
+        // Only read the first 4KB to check if it's actually text
+        const probeBuffer = await file.slice(0, 4096).arrayBuffer();
 
-      // Range request the new content (in-memory)
-      const rangeHeader = request.headers.get("Range");
-      if (rangeHeader) {
-        const parts = rangeHeader.replace(/bytes=/, "").split("-");
-        let start = parseInt(parts[0], 10) || 0;
-        let end = parts[1] ? parseInt(parts[1], 10) : processedSize - 1;
+        if (isActuallyTextSniff(probeBuffer)) {
+          // It's verified text. Now we commit to loading it into RAM.
+          const fullBuffer = await file.arrayBuffer();
+          const processedBuffer = applyRegexRules(
+            relativePath,
+            fullBuffer,
+            contentType,
+            compiledRules,
+          );
 
-        if (start >= processedSize) {
-          return new Response(null, {
-            status: 416,
-            headers: { "Content-Range": `bytes */${processedSize}` },
-          });
+          if (processedBuffer !== fullBuffer) {
+            responseBody = processedBuffer; // Serve manipulated version
+            processedSize = processedBuffer.byteLength;
+          } else {
+            // Rules existed but didn't match.
+            // We use the fullBuffer since it's already in RAM, but processedSize remains totalSize.
+            responseBody = fullBuffer;
+          }
         }
-
-        end = Math.min(end, processedSize - 1);
-        finalHeaders["Content-Range"] =
-          `bytes ${start}-${end}/${processedSize}`;
-        finalHeaders["Content-Length"] = (end - start + 1).toString();
-
-        return new Response(buffer.slice(start, end + 1), {
-          status: 206,
-          headers: finalHeaders,
-        });
       }
-
-      return new Response(buffer, { headers: finalHeaders });
     }
-
-    if (totalSize === 0)
-      return new Response(new Uint8Array(0), { headers: finalHeaders });
 
     const rangeHeader = request.headers.get("Range");
     if (rangeHeader) {
       const parts = rangeHeader.replace(/bytes=/, "").split("-");
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : totalSize - 1;
+      let start = parseInt(parts[0], 10) || 0;
+      let end = parts[1] ? parseInt(parts[1], 10) : processedSize - 1;
 
-      if (start >= totalSize) {
+      if (start >= processedSize) {
         return new Response(null, {
           status: 416,
-          headers: { "Content-Range": `bytes */${totalSize}` },
+          headers: { "Content-Range": `bytes */${processedSize}` },
         });
       }
 
-      finalHeaders["Content-Range"] = `bytes ${start}-${end}/${totalSize}`;
-      finalHeaders["Content-Length"] = end - start + 1;
+      end = Math.min(end, processedSize - 1);
+      const chunkLength = end - start + 1;
 
-      return new Response(file.slice(start, end + 1), {
-        status: 206,
-        headers: finalHeaders,
-      });
+      finalHeaders["Content-Range"] = `bytes ${start}-${end}/${processedSize}`;
+      finalHeaders["Content-Length"] = chunkLength.toString();
+
+      // Slicing works the same for File (streaming) or ArrayBuffer (memory)
+      const rangeSlice = responseBody.slice(start, end + 1);
+      return new Response(rangeSlice, { status: 206, headers: finalHeaders });
     }
 
-    finalHeaders["Content-Length"] = totalSize;
-    return new Response(file, { headers: finalHeaders });
+    finalHeaders["Content-Length"] = processedSize.toString();
+    return new Response(responseBody, { headers: finalHeaders });
   } catch (e) {
-    console.error("SW error:", e);
+    console.error("SW fetch error:", e);
     return new Response("Internal server error", { status: 500 });
   }
 }

@@ -405,7 +405,7 @@ async function processFileListAndStore(name, srcHandle) {
     // Only construct string if necessary
     const p = checkYield(force);
     if (p) {
-      const mb = (bytesUploaded / 1048576).toFixed(2);
+      const mb = (bytesUploaded / 1e6).toFixed(2);
       await logProgress(
         `Uploading: ${mb} MB (${currentFile || "Scanning..."})`,
       );
@@ -497,8 +497,8 @@ async function processAndStoreFolderStreaming(name, srcHandle) {
   let bytesUploaded = 0;
 
   const updateUI = () => {
-    const uploadedMB = (bytesUploaded / 1048576).toFixed(1);
-    const totalFoundMB = (totalBytesDiscovered / 1048576).toFixed(1);
+    const uploadedMB = (bytesUploaded / 1e6).toFixed(2);
+    const totalFoundMB = (totalBytesDiscovered / 1e6).toFixed(2);
 
     let msg = "";
     if (!scanComplete) {
@@ -508,7 +508,7 @@ async function processAndStoreFolderStreaming(name, srcHandle) {
         totalBytesDiscovered > 0
           ? (bytesUploaded / totalBytesDiscovered) * 100
           : 0;
-      msg = `Uploading: ${pct.toFixed(1)}% (${uploadedMB}/${totalFoundMB} MB)`;
+      msg = `Uploading: ${pct.toFixed(2)}% (${uploadedMB}/${totalFoundMB} MB)`;
     }
     logProgress(msg);
   };
@@ -1062,7 +1062,7 @@ async function uploadAndEncryptWithPassword() {
       // Check yield first, then construct string
       const p = checkYield();
       if (p) {
-        const mb = (totalBytesProcessed / 1048576).toFixed(2);
+        const mb = (totalBytesProcessed / 1e6).toFixed(2);
         // Standardized: [Action] [Type]: [Size] ([Detail])
         await logProgress(`Encrypting Folder: ${mb} MB (${task.entryPath})`);
         await p;

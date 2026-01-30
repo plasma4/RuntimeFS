@@ -5,31 +5,32 @@
   let blobIdCounter = 0;
 
   function createYielder(threshold = 100) {
+    // Testing has shown that Chromium's performance.now() is worst-case slower than all other browsers (but can still be called millions of times per second). Date.now() Browsers like Firefox actually have performance.now() over 10x faster than Date.now(), upwards of hundreds of millions of checks per second. However, this shouldn't really matter too much here as yielding is not checked often enough for this to add up significantly.
     let lastYield = Date.now();
+    let inflight = null;
+
     const channel = new MessageChannel();
     const resolvers = [];
+    channel.port1.onmessage = () => resolvers.shift()?.();
 
-    channel.port1.onmessage = () => {
-      const res = resolvers.shift();
-      if (res) res();
-    };
+    async function doYield() {
+      if ("scheduler" in window && "yield" in scheduler) {
+        await scheduler.yield();
+      } else {
+        await new Promise((res) => {
+          resolvers.push(res);
+          channel.port2.postMessage(null);
+        });
+      }
+      lastYield = Date.now();
+      inflight = null;
+    }
 
     return function (force = false) {
       const now = Date.now();
-      if (force || now - lastYield > threshold) {
-        lastYield = now;
-        return (async () => {
-          if ("scheduler" in window && "yield" in scheduler) {
-            await scheduler.yield();
-          } else {
-            await new Promise((res) => {
-              resolvers.push(res);
-              channel.port2.postMessage(null);
-            });
-          }
-        })();
-      }
-      return null;
+      if (!force && now - lastYield <= threshold) return null;
+      if (!inflight) inflight = doYield();
+      return inflight;
     };
   }
 
@@ -263,6 +264,8 @@
       this.time = Math.floor(Date.now() / 1000);
       this.buffer = new Uint8Array(TAR_BUFFER_SIZE);
       this.bufferOffset = 0;
+      this.currentFileWritten = 0;
+      this.currentFileTotal = 0;
     }
 
     async writeEntry(path, data) {
@@ -275,12 +278,18 @@
 
     async writeStream(path, size, readableStream) {
       await this.write(createTarHeader(path, size, this.time));
+      this.currentFileTotal = size;
+      this.currentFileWritten = 0;
       const reader = readableStream.getReader();
       try {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
           await this.write(value);
+          this.currentFileWritten += value.byteLength;
+          if (this.onFileProgress) {
+            this.onFileProgress(this.currentFileWritten, this.currentFileTotal);
+          }
           const p = this.yielder();
           if (p) await p;
         }
@@ -603,7 +612,7 @@
       }
     }
 
-    const status = { category: "Init", detail: "preparing..." };
+    const status = { category: "", detail: "" };
 
     let outputStream,
       downloadUrl,
@@ -640,9 +649,18 @@
         outputBytesWritten += chunk.byteLength;
         const p = yielder();
         if (p) {
-          logger(
-            `Exporting ${status.category}: ${(outputBytesWritten / 1048576).toFixed(2)} MB (${status.detail})`,
-          );
+          if (status.category)
+            if (status.category === "Finishing") {
+              logger("Finishing...");
+            } else {
+              let msg = `Exporting ${status.category}: ${(outputBytesWritten / 1e6).toFixed(2)} MB`;
+              if (currentFileProgress.total > 1e6) {
+                msg += ` (${status.detail}: ${(currentFileProgress.written / 1e6).toFixed(1)}/${(currentFileProgress.total / 1e6).toFixed(1)} MB)`;
+              } else {
+                msg += ` (${status.detail})`;
+              }
+              logger(msg);
+            }
           await p;
         }
         controller.enqueue(chunk);
@@ -661,10 +679,15 @@
       );
     }
 
+    let currentFileProgress = { written: 0, total: 0 };
     const exportFinishedPromise = pipeline
       .pipeThrough(countingStream)
       .pipeTo(outputStream);
     const tar = new TarWriter(gzip.writable, yielder);
+    tar.onFileProgress = (written, total) => {
+      currentFileProgress.written = written;
+      currentFileProgress.total = total;
+    };
 
     try {
       // Custom items (always processed)
@@ -1184,7 +1207,6 @@
       }
 
       status.category = "Finishing";
-      status.detail = "compressing...";
       await tar.close();
       await exportFinishedPromise;
 
@@ -1234,7 +1256,7 @@
       ...config,
     };
 
-    const sourceInput = opts.source;
+    let sourceInput = opts.source;
     if (!sourceInput) {
       throw new Error(
         "No source provided. Pass a URL, Blob, or File via the 'source' property.",
@@ -1319,7 +1341,7 @@
       return true;
     }
 
-    let currentContext = { category: "Init", detail: "..." };
+    let status = { category: "", detail: "" };
 
     try {
       let rawStream;
@@ -1427,12 +1449,16 @@
           while (remaining > 0) {
             const p = yielder();
             if (p) {
-              const mb = (totalRead / 1048576).toFixed(2);
-              logger(
-                `Importing ${currentContext.category}: ${mb} MB (${currentContext.detail})`,
-              );
+              let msg = `Importing ${status.category}: ${(totalRead / 1e6).toFixed(2)} MB`;
+              if (size > 1e6) {
+                msg += ` (${status.detail}: ${(size - remaining / 1e6).toFixed(1)}/${(size / 1e6).toFixed(1)} MB)`;
+              } else {
+                msg += ` (${status.detail})`;
+              }
+              logger(msg);
               await p;
             }
+
             if (streamBuffer.totalSize > 0) {
               let chunk = streamBuffer.read(
                 Math.min(remaining, streamBuffer.totalSize),
@@ -1481,33 +1507,30 @@
         if (prefix) name = `${prefix}/${name}`;
 
         if (name.startsWith("data/idb/")) {
-          currentContext.category = "IndexedDB";
+          status.category = "IndexedDB";
           const parts = name.split("/");
-          currentContext.detail = parts[2]
-            ? decodeURIComponent(parts[2])
-            : "data";
+          status.detail = parts[2] ? decodeURIComponent(parts[2]) : "data";
         } else if (name.startsWith("data/cache/")) {
-          currentContext.category = "Cache";
+          status.category = "Cache";
           const parts = name.split("/");
-          currentContext.detail = parts[2]
-            ? decodeURIComponent(parts[2])
-            : "item";
+          status.detail = parts[2] ? decodeURIComponent(parts[2]) : "item";
         } else if (name.startsWith("opfs/")) {
-          currentContext.category = "OPFS";
-          currentContext.detail = name.replace("opfs/", "");
+          status.category = "OPFS";
+          status.detail = name.replace("opfs/", "");
         } else if (name.startsWith("data/blobs/")) {
-          currentContext.category = "Blobs";
-          currentContext.detail = "restoring...";
+          status.category = "Blobs";
+          status.detail = "restoring...";
         } else {
-          currentContext.category = "Config";
-          currentContext.detail = name;
+          status.category = "Config";
+          status.detail = name;
         }
 
         const p = yielder();
         if (p) {
-          logger(
-            `Importing ${currentContext.category}: ${(totalRead / 1048576).toFixed(2)} MB (${currentContext.detail})`,
-          );
+          if (status.category)
+            logger(
+              `Importing ${status.category}: ${(totalRead / 1e6).toFixed(2)} MB (${status.detail})`,
+            );
           await p;
         }
 

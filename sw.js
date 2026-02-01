@@ -137,7 +137,7 @@ function compileRules(rulesString) {
 
       if (searchPattern === "{{SCRIPT}}") {
         searchRegex =
-          /(?:<!DOCTYPE\\b[^>]*>)|(?:<head\\b[^>]*>)|(?:<body\\b[^>]*>)|(?:<html\\b[^>]*>)|(?:^)/i;
+          /(?:<!DOCTYPE\b[^>]*>)|(?:<head\b[^>]*>)|(?:<body\b[^>]*>)|(?:<html\b[^>]*>)|(?:^)/i;
         replacePart = `$&<script>${replacePart}</script>`;
       } else {
         switch (operator) {
@@ -227,13 +227,13 @@ async function getCachedFileHandle(root, folderName, relativePath) {
     if (dirHandleCache.has(currentPathKey)) {
       currentDirHandle = dirHandleCache.get(currentPathKey);
     } else {
-      // Cold start: Get RFS root -> Folder root
+      // Cold start: Get RFS root to folder root
       const rfsHandle = await root.getDirectoryHandle(RFS_PREFIX);
       currentDirHandle = await rfsHandle.getDirectoryHandle(folderName);
       addToCache(dirHandleCache, currentPathKey, currentDirHandle);
     }
 
-    // Traverse subdirectories using cache
+    // Go through subdirectories using cache
     for (const part of pathParts) {
       const decodedPart = decodeURIComponent(part);
       currentPathKey += `/${decodedPart}`;
@@ -541,7 +541,6 @@ async function handleEncryptedRequest(
     const rawFileHandle = await getCachedFileHandle(
       opfsRoot,
       folderName,
-      "content",
       fileMeta.id,
     );
     const rawFile = await rawFileHandle.getFile();
@@ -645,7 +644,8 @@ function isLikelyText(type, path) {
 
 function isActuallyTextSniff(buffer) {
   const view = new Uint8Array(buffer.slice(0, 4096));
-  if (view.length === 0 || view.includes(0)) return true;
+  if (view.length === 0) return true;
+  else if (view.includes(0)) return false;
 
   // Check for BOMs (UTF-8, UTF-16LE, UTF-16BE)
   if (

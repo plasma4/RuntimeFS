@@ -40,15 +40,17 @@ function createLogger(elem, yielder) {
 
 const checkYield = (function () {
   let lastYield = Date.now();
+  const pendingResolvers = [];
   const channel = new MessageChannel();
-  let resolveSync = null;
+
   channel.port1.onmessage = () => {
-    if (resolveSync) resolveSync();
+    const resolver = pendingResolvers.shift();
+    if (resolver) resolver();
   };
 
   const yieldToMain = () =>
     new Promise((res) => {
-      resolveSync = res;
+      pendingResolvers.push(res);
       channel.port2.postMessage(null);
     });
 
@@ -72,8 +74,9 @@ const logProgress = createLogger(
   checkYield,
 );
 
-window.addEventListener("beforeunload", function () {
+window.addEventListener("beforeunload", function (e) {
   if (currentlyBusy) {
+    e.preventDefault();
     return "Changes you made may not be saved."; // not that the string text matters
   }
 });
@@ -385,7 +388,7 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
   await logProgress("", true);
 }
 
-async function processFileListAndStore(name, srcHandle) {
+async function processFileListAndStore(name, fileList) {
   const root = await getOpfsRoot();
   const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
   try {
@@ -393,79 +396,40 @@ async function processFileListAndStore(name, srcHandle) {
   } catch (e) {}
 
   const destRoot = await rfsRoot.getDirectoryHandle(name, { create: true });
-  const uploadQueue = [];
-  let scanComplete = false;
-  let totalFilesDiscovered = 0;
   let bytesUploaded = 0;
+  const totalFiles = fileList.length;
+  let processedFiles = 0;
 
-  // Shared state for logging context
-  let currentFile = "";
+  const dirCache = new Map();
 
-  const updateUI = async (force = false) => {
-    // Only construct string if necessary
-    const p = checkYield(force);
-    if (p) {
-      const mb = (bytesUploaded / 1e6).toFixed(2);
-      await logProgress(
-        `Uploading: ${mb} MB (${currentFile || "Scanning..."})`,
-      );
-      await p;
+  for (const file of fileList) {
+    const p = logProgress(
+      `Uploading (${processedFiles}/${totalFiles}): ${file.name}`,
+    );
+    if (p) await p;
+
+    // Extract relative path (strip leading folder name if present)
+    let relativePath = file.webkitRelativePath || file.name;
+    const pathParts = relativePath.split("/");
+
+    // webkitRelativePath includes the root folder name, skip it
+    if (pathParts.length > 1) {
+      pathParts.shift();
     }
-  };
+    relativePath = pathParts.join("/");
 
-  const worker = async () => {
-    const dirCache = new Map();
-    while (true) {
-      if (uploadQueue.length > 0) {
-        const task = uploadQueue.shift();
-        currentFile = task.entry.name; // Update context for UI
+    await writeStreamToOpfs(destRoot, relativePath, file, {
+      dirCache,
+      onProgress: async (delta) => {
+        bytesUploaded += delta;
+        const mb = (bytesUploaded / 1e6).toFixed(2);
+        const p = logProgress(`Uploading: ${mb} MB (${file.name})`);
+        if (p) await p;
+      },
+    });
 
-        const file = await task.entry.getFile();
-        await writeStreamToOpfs(task.dest, task.entry.name, file, {
-          dirCache,
-          onProgress: async (delta) => {
-            bytesUploaded += delta;
-            await updateUI();
-          },
-        });
-      } else {
-        if (scanComplete) break;
-        await new Promise((res) => setTimeout(res, 10));
-      }
-      // Idle yield
-      const p = checkYield();
-      if (p) await p;
-    }
-  };
-
-  const workerPromises = Array(CONCURRENCY).fill(null).map(worker);
-  const scanStack = [{ source: srcHandle, dest: destRoot }];
-
-  while (scanStack.length > 0) {
-    const { source, dest } = scanStack.shift();
-    // Optimization: Use for await to be non-blocking on huge folders if supported
-    for await (const entry of source.values()) {
-      if (entry.kind === "file") {
-        totalFilesDiscovered++;
-        uploadQueue.push({ dest, entry });
-        if (totalFilesDiscovered % 50 === 0) await updateUI();
-
-        // Backpressure if queue is too large
-        if (uploadQueue.length > 1000) {
-          const p = checkYield(true); // Force yield to let workers catch up
-          if (p) await p;
-        }
-      } else {
-        const nextDest = await dest.getDirectoryHandle(entry.name, {
-          create: true,
-        });
-        scanStack.push({ source: entry, dest: nextDest });
-      }
-    }
+    processedFiles++;
   }
-
-  scanComplete = true;
-  await Promise.all(workerPromises);
 
   document.getElementById("folderName").value = "";
   document.getElementById("openFolderName").value = name;

@@ -447,7 +447,7 @@ self.addEventListener("fetch", (e) => {
 
         if (response.status !== 404) return response;
         if (FULL_APP_SHELL_URLS.includes(cleanUrl)) {
-          const cache = await caches.match(request);
+          const cache = await caches.match(request, { ignoreSearch: true });
           return cache || fetch(request);
         }
 
@@ -460,7 +460,7 @@ self.addEventListener("fetch", (e) => {
   if (FULL_APP_SHELL_URLS.includes(cleanUrl)) {
     e.respondWith(
       (async () => {
-        const cached = await caches.match(request);
+        const cached = await caches.match(request, { ignoreSearch: true });
         return cached || fetch(request);
       })(),
     );
@@ -699,7 +699,7 @@ async function generateResponseForVirtualFile(
     const registry = registryCache || {};
     const folderData = registry[folderName] || {};
 
-    // Here the boot-up logic happens if the flag is enabled
+    // Here the boot-up logic happens (but only if the reloadOnRequest is enabled)
     if (
       reloadOnRequest &&
       mode === "navigate" &&
@@ -797,7 +797,7 @@ async function generateResponseForVirtualFile(
       compiledHeaders,
     );
 
-    let responseBody = file; // Default is the streaming File object (Zero RAM)
+    let responseBody = file;
     let processedSize = totalSize;
 
     if (
@@ -825,7 +825,6 @@ async function generateResponseForVirtualFile(
             processedSize = processedBuffer.byteLength;
           } else {
             // Rules existed but didn't match.
-            // We use the fullBuffer since it's already in RAM, but processedSize remains totalSize.
             responseBody = fullBuffer;
           }
         }
@@ -851,7 +850,6 @@ async function generateResponseForVirtualFile(
       finalHeaders["Content-Range"] = `bytes ${start}-${end}/${processedSize}`;
       finalHeaders["Content-Length"] = chunkLength.toString();
 
-      // Slicing works the same for File (streaming) or ArrayBuffer (memory)
       const rangeSlice = responseBody.slice(start, end + 1);
       return new Response(rangeSlice, { status: 206, headers: finalHeaders });
     }

@@ -751,7 +751,8 @@ async function exportData() {
         alert("Error while exporting: " + e);
       },
       onsuccess: () => {
-        logProgress("Export complete!", true);
+        alert("Export complete!");
+        logProgress("", true);
       },
     });
   } catch (e) {
@@ -759,6 +760,7 @@ async function exportData() {
     alert("Export failed: " + e.message);
   } finally {
     setUiBusy(false);
+    logProgress("", true);
   }
 }
 
@@ -905,7 +907,7 @@ async function syncAndOpenFile() {
 async function performSyncToOpfs() {
   console.log(`Syncing ${changes.length} changes...`);
 
-  // Use a lock to prevent UI-SW conflict
+  // Use a lock to prevent UI and SW conflict
   await navigator.locks.request(`lock_rfs_${folderName}`, async () => {
     const root = await getOpfsRoot();
     const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX);
@@ -1027,8 +1029,7 @@ async function uploadAndEncryptWithPassword() {
       const p = checkYield();
       if (p) {
         const mb = (totalBytesProcessed / 1e6).toFixed(2);
-        // Standardized: [Action] [Type]: [Size] ([Detail])
-        await logProgress(`Encrypting Folder: ${mb} MB (${task.entryPath})`);
+        await logProgress(`Encrypting: ${mb} MB (${task.entryPath})`);
         await p;
       }
 
@@ -1109,7 +1110,9 @@ async function uploadAndEncryptWithPassword() {
           }
         } finally {
           reader.releaseLock();
-          await writable.close();
+          try {
+            await writable.close();
+          } catch (e) {}
         }
       } else {
         await writable.close();

@@ -67,7 +67,7 @@
       if (typeof filter === "function") {
         if (filter(pathStr)) return false;
       } else if (Array.isArray(filter)) {
-        // For arrays: exact match or prefix match
+        // Either exact match or directory prefix match
         if (filter.some((t) => pathStr === t || pathStr.startsWith(t + "/")))
           return false;
       }
@@ -79,12 +79,7 @@
       if (typeof filter === "function") {
         return filter(pathStr);
       } else if (Array.isArray(filter) && filter.length > 0) {
-        return filter.some(
-          (t) =>
-            pathStr === t ||
-            pathStr.startsWith(t + "/") ||
-            pathStr.startsWith(t),
-        );
+        return filter.some((t) => pathStr.startsWith(t));
       }
     }
 
@@ -115,7 +110,7 @@
         return blobMap.get(item);
       }
 
-      const id = (blobIdCounter++).toString(36);
+      const id = (blobIdCounter++).toString(16);
       externalBlobs.push({ uuid: id, blob: item });
 
       const ref = { __le_blob_ref: id, type: item.type, size: item.size };
@@ -364,7 +359,7 @@
     }
 
     async writeStream(path, size, readableStream) {
-      let contentWritten = 0; // Use a local variable for pure content tracking
+      let contentWritten = 0;
       await this.smartWrite(path, size, async () => {
         const reader = readableStream.getReader();
         try {
@@ -372,13 +367,29 @@
             const { done, value } = await reader.read();
             if (done) break;
             if (value) {
-              await this.write(value);
-              contentWritten += value.byteLength;
+              const remaining = size - contentWritten;
+              if (remaining <= 0) {
+                continue;
+              }
+
+              const toWrite =
+                value.byteLength > remaining
+                  ? value.subarray(0, remaining)
+                  : value;
+              await this.write(toWrite);
+              contentWritten += toWrite.byteLength;
+
               if (this.onFileProgress)
                 this.onFileProgress(contentWritten, size);
             }
             const p = this.yielder();
             if (p) await p;
+          }
+
+          if (contentWritten < size) {
+            const missing = size - contentWritten;
+            const zeros = new Uint8Array(missing);
+            await this.write(zeros);
           }
         } finally {
           reader.releaseLock();
@@ -576,7 +587,7 @@
 
     read(n) {
       if (n === 0) return new Uint8Array(0);
-      if (this.totalSize < n) throw new Error("Insufficient data");
+      if (this.totalSize < n) throw new Error("Insufficient chunk data.");
 
       if (this.chunks[0].byteLength >= n) {
         const res = this.chunks[0].subarray(0, n);
@@ -641,14 +652,15 @@
         async start(controller) {
           reader = self.stream.getReader();
           try {
-            if (!(await ensure(22))) throw new Error("File too small");
+            if (!(await ensure(22)))
+              throw new Error("Not an encrypted archive.");
             const sig = DEC.decode(self.buffer.read(6));
-            if (sig !== "LE_ENC") throw new Error("Not an encrypted archive");
+            if (sig !== "LE_ENC") throw new Error("Not an encrypted archive.");
 
             const salt = self.buffer.read(16);
             const key = await deriveKey(self.password, salt);
 
-            if (!(await ensure(16))) throw new Error("Corrupt header");
+            if (!(await ensure(16))) throw new Error("Corrupt header.");
             const initIV = self.buffer.read(12);
             const initLenRaw = self.buffer.read(4);
             const initLen = new DataView(
@@ -658,7 +670,7 @@
             ).getUint32(0, true);
 
             if (initLen !== 16 || !(await ensure(initLen)))
-              throw new Error("Corrupt header");
+              throw new Error("Corrupt header.");
             const initCipher = self.buffer.read(initLen);
             try {
               await crypto.subtle.decrypt(
@@ -678,7 +690,7 @@
                 const { value, done } = await reader.read();
                 if (done) {
                   if (self.buffer.totalSize === 0) break;
-                  throw new Error("Truncated encrypted stream");
+                  throw new Error("Truncated encrypted stream.");
                 }
                 self.buffer.push(value);
                 continue;
@@ -693,7 +705,7 @@
 
               while (!self.buffer.has(lenVal)) {
                 const { value, done } = await reader.read();
-                if (done) throw new Error("Unexpected EOF in ciphertext");
+                if (done) throw new Error("Unexpected EOF in ciphertext.");
                 self.buffer.push(value);
                 const p2 = self.yielder();
                 if (p2) await p2;
@@ -722,11 +734,13 @@
   }
 
   function verifyChecksum(header) {
-    // Checksum is at offset 148, length 8
-    const claimed = parseInt(DEC.decode(header.slice(148, 156)).trim(), 8);
+    const claimedStr = DEC.decode(header.slice(148, 156))
+      .replace(/\0/g, "")
+      .trim();
+    const claimed = parseInt(claimedStr, 8);
+
     if (isNaN(claimed)) return false;
 
-    // Calculate sum of bytes
     let sum = 0;
     for (let i = 0; i < 512; i++) {
       // The 8 bytes at 148 must be treated as spaces (ASCII 32)
@@ -761,7 +775,8 @@
     const encoder =
       opts.encoder ||
       new CBOR.Encoder({
-        copyBuffers: false,
+        structuredClone: true, // Circular references may cause errors/problems if disabled.
+        copyBuffers: false, // Free optimization of preventing copying of buffers (less memory use).
         bundleStrings: true, // Optimization for strings at the cost of inconsistency with the formal CBOR spec (and lack of explicit documentation in cbor-x to parse). See the LittleExport README for more information.
         ...opts.cborOptions,
       });
@@ -999,12 +1014,12 @@
               return await new Promise((resolve, reject) => {
                 const req = indexedDB.open(name);
                 const timeout = setTimeout(
-                  () => reject(new Error(`Database ${name} timed out`)),
+                  () => reject(new Error(`Database ${name} timed out.`)),
                   5000,
                 );
                 req.onblocked = () => {
                   clearTimeout(timeout);
-                  reject(new Error(`Database ${name} blocked`));
+                  reject(new Error(`Database ${name} blocked.`));
                 };
                 req.onsuccess = () => {
                   clearTimeout(timeout);
@@ -1566,6 +1581,7 @@
 
     let status = { category: "", detail: "" };
     const dbCache = {};
+    let foundEofMarker = false;
 
     try {
       let rawStream;
@@ -1591,11 +1607,10 @@
       }
       rawReader.releaseLock();
 
-      let totalRead = 0;
+      let totalProcessed = 0;
       const combinedStream = new ReadableStream({
         async start(controller) {
           for (const chunk of initialChunks) {
-            totalRead += chunk.byteLength;
             controller.enqueue(chunk);
           }
           const reader = rawStream.getReader();
@@ -1603,7 +1618,6 @@
             while (true) {
               const { value, done } = await reader.read();
               if (done) break;
-              totalRead += value.byteLength;
               controller.enqueue(value);
             }
             controller.close();
@@ -1643,6 +1657,15 @@
         inputStream = combinedStream;
       }
 
+      inputStream = inputStream.pipeThrough(
+        new TransformStream({
+          transform(chunk, controller) {
+            totalProcessed += chunk.byteLength;
+            controller.enqueue(chunk);
+          },
+        }),
+      );
+
       const reader = inputStream.getReader();
       const streamBuffer = new ChunkBuffer();
       let done = false;
@@ -1652,7 +1675,6 @@
           const { value, done: d } = await reader.read();
           if (d) done = true;
           else {
-            totalRead += value.byteLength;
             streamBuffer.push(value);
           }
         }
@@ -1684,7 +1706,7 @@
           while (remaining > 0) {
             const p = yielder();
             if (p) {
-              let msg = `Importing ${status.category}: ${(totalRead / 1e6).toFixed(2)} MB`;
+              let msg = `Importing ${status.category}: ${(totalProcessed / 1e6).toFixed(2)} MB`;
               if (size > 1e6) {
                 msg += ` (${status.detail}: ${((size - remaining) / 1e6).toFixed(1)}/${(size / 1e6).toFixed(1)} MB)`;
               } else {
@@ -1702,8 +1724,7 @@
               });
             } else {
               let { value, done: d } = await reader.read();
-              if (d) throw new Error("Unexpected EOF");
-              totalRead += value.byteLength;
+              if (d) throw new Error("Unexpected EOF.");
               if (value.byteLength <= remaining) {
                 await writer.write(value);
                 remaining -= value.byteLength;
@@ -1799,8 +1820,7 @@
         const padding = (512 - (entrySize % 512)) % 512;
 
         if (typeFlag === 120) {
-          if (!(await ensure(entrySize)))
-            throw new Error("Unexpected EOF in PAX");
+          if (!(await ensure(entrySize))) throw new Error("Unexpected EOF.");
           const paxBytes = streamBuffer.read(entrySize);
           await skip(padding);
           paxOverrides = parsePax(paxBytes);
@@ -1837,7 +1857,7 @@
         if (p) {
           if (status.category)
             logger(
-              `Importing ${status.category}: ${(totalRead / 1e6).toFixed(2)} MB (${status.detail})`,
+              `Importing ${status.category}: ${(totalProcessed / 1e6).toFixed(2)} MB (${status.detail})`,
             );
           await p;
         }
@@ -1868,7 +1888,7 @@
               continue;
             }
             if (!(await ensure(size)))
-              throw new Error("Unexpected EOF for metadata");
+              throw new Error("Unexpected EOF for metadata.");
             const d = streamBuffer.read(size);
 
             // localStorage
@@ -2062,12 +2082,13 @@
                     return await new Promise((resolve, reject) => {
                       const req = indexedDB.open(dbName);
                       const timeout = setTimeout(
-                        () => reject(new Error(`Database ${dbName} timed out`)),
+                        () =>
+                          reject(new Error(`Database ${dbName} timed out.`)),
                         5000,
                       );
                       req.onblocked = () => {
                         clearTimeout(timeout);
-                        reject(new Error(`Database ${dbName} blocked`));
+                        reject(new Error(`Database ${dbName} blocked.`));
                       };
                       req.onsuccess = () => {
                         clearTimeout(timeout);
@@ -2096,7 +2117,7 @@
                   await new Promise((res, rej) => {
                     tx.oncomplete = res;
                     tx.onerror = () => rej(tx.error);
-                    tx.onabort = () => rej(new Error("Transaction aborted"));
+                    tx.onabort = () => rej(new Error("Transaction aborted."));
                   });
                 }, `IDB ${dbName}/${storeName}`);
               }
@@ -2198,6 +2219,10 @@
       logger(`Error: ${e.message}`);
       if (opts.onerror) opts.onerror(e);
       if (!graceful) throw e;
+    } finally {
+      try {
+        await rootOpfs.removeEntry(TEMP_BLOB_DIR, { recursive: true });
+      } catch (e) {}
     }
   }
 
@@ -2278,7 +2303,7 @@
       } catch (e) {
         if (e.name === "AbortError") {
           logger("User cancelled the directory picker.");
-          return; // User cancelled
+          return;
         }
         logger("Directory Picker failed, falling back to legacy input.");
         console.warn(

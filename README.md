@@ -37,17 +37,17 @@ In the future, non-Chromium browsers might adopt parts of the File System API th
 
 RuntimeFS requires ES11 or later (supported by over 95% of all browsers).
 
-| Feature | 🟢 Chromium | 🟡 Firefox/Safari/Brave |
-| :--- | :--- | :--- |
-| **Folder Upload** | ✅ Yes | ⚠️ `<input>` or drag-and-drop fallback, no sync |
-| **Encryption (folder-based)** | ✅ Yes | ❌ No |
-| **Export (including encryption)** | ✅ Mostly streamed to disk | ⚠️ RAM-only |
+| Feature                           | 🟢 Chromium                | 🟡 Firefox/Safari/Brave                         |
+| :-------------------------------- | :------------------------- | :---------------------------------------------- |
+| **Folder Upload**                 | ✅ Yes                     | ⚠️ `<input>` or drag-and-drop fallback, no sync |
+| **Encryption (folder-based)**     | ✅ Yes                     | ❌ No                                           |
+| **Export (including encryption)** | ✅ Mostly streamed to disk | ⚠️ RAM-only                                     |
 
 ## URL Persistence & Location Spoofing
 
 URL Persistence is an informal term that means that websites store data along with URLs. Examples include the Ruffle emulator (in `localStorage`) and Unity (in `IndexedDB`). If you export data from `example.com/v1/` and try to import it to `example.com/v2/` (or to different domains), it probably won't work.
 
-Because of this problem, you must normalize these URL keys during exporting or importing with a mock location object (and replace `document.URL` if needed). See a **standardized** RuntimeFS location spoofer and explanation in the [LittleExport](https://github.com/plasma4/LittleExport) repo.
+Because of this problem, you must normalize these URL keys during exporting or importing with a mock location object (and replace `document.URL` if needed). See a **standardized** RuntimeFS location spoofer and more details are in the [LittleExport](https://github.com/plasma4/LittleExport) repo.
 
 ## Notes
 
@@ -76,7 +76,8 @@ Also note:
 - Some extensions, such as Chrome compatibility plugins for Firefox, might actively interfere with the features presented. Make sure that your extensions aren't breaking anything!
 - The most likely reason that data export fails when transferring between sites is because those websites use URL properties as part of the key (either from `document.URL` or `location`). You might be able to force a site to use a hardcoded URL for storage with clever regex or code changes.
 - Using regex requires any matched files to be fully loaded into memory, reducing performance. Be careful!
-- Exporting any single files with very large sizes not from OPFS (such as from IndexedDB, or cache storage) might result in crashes.
+- There may be some highly specific crash cases when exporting; check LittleExport documentation for details.
+- `.cbor` files are non-standard (`with bundleStrings`). To read a more JS-friendly version of these files, please check LittleExport documentation.
 - Regex attempts to only operate on text files; the checking should be performant and accurate for almost all cases. You can customize the `isActuallyText` function in the SW if necessary.
 - Check `getMimeType` in the ServiceWorker for the supported MIME types; you may need to add your own in some cases.
 - You might encounter freezing of all RuntimeFS-related tabs if any tab is stuck or waiting for something (such as making a IndexedDB writable). RuntimeFS might also encounter a QuotaExceededError in certain situations (like running out of memory or private tabs).

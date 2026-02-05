@@ -37,7 +37,7 @@
   const CHUNK_SIZE = 4194304;
   const TAR_BUFFER_SIZE = 65536;
   const ENC = new TextEncoder();
-  const DEC = new TextDecoder();
+  const DEC = new TextDecoder("utf-8", { fatal: false });
   const TEMP_BLOB_DIR = ".rfs_temp_blobs";
 
   async function deriveKey(password, salt) {
@@ -68,14 +68,7 @@
         if (filter(pathStr)) return false;
       } else if (Array.isArray(filter)) {
         // For arrays: exact match or prefix match
-        if (
-          filter.some(
-            (t) =>
-              pathStr === t ||
-              pathStr.startsWith(t + "/") ||
-              pathStr.startsWith(t),
-          )
-        )
+        if (filter.some((t) => pathStr === t || pathStr.startsWith(t + "/")))
           return false;
       }
     }
@@ -98,45 +91,60 @@
     return true;
   }
 
-  function prepForCBOR(item, externalBlobs, seen) {
+  function prepForCBOR(item, externalBlobs, seen = new WeakMap()) {
     if (!item || typeof item !== "object") return item;
 
-    // Circular reference protection
-    if (!seen) seen = new WeakSet();
-    if (seen.has(item)) return { __le_circular: true };
-
-    if (item instanceof Blob) {
-      const id = (blobIdCounter++).toString(36);
-      externalBlobs.push({ uuid: id, blob: item });
-      return { __le_blob_ref: id, type: item.type, size: item.size };
-    }
-
+    // Passthrough types (add others if needed)
     if (
       item instanceof ArrayBuffer ||
       ArrayBuffer.isView(item) ||
-      item instanceof Date ||
-      item instanceof RegExp
+      item instanceof Date
     ) {
       return item;
     }
 
-    seen.add(item);
+    // Handle Cycles: Return the reference to the object currently being built
+    if (seen.has(item)) return seen.get(item);
+
+    // Extract Blobs
+    if (item instanceof Blob) {
+      const id = (blobIdCounter++).toString(36);
+      externalBlobs.push({ uuid: id, blob: item });
+      // Note: We don't cache Blobs in 'seen' as they aren't recursive
+      return { __le_blob_ref: id, type: item.type, size: item.size };
+    }
+
+    let res;
 
     if (Array.isArray(item)) {
-      const len = item.length;
-      const res = new Array(len);
-      for (let i = 0; i < len; i++) {
-        res[i] = prepForCBOR(item[i], externalBlobs, seen);
+      const keys = Object.keys(item);
+      // Sparse Array Detection
+      const isSparse = keys.length < item.length || keys.some((k) => isNaN(k));
+
+      if (isSparse) {
+        res = { __le_type: "sparse_array", length: item.length, data: {} };
+        seen.set(item, res); // Register before recursion
+        for (const k of keys) {
+          res.data[k] = LittleExport.prepForCBOR(item[k], externalBlobs, seen);
+        }
+      } else {
+        res = new Array(item.length);
+        seen.set(item, res); // Register before recursion
+        for (let i = 0; i < item.length; i++) {
+          res[i] = LittleExport.prepForCBOR(item[i], externalBlobs, seen);
+        }
       }
-      return res;
+    } else {
+      // Plain Object
+      res = {};
+      seen.set(item, res); // Register before recursion
+      for (const k in item) {
+        if (Object.prototype.hasOwnProperty.call(item, k)) {
+          res[k] = LittleExport.prepForCBOR(item[k], externalBlobs, seen);
+        }
+      }
     }
 
-    const res = {};
-    for (const k in item) {
-      if (Object.prototype.hasOwnProperty.call(item, k)) {
-        res[k] = prepForCBOR(item[k], externalBlobs, seen);
-      }
-    }
     return res;
   }
 
@@ -158,11 +166,19 @@
     if (item.__le_circular) {
       return null; // Can't restore circular references
     }
+    if (item.__le_type === "sparse_array") {
+      const arr = new Array(item.length);
+      // data contains the indices
+      for (const k in item.data) {
+        arr[k] = await LittleExport.restoreFromCBOR(item.data[k], tempBlobDir);
+      }
+      return arr;
+    }
 
     if (Array.isArray(item)) {
       const res = new Array(item.length);
       for (let i = 0; i < item.length; i++) {
-        res[i] = await restoreFromCBOR(item[i], tempBlobDir);
+        res[i] = await LittleExport.restoreFromCBOR(item[i], tempBlobDir);
       }
       return res;
     }
@@ -170,7 +186,7 @@
     if (item.constructor === Object) {
       const n = {};
       for (const k in item) {
-        n[k] = await restoreFromCBOR(item[k], tempBlobDir);
+        n[k] = await LittleExport.restoreFromCBOR(item[k], tempBlobDir);
       }
       return n;
     }
@@ -186,7 +202,7 @@
   const HEADER_TEMPLATE = new Uint8Array(512);
   (function initTemplate() {
     const w = (str, off) => ENC.encodeInto(str, HEADER_TEMPLATE.subarray(off));
-    w("000664 \0", 100);
+    w("000644 \0", 100);
     w("000000 \0", 108);
     w("000000 \0", 116);
     HEADER_TEMPLATE.set(TAR_CONSTANTS.EMPTY_SPACE, 148);
@@ -195,63 +211,87 @@
     HEADER_TEMPLATE.set(TAR_CONSTANTS.USTAR_VER, 263);
   })();
 
-  function createTarHeader(filename, size, time, isDir = false) {
+  function createPaxData(path, size) {
+    const encoder = new TextEncoder();
+    let content = new Uint8Array(0);
+
+    const addRecord = (keyword, value) => {
+      if (value === null || value === undefined) return;
+      const strVal = String(value);
+      // Format: "length keyword=value\n"
+      const suffix = ` ${keyword}=${strVal}\n`;
+      const suffixBytes = encoder.encode(suffix);
+
+      // Calculate total length (bytes of length string + space + bytes of suffix)
+      let total = suffixBytes.length;
+      let lenStr = String(total);
+
+      // Adjust length until it stabilizes (e.g. 9 -> 10 adds a digit)
+      while (true) {
+        const newTotal = suffixBytes.length + lenStr.length;
+        if (newTotal === total) break;
+        total = newTotal;
+        lenStr = String(total);
+      }
+
+      const line = encoder.encode(`${lenStr}${suffix}`);
+      const newContent = new Uint8Array(content.length + line.length);
+      newContent.set(content);
+      newContent.set(line, content.length);
+      content = newContent;
+    };
+
+    addRecord("path", path);
     if (size > 8589934591) {
-      throw new Error("File size exceeds USTAR 8GB limit.");
+      addRecord("size", size);
     }
 
+    return content;
+  }
+
+  function createTarHeader(filename, size, time, type = "0", mode = "000644") {
+    const safeSize = size > 8589934591 ? 0 : size;
     const buffer = HEADER_TEMPLATE.slice(0);
 
-    if (isDir) {
-      if (!filename.endsWith("/")) filename += "/";
-      buffer[156] = 53;
+    // 0=file, 5=dir, x=pax
+    buffer[156] = type.charCodeAt(0);
+
+    // Write filename
+    const nameBytes = ENC.encode(filename);
+    if (nameBytes.length > 100) {
+      let cut = 100;
+      while (cut > 0 && (nameBytes[cut] & 0xc0) === 0x80) cut--;
+      buffer.set(nameBytes.subarray(0, cut), 0);
+    } else {
+      buffer.set(nameBytes, 0);
     }
 
-    const fullBytes = ENC.encode(filename);
-
-    if (fullBytes.length <= 100) {
-      buffer.set(fullBytes, 0);
-    } else {
-      let bestSplit = -1;
-
-      for (let i = 0; i < fullBytes.length; i++) {
-        if (fullBytes[i] === 47) {
-          const prefixLen = i;
-          const nameLen = fullBytes.length - 1 - i;
-
-          if (prefixLen <= 155 && nameLen <= 100 && nameLen > 0) {
-            bestSplit = i;
-          }
-        }
-      }
-
-      if (bestSplit !== -1) {
-        buffer.set(fullBytes.subarray(bestSplit + 1), 0);
-        buffer.set(fullBytes.subarray(0, bestSplit), 345);
-      } else {
-        throw new Error(`Filename too long for USTAR: ${filename}`);
-      }
+    if (mode) {
+      ENC.encodeInto(mode.padEnd(7, "\0"), buffer.subarray(100, 108));
     }
 
     const writeOctal = (num, offset, len) => {
       const str = Math.floor(num)
         .toString(8)
         .padStart(len - 1, "0");
-      if (str.length >= len) throw new Error("Octal field overflow");
+      if (str.length >= len) return;
       ENC.encodeInto(str, buffer.subarray(offset, offset + len - 1));
-      buffer[offset + len - 1] = 0;
+      buffer[offset + len - 1] = 0; // Space/null termination
     };
 
-    writeOctal(size, 124, 12);
+    writeOctal(safeSize, 124, 12);
     writeOctal(time, 136, 12);
 
     let sum = 0;
-    for (let i = 0; i < 512; i++) sum += buffer[i];
+    for (let i = 0; i < 512; i++) {
+      sum += buffer[i];
+    }
 
     const cksumStr = sum.toString(8).padStart(6, "0");
     ENC.encodeInto(cksumStr, buffer.subarray(148));
     buffer[154] = 0;
     buffer[155] = 32;
+
     return buffer;
   }
 
@@ -264,44 +304,96 @@
       this.time = Math.floor(Date.now() / 1000);
       this.buffer = new Uint8Array(TAR_BUFFER_SIZE);
       this.bufferOffset = 0;
-      this.currentFileWritten = 0;
-      this.currentFileTotal = 0;
     }
 
     async writeEntry(path, data) {
       const bytes = typeof data === "string" ? ENC.encode(data) : data;
-      const header = createTarHeader(path, bytes.length, this.time);
-      await this.write(header);
-      await this.write(bytes);
-      await this.pad();
+      const size = bytes.length;
+      await this.smartWrite(path, size, async () => {
+        await this.write(bytes);
+      });
+    }
+
+    async checkAndWritePax(path, size) {
+      const needsPaxPath = ENC.encode(path).length > 100;
+      const needsPaxSize = size > 8589934591;
+
+      if (needsPaxPath || needsPaxSize) {
+        const paxData = createPaxData(path, size);
+        // PAX header convention: PaxHeaders/filename
+        const safeName =
+          "PaxHeaders/" + (path.length > 50 ? path.slice(0, 50) : path);
+
+        const paxHeader = createTarHeader(
+          safeName,
+          paxData.length,
+          this.time,
+          "x",
+        );
+        await this.write(paxHeader);
+        await this.write(paxData);
+        await this.pad();
+        return true;
+      }
+      return false;
     }
 
     async writeStream(path, size, readableStream) {
-      await this.write(createTarHeader(path, size, this.time));
-      this.currentFileTotal = size;
-      this.currentFileWritten = 0;
-      const reader = readableStream.getReader();
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          await this.write(value);
-          this.currentFileWritten += value.byteLength;
-          if (this.onFileProgress) {
-            this.onFileProgress(this.currentFileWritten, this.currentFileTotal);
+      await this.smartWrite(path, size, async () => {
+        const reader = readableStream.getReader();
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            await this.write(value);
+            if (this.onFileProgress)
+              this.onFileProgress(this.bytesWritten, size);
+            const p = this.yielder();
+            if (p) await p;
           }
-          const p = this.yielder();
-          if (p) await p;
+        } finally {
+          reader.releaseLock();
         }
-      } finally {
-        reader.releaseLock();
+      });
+    }
+
+    async smartWrite(path, size, contentFn) {
+      const pathBytes = ENC.encode(path); // byte length matters, not string
+      const needsPax = pathBytes.length > 100 || size > 8589934591;
+
+      if (needsPax) {
+        const paxData = createPaxData(path, size);
+        // PAX Header name is arbitrary, usually "PaxHeaders/filename"
+        const safePaxName =
+          "PaxHeaders/" + (path.length > 50 ? path.slice(0, 50) : path);
+
+        await this.write(
+          createTarHeader(safePaxName, paxData.length, this.time, "x"),
+        );
+        await this.write(paxData);
+        await this.pad();
       }
+
+      await this.write(
+        createTarHeader(
+          path,
+          size,
+          this.time,
+          size === 0 && path.endsWith("/") ? "5" : "0",
+        ),
+      );
+      if (contentFn) await contentFn();
       await this.pad();
+    }
+
+    async writeDir(path) {
+      await this.checkAndWritePax(path, 0);
+      const header = createTarHeader(path, 0, this.time, "5", "000755");
+      await this.write(header);
     }
 
     async write(chunk) {
       const len = chunk.byteLength;
-
       if (len >= TAR_BUFFER_SIZE) {
         await this.flush();
         await this.writer.write(chunk);
@@ -320,14 +412,7 @@
 
     async pad() {
       const padding = (512 - (this.pos % 512)) % 512;
-      if (padding > 0) {
-        await this.write(new Uint8Array(padding));
-      }
-    }
-
-    async writeDir(path) {
-      const header = createTarHeader(path, 0, this.time, true);
-      await this.write(header);
+      if (padding > 0) await this.write(new Uint8Array(padding));
     }
 
     async flush() {
@@ -427,37 +512,77 @@
       this.chunks = [];
       this.totalSize = 0;
     }
+
     push(chunk) {
       if (!chunk || chunk.byteLength === 0) return;
       this.chunks.push(chunk);
       this.totalSize += chunk.byteLength;
     }
+
     has(n) {
       return this.totalSize >= n;
     }
+
+    _internalConsume(n, callback) {
+      let consumed = 0;
+      while (consumed < n) {
+        const chunk = this.chunks[0];
+        const remainingNeeded = n - consumed;
+        const toTake = Math.min(chunk.byteLength, remainingNeeded);
+
+        // Provide the segment to the requester
+        callback(chunk.subarray(0, toTake));
+
+        if (toTake === chunk.byteLength) {
+          this.chunks.shift();
+        } else {
+          this.chunks[0] = chunk.subarray(toTake);
+        }
+
+        this.totalSize -= toTake;
+        consumed += toTake;
+      }
+    }
+
     read(n) {
       if (n === 0) return new Uint8Array(0);
-      if (this.totalSize < n) throw new Error("Insufficient data in buffer");
+      if (this.totalSize < n) throw new Error("Insufficient data");
+
       if (this.chunks[0].byteLength >= n) {
-        const result = this.chunks[0].subarray(0, n);
+        const res = this.chunks[0].subarray(0, n);
         if (this.chunks[0].byteLength === n) this.chunks.shift();
         else this.chunks[0] = this.chunks[0].subarray(n);
         this.totalSize -= n;
-        return result;
+        return res;
       }
+
       const result = new Uint8Array(n);
       let offset = 0;
-      while (offset < n) {
-        const chunk = this.chunks[0];
-        const remaining = n - offset;
-        const toCopy = Math.min(chunk.byteLength, remaining);
-        result.set(chunk.subarray(0, toCopy), offset);
-        offset += toCopy;
-        this.totalSize -= toCopy;
-        if (toCopy === chunk.byteLength) this.chunks.shift();
-        else this.chunks[0] = chunk.subarray(toCopy);
-      }
+      this._internalConsume(n, (seg) => {
+        result.set(seg, offset);
+        offset += seg.byteLength;
+      });
       return result;
+    }
+
+    async consume(n, callback) {
+      let remaining = n;
+      while (remaining > 0) {
+        const chunk = this.chunks[0];
+        const toProcess = Math.min(chunk.byteLength, remaining);
+
+        // Pass the existing memory view to the callback
+        await callback(chunk.subarray(0, toProcess));
+
+        if (toProcess === chunk.byteLength) {
+          this.chunks.shift();
+        } else {
+          this.chunks[0] = chunk.subarray(toProcess);
+        }
+
+        this.totalSize -= toProcess;
+        remaining -= toProcess;
+      }
     }
   }
 
@@ -502,7 +627,8 @@
               initLenRaw.byteLength,
             ).getUint32(0, true);
 
-            if (!(await ensure(initLen))) throw new Error("Corrupt header");
+            if (initLen !== 16 || !(await ensure(initLen)))
+              throw new Error("Corrupt header");
             const initCipher = self.buffer.read(initLen);
             try {
               await crypto.subtle.decrypt(
@@ -565,6 +691,21 @@
     }
   }
 
+  function verifyChecksum(header) {
+    // Checksum is at offset 148, length 8
+    const claimed = parseInt(DEC.decode(header.slice(148, 156)).trim(), 8);
+    if (isNaN(claimed)) return false;
+
+    // Calculate sum of bytes
+    let sum = 0;
+    for (let i = 0; i < 512; i++) {
+      // The 8 bytes at 148 must be treated as spaces (ASCII 32)
+      if (i >= 148 && i < 156) sum += 32;
+      else sum += header[i];
+    }
+    return sum === claimed;
+  }
+
   async function exportData(config = {}) {
     blobIdCounter = 0;
     const CBOR = window.CBOR;
@@ -586,6 +727,14 @@
       ...config,
     };
 
+    const encoder =
+      opts.encoder ||
+      new CBOR.Encoder({
+        copyBuffers: false,
+        bundleStrings: true, // Optimization for strings at the cost of inconsistency with the formal CBOR spec (and lack of explicit documentation in cbor-x to parse). See the LittleExport README for more information.
+        ...opts.cborOptions,
+      });
+
     const logger = opts.logger || (() => {});
     const yielder = createYielder(opts.logSpeed);
     const graceful = opts.graceful;
@@ -605,7 +754,7 @@
       } catch (e) {
         if (graceful) {
           if (opts.onerror) opts.onerror(e);
-          logger(`Warning: ${context} - ${e.message}`);
+          logger(`Error: ${context} - ${e.message}`);
           return null;
         }
         throw e;
@@ -722,53 +871,68 @@
           const trustAll = categoryDecision === DECISION.TRUST;
 
           async function walkOpfs(dir, pathArray, inherited) {
-            for await (const entry of dir.values()) {
-              if (aborted) return;
+            try {
+              for await (const entry of dir.values()) {
+                if (aborted) return;
 
-              const currentPath = [...pathArray, entry.name];
-              const pathStr = currentPath.join("/");
-              let decision = inherited;
+                const currentPath = [...pathArray, entry.name];
+                const pathStr = currentPath.join("/");
+                let decision = inherited;
 
-              status.detail = pathStr;
+                status.detail = pathStr;
 
-              if (!inherited) {
-                if (useOnVisit) {
-                  let raw = getDecision(TYPE.OPFS, currentPath, {
-                    kind: entry.kind,
-                    handle: entry,
-                  });
-                  if (raw && typeof raw.then === "function") raw = await raw;
-                  decision = raw;
+                if (!inherited) {
+                  if (useOnVisit) {
+                    let raw = getDecision(TYPE.OPFS, currentPath, {
+                      kind: entry.kind,
+                      handle: entry,
+                    });
+                    if (raw && typeof raw.then === "function") raw = await raw;
+                    decision = raw;
 
-                  if (decision === DECISION.ABORT) {
-                    aborted = true;
-                    return;
+                    if (decision === DECISION.ABORT) {
+                      aborted = true;
+                      return;
+                    }
+                    if (decision === DECISION.SKIP) continue;
+                  } else {
+                    if (!checkSimpleFilter("opfs", pathStr, opts)) continue;
+                    decision = DECISION.TRUST;
                   }
-                  if (decision === DECISION.SKIP) continue;
-                } else {
-                  if (!checkSimpleFilter("opfs", pathStr, opts)) continue;
-                  decision = DECISION.TRUST;
                 }
+
+                const trustChildren = decision === DECISION.TRUST;
+
+                if (entry.kind === "file") {
+                  await tryGraceful(async () => {
+                    const f = await entry.getFile();
+                    await tar.writeStream(
+                      `opfs/${pathStr}`,
+                      f.size,
+                      f.stream(),
+                    );
+                  }, `OPFS file ${pathStr}`);
+                } else {
+                  // Write directory entry
+                  await tar.writeDir(`opfs/${pathStr}`);
+                  // Recurse
+                  await walkOpfs(
+                    entry,
+                    currentPath,
+                    trustChildren ? DECISION.TRUST : false,
+                  );
+                }
+
+                const p = yielder();
+                if (p) await p;
               }
-
-              const trustChildren = decision === DECISION.TRUST;
-
-              if (entry.kind === "file") {
-                await tryGraceful(async () => {
-                  const f = await entry.getFile();
-                  await tar.writeStream(`opfs/${pathStr}`, f.size, f.stream());
-                }, `OPFS file ${pathStr}`);
-              } else {
-                await tar.writeDir(`opfs/${pathStr}`);
-                await walkOpfs(
-                  entry,
-                  currentPath,
-                  trustChildren ? DECISION.TRUST : false,
-                );
-              }
-
-              const p = yielder();
-              if (p) await p;
+            } catch (e) {
+              // Log error but allow other folders to continue processing
+              logger(
+                `Error: accessing OPFS folder /${pathArray.join("/")} failed (${e.message})`,
+              );
+              if (opts.onerror) opts.onerror(e);
+              if (!graceful) throw e;
             }
           }
 
@@ -852,7 +1016,7 @@
               if (storeNames.length === 0) {
                 await tar.writeEntry(
                   `data/idb/${safeName}/schema.cbor`,
-                  CBOR.encode({ name, version, stores: [] }),
+                  encoder.encode({ name, version, stores: [] }),
                 );
                 continue;
               }
@@ -880,7 +1044,7 @@
 
               await tar.writeEntry(
                 `data/idb/${safeName}/schema.cbor`,
-                CBOR.encode({ name, version, stores }),
+                encoder.encode({ name, version, stores }),
               );
 
               for (const sName of storeNames) {
@@ -951,7 +1115,7 @@
                     const processedValues = [];
                     for (let i = 0; i < batch.values.length; i++) {
                       const blobsInItem = [];
-                      const cleanValue = prepForCBOR(
+                      const cleanValue = LittleExport.prepForCBOR(
                         batch.values[i],
                         blobsInItem,
                       );
@@ -967,7 +1131,7 @@
 
                     await tar.writeEntry(
                       `data/idb/${safeName}/${encodeURIComponent(sName)}/${chunkId++}.cbor`,
-                      CBOR.encode([batch.keys, processedValues]),
+                      encoder.encode([batch.keys, processedValues]),
                     );
                     const p = yielder();
                     if (p) await p;
@@ -1188,16 +1352,29 @@
                 if (!res) continue;
                 const blob = await res.blob();
                 const safeHash = btoa(req.url).slice(0, 50).replace(/\//g, "_");
+                const blobsInItem = [];
+                const cleanData = LittleExport.prepForCBOR(blob, blobsInItem);
+
+                // Write the external blobs (the large file body)
+                for (const b of blobsInItem) {
+                  await tar.writeStream(
+                    `data/blobs/${b.uuid}`,
+                    b.blob.size,
+                    b.blob.stream(),
+                  );
+                }
+
+                // Write the metadata record containing the reference
                 await tar.writeEntry(
                   `data/cache/${encodeURIComponent(cacheName)}/${safeHash}.cbor`,
-                  CBOR.encode({
+                  encoder.encode({
                     meta: {
                       url: req.url,
                       status: res.status,
                       headers: Object.fromEntries(res.headers),
                       type: blob.type,
                     },
-                    data: new Uint8Array(await blob.arrayBuffer()),
+                    data: cleanData,
                   }),
                 );
               }
@@ -1220,11 +1397,13 @@
         if (opts.download !== false) {
           const a = document.createElement("a");
           a.href = downloadUrl;
-          a.download = opts.password
-            ? `${opts.fileName}.enc`
-            : `${opts.fileName}.tar.gz`;
+          let fileName = opts.fileName;
+          a.download = fileName.includes(".")
+            ? fileName
+            : opts.password
+              ? `${fileName}.enc`
+              : `${fileName}.tar.gz`;
           a.click();
-          setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
         }
         if (opts.onsuccess) opts.onsuccess(downloadUrl);
       } else if (!opts.download && opts.onsuccess) {
@@ -1236,8 +1415,9 @@
       try {
         await outputStream.abort(e).catch(() => {});
       } catch (z) {}
+      logger(`Error: ${context} - ${e.message}`);
       if (opts.onerror) opts.onerror(e);
-      else throw e;
+      if (!graceful) throw e;
     }
   }
 
@@ -1256,10 +1436,20 @@
       ...config,
     };
 
+    const decoder =
+      opts.decoder ||
+      new CBOR.Decoder({
+        structuredClone: true, // Circular references may cause errors/problems if disabled.
+        bundleStrings: true, // Optimization for strings at the cost of inconsistency with the formal CBOR spec (and lack of explicit documentation in cbor-x to parse). See the LittleExport README for more information.
+        copyBuffers: false, // Free optimization of preventing copying of buffers (less memory use).
+        // implied
+        ...opts.cborOptions,
+      });
+
     let sourceInput = opts.source;
     if (!sourceInput) {
       throw new Error(
-        "No source provided. Pass a URL, Blob, or File via the 'source' property.",
+        "No source provided. Pass a URL, Blob, or File via the source config property.",
       );
     }
 
@@ -1282,12 +1472,10 @@
       try {
         return await fn();
       } catch (e) {
-        if (graceful) {
-          if (opts.onerror) opts.onerror(e);
-          logger(`Warning: ${context} - ${e.message}`);
-          return null;
-        }
-        throw e;
+        if (opts.onerror) opts.onerror(e);
+        logger(`Error: ${context} - ${e.message}`);
+        if (!graceful) throw e;
+        return null;
       }
     }
 
@@ -1342,12 +1530,11 @@
     }
 
     let status = { category: "", detail: "" };
+    const dbCache = {};
 
     try {
       let rawStream;
       if (typeof sourceInput === "string") {
-        if (!sourceInput.startsWith("http"))
-          sourceInput = "https://" + sourceInput;
         const response = await fetch(sourceInput);
         if (!response.ok) throw new Error("Fetching of URL failed.");
         rawStream = response.body;
@@ -1437,8 +1624,17 @@
         while (n > 0) {
           if (streamBuffer.totalSize === 0 && !done) await ensure(1);
           if (streamBuffer.totalSize === 0) break;
-          const toSkip = Math.min(streamBuffer.totalSize, n);
-          streamBuffer.read(toSkip);
+
+          const chunk = streamBuffer.chunks[0];
+          const toSkip = Math.min(chunk.byteLength, n);
+
+          if (toSkip === chunk.byteLength) {
+            streamBuffer.chunks.shift(); // Drop the whole chunk
+          } else {
+            streamBuffer.chunks[0] = chunk.subarray(toSkip); // Slice (Cheap View)
+          }
+
+          streamBuffer.totalSize -= toSkip;
           n -= toSkip;
         }
       }
@@ -1460,11 +1656,11 @@
             }
 
             if (streamBuffer.totalSize > 0) {
-              let chunk = streamBuffer.read(
-                Math.min(remaining, streamBuffer.totalSize),
-              );
-              await writer.write(chunk);
-              remaining -= chunk.byteLength;
+              const batchSize = Math.min(remaining, streamBuffer.totalSize);
+              await streamBuffer.consume(batchSize, async (chunk) => {
+                await writer.write(chunk);
+                remaining -= chunk.byteLength;
+              });
             } else {
               let { value, done: d } = await reader.read();
               if (d) throw new Error("Unexpected EOF");
@@ -1492,19 +1688,90 @@
         });
       } catch (e) {}
 
-      const dbCache = {};
       const processedDbSchemas = new Set();
 
+      function parsePax(paxBytes) {
+        const res = {};
+        let pos = 0;
+        while (pos < paxBytes.length) {
+          // Find the first space to get the length
+          let spacePos = -1;
+          for (let i = pos; i < paxBytes.length; i++) {
+            if (paxBytes[i] === 32) {
+              spacePos = i;
+              break;
+            }
+          }
+          if (spacePos === -1) break;
+
+          const lenStr = DEC.decode(paxBytes.subarray(pos, spacePos));
+          const len = parseInt(lenStr, 10);
+          if (isNaN(len)) break;
+
+          // Slice the exact byte range for this record
+          const recordBytes = paxBytes.subarray(pos, pos + len);
+          const recordStr = DEC.decode(recordBytes);
+
+          const eq = recordStr.indexOf("=");
+          if (eq !== -1) {
+            const spaceIdx = recordStr.indexOf(" ");
+            const key = recordStr.slice(spaceIdx + 1, eq);
+            const val = recordStr.slice(eq + 1, -1); // remove trailing \n
+            res[key] = val;
+          }
+          pos += len;
+        }
+        return res;
+      }
+
+      let paxOverrides = null;
+
       while (!aborted) {
-        if (!(await ensure(512))) break;
+        const hasHeader = await ensure(512);
+
+        if (!hasHeader) {
+          // Stream ended but we never saw the two null blocks
+          if (!foundEofMarker) {
+            throw new Error("Archive truncated: Stream ended prematurely.");
+          }
+          break;
+        }
+
         const header = streamBuffer.read(512);
-        if (header.every((b) => b === 0)) break;
+
+        // Check for the first EOF block (all zeros)
+        if (header[0] === 0 && header.every((b) => b === 0)) {
+          foundEofMarker = true;
+          continue;
+        }
+
+        if (!verifyChecksum(header)) {
+          throw new Error("Corrupt TAR header: Checksum mismatch.");
+        }
 
         let name = DEC.decode(header.slice(0, 100)).replace(/\0/g, "").trim();
-        const prefix = DEC.decode(header.slice(345, 500))
+        const typeFlag = header[156]; // '0', '5', 'x'
+        const sizeStr = DEC.decode(header.slice(124, 136))
           .replace(/\0/g, "")
           .trim();
-        if (prefix) name = `${prefix}/${name}`;
+        const entrySize = parseInt(sizeStr, 8) || 0;
+        const padding = (512 - (entrySize % 512)) % 512;
+
+        if (typeFlag === 120) {
+          if (!(await ensure(entrySize)))
+            throw new Error("Unexpected EOF in PAX");
+          const paxBytes = streamBuffer.read(entrySize);
+          await skip(padding);
+          paxOverrides = parsePax(paxBytes);
+          continue; // Move to the next block which contains the actual file
+        }
+
+        let size = entrySize;
+        if (paxOverrides) {
+          if (paxOverrides.path) name = paxOverrides.path;
+          if (paxOverrides.size) size = parseInt(paxOverrides.size, 10);
+          paxOverrides = null;
+        }
 
         if (name.startsWith("data/idb/")) {
           status.category = "IndexedDB";
@@ -1533,12 +1800,6 @@
             );
           await p;
         }
-
-        const sizeStr = DEC.decode(header.slice(124, 136))
-          .replace(/\0/g, "")
-          .trim();
-        const size = parseInt(sizeStr, 8);
-        const padding = (512 - (size % 512)) % 512;
 
         if (name.startsWith("data/")) {
           if (name.startsWith("data/blobs/")) {
@@ -1694,7 +1955,7 @@
                 if (!(await shouldProcess(TYPE.IDB, [dbName], dbName, "idb")))
                   continue;
 
-                const schema = CBOR.decode(d);
+                const schema = decoder.decode(d);
                 processedDbSchemas.add(dbName);
 
                 if (dbCache[dbName]) {
@@ -1749,8 +2010,8 @@
                 )
                   continue;
 
-                const decoded = CBOR.decode(d);
-                const [keys, values] = await restoreFromCBOR(
+                const decoded = decoder.decode(d);
+                const [keys, values] = await LittleExport.restoreFromCBOR(
                   decoded,
                   tempBlobDir,
                 );
@@ -1812,7 +2073,7 @@
                 await shouldProcess(TYPE.CACHE, [cacheName], cacheName, "cache")
               ) {
                 await tryGraceful(async () => {
-                  const data = CBOR.decode(d);
+                  const data = decoder.decode(d);
                   const cache = await caches.open(cacheName);
                   const response = new Response(data.data, {
                     status: data.meta.status,
@@ -1876,24 +2137,157 @@
         await skip(padding);
       }
 
-      Object.values(dbCache).forEach((d) => d.close());
-
       if (tempBlobDir) {
         try {
           await rootOpfs.removeEntry(TEMP_BLOB_DIR, { recursive: true });
         } catch (e) {}
       }
 
+      Object.values(dbCache).forEach((d) => d.close());
       if (!aborted) {
         logger("Import complete!");
-        if (opts.onsuccess) opts.onsuccess();
       }
     } catch (e) {
-      logger("Error: " + e.message);
+      Object.values(dbCache).forEach((d) => {
+        try {
+          d.close();
+        } catch (e) {}
+      });
+
+      logger(`Error: ${e.message}`);
       if (opts.onerror) opts.onerror(e);
-      else throw e;
+      if (!graceful) throw e;
     }
   }
 
-  window.LittleExport = { importData, exportData, deriveKey, TYPE, DECISION };
+  function folderToTarStream(source, yielder) {
+    const { readable, writable } = new TransformStream();
+    // We use the existing TarWriter class to generate the stream on the fly
+    const tar = new TarWriter(writable, yielder);
+
+    (async () => {
+      try {
+        if (
+          window.FileSystemDirectoryHandle &&
+          source instanceof FileSystemDirectoryHandle
+        ) {
+          async function walk(dir, pathPrefix) {
+            for await (const [name, entry] of dir.entries()) {
+              if (entry.kind === "directory" && name === "PaxHeaders") continue;
+              const fullPath = pathPrefix ? `${pathPrefix}/${name}` : name;
+
+              if (entry.kind === "file") {
+                const file = await entry.getFile();
+                await tar.writeStream(fullPath, file.size, file.stream());
+              } else if (entry.kind === "directory") {
+                await tar.writeDir(fullPath);
+                await walk(entry, fullPath);
+              }
+            }
+          }
+          await walk(source, "");
+        } else if (
+          source instanceof FileList ||
+          (Array.isArray(source) && source[0] instanceof File)
+        ) {
+          const files = Array.from(source);
+          const relativePath = files[0].webkitRelativePath;
+          const rootName = relativePath ? relativePath.split("/")[0] + "/" : ""; // Only strip root if webkitRelativePath exists (indicates folder upload)
+
+          for (const file of files) {
+            let path = file.webkitRelativePath;
+            if (path.startsWith(rootName)) {
+              path = path.slice(rootName.length);
+            }
+
+            if (!path) path = file.name;
+            await tar.writeStream(path, file.size, file.stream());
+          }
+        }
+        await tar.close();
+      } catch (e) {
+        try {
+          await writable.abort(e);
+        } catch (e) {}
+      }
+    })();
+
+    return readable;
+  }
+
+  async function importFromFolder(config = {}) {
+    const opts = { ...config };
+    const yielder = createYielder(opts.logSpeed);
+
+    // Helper to run the importData logic using our custom stream
+    const runImport = (streamSource) => {
+      return importData({
+        ...opts,
+        source: {
+          stream: () => streamSource,
+        },
+      });
+    };
+
+    if (window.showDirectoryPicker && opts.legacy !== true) {
+      try {
+        const handle = await window.showDirectoryPicker();
+        const stream = folderToTarStream(handle, yielder);
+        return await runImport(stream);
+      } catch (e) {
+        if (e.name === "AbortError") return; // User cancelled
+        // If it fails (security, etc), fall through to legacy
+        console.warn(
+          "Directory Picker failed, falling back to legacy input",
+          e,
+        );
+      }
+    }
+
+    return new Promise((resolve, reject) => {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.webkitdirectory = true;
+      input.multiple = true;
+      input.style.display = "none";
+      document.body.appendChild(input);
+
+      input.onchange = async () => {
+        if (!input.files || input.files.length === 0) {
+          resolve(); // Cancelled or empty
+          return;
+        }
+
+        try {
+          // Convert FileList to Stream
+          const stream = folderToTarStream(input.files, yielder);
+          await runImport(stream);
+          resolve();
+        } catch (e) {
+          reject(e);
+        } finally {
+          document.body.removeChild(input);
+        }
+      };
+
+      input.oncancel = () => {
+        document.body.removeChild(input);
+        resolve();
+      };
+
+      input.click();
+    });
+  }
+
+  window.LittleExport = {
+    importData,
+    exportData,
+    deriveKey,
+    prepForCBOR,
+    restoreFromCBOR,
+    importFromFolder,
+    folderToTarStream,
+    TYPE,
+    DECISION,
+  };
 })();

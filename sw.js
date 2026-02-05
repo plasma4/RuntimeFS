@@ -1,5 +1,6 @@
 const APP_SHELL_FILES = ["./", "./index.html", "./main.min.js", "sw.min.js"]; // If you're using .php or some other configuration, make sure to change this!
 const NETWORK_ALLOWLIST_PREFIXES = []; // For custom bypassing of the virtual file system (not used by default)
+
 // Old SpiderMonkey check, because Firefox previously had weird SW header issues. ?boot=1 is used to ensure the context is "clean" and controlled because Firefox acted strangely with SWs in older versions; use `typeof InternalError !== "undefined"` to re-enable with Firefox.
 let reloadOnRequest = false;
 
@@ -8,7 +9,7 @@ const clientSessionStore = new Map();
 const handleCache = new Map();
 const manifestCache = new Map();
 const ruleCache = new Map();
-const MAX_REGEX_SIZE = 10 * 1024 * 1024;
+const MAX_REGEX_SIZE = 10 * 1024 * 1024; // Technically 10 MiB and not 10 MB, but it's fine this way
 
 const dirHandleCache = new Map(); // Cache for directory handles
 const MAX_DIR_CACHE_SIZE = 1000; // Prevent memory leaks
@@ -811,7 +812,6 @@ async function generateResponseForVirtualFile(
         const probeBuffer = await file.slice(0, 4096).arrayBuffer();
 
         if (isActuallyTextSniff(probeBuffer)) {
-          // It's verified text. Now we commit to loading it into RAM.
           const fullBuffer = await file.arrayBuffer();
           const processedBuffer = applyRegexRules(
             relativePath,

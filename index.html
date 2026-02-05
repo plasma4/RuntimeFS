@@ -110,6 +110,7 @@
             try {
                 setUiBusy(false)
                 logProgress("", true)
+                syncInfo.textContent = ""
             } finally { }
         }
         window.onunhandledrejection = function (e) {
@@ -138,6 +139,7 @@
             try {
                 setUiBusy(false)
                 logProgress("", true)
+                syncInfo.textContent = ""
             } finally { }
         }
     </script>

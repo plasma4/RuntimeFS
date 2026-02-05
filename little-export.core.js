@@ -91,10 +91,15 @@
     return true;
   }
 
-  function prepForCBOR(item, externalBlobs, seen = new WeakMap()) {
+  // All access of this function will be from LittleExport.prepForCBOR to allow for customization.
+  function prepForCBOR(
+    item,
+    externalBlobs,
+    seen = new WeakMap(),
+    blobMap = new Map(),
+  ) {
     if (!item || typeof item !== "object") return item;
 
-    // Passthrough types (add others if needed)
     if (
       item instanceof ArrayBuffer ||
       ArrayBuffer.isView(item) ||
@@ -103,44 +108,61 @@
       return item;
     }
 
-    // Handle Cycles: Return the reference to the object currently being built
     if (seen.has(item)) return seen.get(item);
 
-    // Extract Blobs
     if (item instanceof Blob) {
+      if (blobMap.has(item)) {
+        return blobMap.get(item);
+      }
+
       const id = (blobIdCounter++).toString(36);
       externalBlobs.push({ uuid: id, blob: item });
-      // Note: We don't cache Blobs in 'seen' as they aren't recursive
-      return { __le_blob_ref: id, type: item.type, size: item.size };
+
+      const ref = { __le_blob_ref: id, type: item.type, size: item.size };
+      blobMap.set(item, ref);
+      return ref;
     }
 
     let res;
 
     if (Array.isArray(item)) {
       const keys = Object.keys(item);
-      // Sparse Array Detection
       const isSparse = keys.length < item.length || keys.some((k) => isNaN(k));
 
       if (isSparse) {
         res = { __le_type: "sparse_array", length: item.length, data: {} };
-        seen.set(item, res); // Register before recursion
+        seen.set(item, res);
         for (const k of keys) {
-          res.data[k] = LittleExport.prepForCBOR(item[k], externalBlobs, seen);
+          res.data[k] = LittleExport.prepForCBOR(
+            item[k],
+            externalBlobs,
+            seen,
+            blobMap,
+          );
         }
       } else {
         res = new Array(item.length);
-        seen.set(item, res); // Register before recursion
+        seen.set(item, res);
         for (let i = 0; i < item.length; i++) {
-          res[i] = LittleExport.prepForCBOR(item[i], externalBlobs, seen);
+          res[i] = LittleExport.prepForCBOR(
+            item[i],
+            externalBlobs,
+            seen,
+            blobMap,
+          );
         }
       }
     } else {
-      // Plain Object
       res = {};
-      seen.set(item, res); // Register before recursion
+      seen.set(item, res);
       for (const k in item) {
         if (Object.prototype.hasOwnProperty.call(item, k)) {
-          res[k] = LittleExport.prepForCBOR(item[k], externalBlobs, seen);
+          res[k] = LittleExport.prepForCBOR(
+            item[k],
+            externalBlobs,
+            seen,
+            blobMap,
+          );
         }
       }
     }
@@ -304,14 +326,18 @@
       this.time = Math.floor(Date.now() / 1000);
       this.buffer = new Uint8Array(TAR_BUFFER_SIZE);
       this.bufferOffset = 0;
+      this.headerBuffer = new Uint8Array(512);
     }
 
     async writeEntry(path, data) {
       const bytes = typeof data === "string" ? ENC.encode(data) : data;
       const size = bytes.byteLength;
+      if (this.onFileProgress) this.onFileProgress(0, size);
       await this.smartWrite(path, size, async () => {
         await this.write(bytes);
       });
+
+      if (this.onFileProgress) this.onFileProgress(size, size);
     }
 
     async checkAndWritePax(path, size) {
@@ -345,9 +371,12 @@
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            await this.write(value);
-            contentWritten += value.byteLength;
-            if (this.onFileProgress) this.onFileProgress(contentWritten, size);
+            if (value) {
+              await this.write(value);
+              contentWritten += value.byteLength;
+              if (this.onFileProgress)
+                this.onFileProgress(contentWritten, size);
+            }
             const p = this.yielder();
             if (p) await p;
           }
@@ -381,7 +410,6 @@
           size === 0 && path.endsWith("/") ? "5" : "0",
         ),
       );
-      const prevFileProgress = this.bytesWritten;
       this.bytesWritten = 0;
       if (contentFn) await contentFn();
       await this.pad();
@@ -878,6 +906,8 @@
             try {
               for await (const entry of dir.values()) {
                 if (aborted) return;
+                currentFileProgress.written = 0;
+                currentFileProgress.total = 0;
 
                 const currentPath = [...pathArray, entry.name];
                 const pathStr = currentPath.join("/");
@@ -959,6 +989,8 @@
 
           for (const { name, version } of dbs) {
             if (aborted) break;
+            currentFileProgress.written = 0;
+            currentFileProgress.total = 0;
 
             status.detail = name;
             const safeName = encodeURIComponent(name);
@@ -1320,6 +1352,8 @@
 
           for (const cacheName of cacheNames) {
             if (aborted) break;
+            currentFileProgress.written = 0;
+            currentFileProgress.total = 0;
 
             let shouldProcess = trustAll;
 
@@ -1383,8 +1417,7 @@
         }
       }
 
-      status.category = "finishing";
-      status.detail = "almost done";
+      status.category = "Finishing";
       await tar.close();
       await exportFinishedPromise;
 

@@ -338,7 +338,7 @@
     }
 
     async writeStream(path, size, readableStream) {
-      this.bytesWritten = 0;
+      let contentWritten = 0; // Use a local variable for pure content tracking
       await this.smartWrite(path, size, async () => {
         const reader = readableStream.getReader();
         try {
@@ -346,8 +346,8 @@
             const { done, value } = await reader.read();
             if (done) break;
             await this.write(value);
-            if (this.onFileProgress)
-              this.onFileProgress(this.bytesWritten, size);
+            contentWritten += value.byteLength;
+            if (this.onFileProgress) this.onFileProgress(contentWritten, size);
             const p = this.yielder();
             if (p) await p;
           }
@@ -385,7 +385,7 @@
       this.bytesWritten = 0;
       if (contentFn) await contentFn();
       await this.pad();
-      this.bytesWritten = prevFileProgress + size;
+      this.bytesWritten = 0;
     }
 
     async writeDir(path) {
@@ -1159,7 +1159,6 @@
 
         if (!aborted && categoryDecision !== DECISION.SKIP) {
           status.category = "Storage";
-          status.detail = "localStorage";
           const d = {};
           const trustAll = categoryDecision === DECISION.TRUST;
 
@@ -1208,7 +1207,6 @@
 
         if (!aborted && categoryDecision !== DECISION.SKIP) {
           status.category = "Storage";
-          status.detail = "sessionStorage";
           const d = {};
           const trustAll = categoryDecision === DECISION.TRUST;
 
@@ -1257,7 +1255,6 @@
 
         if (!aborted && categoryDecision !== DECISION.SKIP) {
           status.category = "Storage";
-          status.detail = "Cookies";
           const c = {};
           const trustAll = categoryDecision === DECISION.TRUST;
 
@@ -1276,8 +1273,7 @@
 
             if (!key) continue;
 
-            status.detail = `cookie: ${key}`;
-
+            status.detail = `Cookie: ${key}`;
             let shouldInclude = trustAll;
 
             if (!shouldInclude) {
@@ -1562,14 +1558,19 @@
       }
       rawReader.releaseLock();
 
+      let totalRead = 0;
       const combinedStream = new ReadableStream({
         async start(controller) {
-          for (const chunk of initialChunks) controller.enqueue(chunk);
+          for (const chunk of initialChunks) {
+            totalRead += chunk.byteLength;
+            controller.enqueue(chunk);
+          }
           const reader = rawStream.getReader();
           try {
             while (true) {
               const { value, done } = await reader.read();
               if (done) break;
+              totalRead += value.byteLength;
               controller.enqueue(value);
             }
             controller.close();
@@ -1612,7 +1613,6 @@
       const reader = inputStream.getReader();
       const streamBuffer = new ChunkBuffer();
       let done = false;
-      let totalRead = 0;
 
       async function ensure(n) {
         while (!streamBuffer.has(n) && !done) {
@@ -1653,7 +1653,7 @@
             if (p) {
               let msg = `Importing ${status.category}: ${(totalRead / 1e6).toFixed(2)} MB`;
               if (size > 1e6) {
-                msg += ` (${status.detail}: ${(size - remaining / 1e6).toFixed(1)}/${(size / 1e6).toFixed(1)} MB)`;
+                msg += ` (${status.detail}: ${((size - remaining) / 1e6).toFixed(1)}/${(size / 1e6).toFixed(1)} MB)`;
               } else {
                 msg += ` (${status.detail})`;
               }
@@ -1682,7 +1682,9 @@
             }
           }
         } finally {
-          await writer.close();
+          try {
+            await writer.close();
+          } catch (e) {}
         }
       }
 
@@ -2168,7 +2170,7 @@
 
   function folderToTarStream(source, yielder) {
     const { readable, writable } = new TransformStream();
-    // We use the existing TarWriter class to generate the stream on the fly
+    // Generate stream on the fly
     const tar = new TarWriter(writable, yielder);
 
     (async () => {
@@ -2241,10 +2243,13 @@
         const stream = folderToTarStream(handle, yielder);
         return await runImport(stream);
       } catch (e) {
-        if (e.name === "AbortError") return; // User cancelled
-        // If it fails (security, etc), fall through to legacy
+        if (e.name === "AbortError") {
+          logger("User cancelled the directory picker.");
+          return; // User cancelled
+        }
+        logger("Directory Picker failed, falling back to legacy input.");
         console.warn(
-          "Directory Picker failed, falling back to legacy input",
+          "Directory Picker failed, falling back to legacy input.",
           e,
         );
       }

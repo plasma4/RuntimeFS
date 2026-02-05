@@ -618,7 +618,9 @@ async function writeStreamToOpfs(parentHandle, path, fileObj, options = {}) {
         .pipeTo(writable, { preventClose: true });
     }
   } finally {
-    await writable.close();
+    try {
+      await writable.close();
+    } catch (e) {}
   }
 }
 
@@ -1413,7 +1415,7 @@ async function openFileInPlace() {
   }
 
   const sw = await waitForController();
-  // Wrap SW communication in a race to ensure we don't hang forever
+  // Wrap SW communication in a race to prevent hanging
   await Promise.race([
     new Promise((resolve) => {
       const channel = new MessageChannel();

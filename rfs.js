@@ -29,17 +29,23 @@ function setUiBusy(isBusy) {
 
 function createLogger(elem, yielder) {
   let lastMsg = null;
+  let lastDomUpdate = 0;
   // Returns Promise | null
   return function (msg, force = false) {
+    const now = Date.now();
     if (msg !== lastMsg && msg !== null) {
-      elem.textContent = lastMsg = msg;
+      lastMsg = msg;
+      if (force || now - lastDomUpdate > YIELD_TIME) {
+        elem.textContent = msg;
+        lastDomUpdate = now;
+      }
     }
     return yielder(force);
   };
 }
 
 const checkYield = (function () {
-  let lastYield = Date.now();
+  let lastYield = 0;
   const pendingResolvers = [];
   const channel = new MessageChannel();
 
@@ -742,7 +748,10 @@ async function exportData() {
       const sanitizedRegistry = {};
       for (const [folderName, meta] of Object.entries(registry)) {
         sanitizedRegistry[folderName] = { ...meta };
+        const p = checkYield();
+        if (p) await p;
       }
+
       customItems.push({
         path: SYSTEM_FILE,
         data: JSON.stringify(sanitizedRegistry),
@@ -757,8 +766,8 @@ async function exportData() {
     } else if (!exportRFS && exportOPFS) {
       exclude.opfs.push(RFS_PREFIX);
     }
-    // If both or neither, include.opfs stays empty (export all / export none based on opts.opfs)
 
+    // If both or neither, include.opfs stays empty (export all / export none based on opts.opfs)
     await LittleExport.exportData({
       fileName: "result",
       password: password,
@@ -816,6 +825,7 @@ async function startImport(file) {
     let successful = true;
     let noerror = true;
 
+    logProgress("Starting...", true);
     await LittleExport.importData({
       source: file,
       graceful: true,
@@ -823,6 +833,8 @@ async function startImport(file) {
       onerror: (e) => {
         if (e.message === "A password is required to decrypt this data.") {
           successful = false;
+        } else {
+          console.error(e);
         }
         noerror = false;
         alert(e.message);
@@ -846,6 +858,10 @@ async function startImport(file) {
           ? "Import finished! Reload to fix any issues."
           : "Import finished; the import might have been incomplete or stopped. Reload to fix any issues.",
       );
+      const rT = document.getElementById("regex");
+      const hT = document.getElementById("headers");
+      rT.value = localStorage.getItem("fsRegex") || "";
+      hT.value = localStorage.getItem("fsHeaders") || "";
     }
   } catch (e) {
     console.error("Import failed:", e);
@@ -1354,8 +1370,8 @@ document.addEventListener("DOMContentLoaded", () => {
   const rT = document.getElementById("regex");
   const hT = document.getElementById("headers");
   rT.value = localStorage.getItem("fsRegex") || "";
-  rT.addEventListener("input", () => localStorage.setItem("fsRegex", rT.value));
   hT.value = localStorage.getItem("fsHeaders") || "";
+  rT.addEventListener("input", () => localStorage.setItem("fsRegex", rT.value));
   hT.addEventListener("input", () =>
     localStorage.setItem("fsHeaders", hT.value),
   );

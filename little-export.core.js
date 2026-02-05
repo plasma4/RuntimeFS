@@ -6,7 +6,7 @@
 
   function createYielder(threshold = 100) {
     // Testing has shown that Chromium's performance.now() is worst-case slower than all other browsers (but can still be called millions of times per second). Date.now() Browsers like Firefox actually have performance.now() over 10x faster than Date.now(), upwards of hundreds of millions of checks per second. However, this shouldn't really matter too much here as yielding is not checked often enough for this to add up significantly.
-    let lastYield = Date.now();
+    let lastYield = 0;
     let inflight = null;
 
     const channel = new MessageChannel();
@@ -308,7 +308,7 @@
 
     async writeEntry(path, data) {
       const bytes = typeof data === "string" ? ENC.encode(data) : data;
-      const size = bytes.length;
+      const size = bytes.byteLength;
       await this.smartWrite(path, size, async () => {
         await this.write(bytes);
       });
@@ -320,7 +320,6 @@
 
       if (needsPaxPath || needsPaxSize) {
         const paxData = createPaxData(path, size);
-        // PAX header convention: PaxHeaders/filename
         const safeName =
           "PaxHeaders/" + (path.length > 50 ? path.slice(0, 50) : path);
 
@@ -339,6 +338,7 @@
     }
 
     async writeStream(path, size, readableStream) {
+      this.bytesWritten = 0;
       await this.smartWrite(path, size, async () => {
         const reader = readableStream.getReader();
         try {
@@ -363,7 +363,6 @@
 
       if (needsPax) {
         const paxData = createPaxData(path, size);
-        // PAX Header name is arbitrary, usually "PaxHeaders/filename"
         const safePaxName =
           "PaxHeaders/" + (path.length > 50 ? path.slice(0, 50) : path);
 
@@ -382,8 +381,11 @@
           size === 0 && path.endsWith("/") ? "5" : "0",
         ),
       );
+      const prevFileProgress = this.bytesWritten;
+      this.bytesWritten = 0;
       if (contentFn) await contentFn();
       await this.pad();
+      this.bytesWritten = prevFileProgress + size;
     }
 
     async writeDir(path) {
@@ -423,7 +425,7 @@
     }
 
     async close() {
-      await this.write(new Uint8Array(1024));
+      await this.write(new Uint8Array(1024)); // EOF
       await this.flush();
       await this.writer.close();
     }
@@ -844,7 +846,7 @@
       // Custom items (always processed)
       for (const item of opts.customItems) {
         if (aborted) break;
-        status.category = "Custom";
+        status.category = "custom";
         status.detail = item.path;
         const path = `data/custom/${item.path}`;
         if (item.data instanceof Blob) {
@@ -1075,7 +1077,7 @@
                   }
                 }
 
-                status.detail = `${name} / ${sName}`;
+                status.detail = `${name}/${sName}`;
 
                 let lastKey = null;
                 let chunkId = 0;
@@ -1157,7 +1159,7 @@
 
         if (!aborted && categoryDecision !== DECISION.SKIP) {
           status.category = "Storage";
-          status.detail = "Local Storage";
+          status.detail = "localStorage";
           const d = {};
           const trustAll = categoryDecision === DECISION.TRUST;
 
@@ -1206,7 +1208,7 @@
 
         if (!aborted && categoryDecision !== DECISION.SKIP) {
           status.category = "Storage";
-          status.detail = "Session Storage";
+          status.detail = "sessionStorage";
           const d = {};
           const trustAll = categoryDecision === DECISION.TRUST;
 
@@ -1385,7 +1387,8 @@
         }
       }
 
-      status.category = "Finishing";
+      status.category = "finishing";
+      status.detail = "almost done";
       await tar.close();
       await exportFinishedPromise;
 

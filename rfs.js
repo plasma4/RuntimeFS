@@ -1,4 +1,4 @@
-const SW_LINK = "./sw.min.js"; // Change if needed!
+const SW_URL = "./sw.min.js"; // Change if needed!
 const RFS_PREFIX = "rfs"; // OPFS prefix
 const SYSTEM_FILE = "rfs_system.json"; // File with a little bit of extra data
 const CHUNK_SIZE = 4194304; // 4MB, for encrypted chunks
@@ -90,7 +90,7 @@ navigator.storage
 async function waitForController() {
   if (navigator.serviceWorker.controller)
     return navigator.serviceWorker.controller;
-  await navigator.serviceWorker.register(SW_LINK);
+  await navigator.serviceWorker.register(SW_URL);
   const reg = await navigator.serviceWorker.ready;
   return navigator.serviceWorker.controller || reg.active;
 }
@@ -814,6 +814,7 @@ async function startImport(file) {
       root.removeEntry(TEMP_BLOB_DIR, { recursive: true }),
     ]);
     let successful = true;
+    let noerror = true;
 
     await LittleExport.importData({
       source: file,
@@ -823,6 +824,7 @@ async function startImport(file) {
         if (e.message === "A password is required to decrypt this data.") {
           successful = false;
         }
+        noerror = false;
         alert(e.message);
       },
       onCustomItem: async (path, data) => {
@@ -839,7 +841,11 @@ async function startImport(file) {
         });
       }
       await listFolders();
-      alert("Import complete! Reload to fix any issues.");
+      alert(
+        noerror
+          ? "Import finished! Reload to fix any issues."
+          : "Import finished; the import might have been incomplete or stopped. Reload to fix any issues.",
+      );
     }
   } catch (e) {
     console.error("Import failed:", e);
@@ -1323,7 +1329,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   navigator.serviceWorker
-    .register(SW_LINK)
+    .register(SW_URL)
     .then((reg) => {
       reg.addEventListener("updatefound", () => {
         const newWorker = reg.installing;

@@ -724,6 +724,7 @@
       exclude: {},
       graceful: false,
       download: true,
+      cborExtensionName: "cbor",
       ...config,
     };
 
@@ -735,6 +736,7 @@
         ...opts.cborOptions,
       });
 
+    const cborExtensionName = opts.cborExtensionName;
     const logger = opts.logger || (() => {});
     const yielder = createYielder(opts.logSpeed);
     const graceful = opts.graceful;
@@ -1015,7 +1017,7 @@
 
               if (storeNames.length === 0) {
                 await tar.writeEntry(
-                  `data/idb/${safeName}/schema.cbor`,
+                  `data/idb/${safeName}/schema.${cborExtensionName}`,
                   encoder.encode({ name, version, stores: [] }),
                 );
                 continue;
@@ -1043,7 +1045,7 @@
               }
 
               await tar.writeEntry(
-                `data/idb/${safeName}/schema.cbor`,
+                `data/idb/${safeName}/schema.${cborExtensionName}`,
                 encoder.encode({ name, version, stores }),
               );
 
@@ -1130,7 +1132,7 @@
                     }
 
                     await tar.writeEntry(
-                      `data/idb/${safeName}/${encodeURIComponent(sName)}/${chunkId++}.cbor`,
+                      `data/idb/${safeName}/${encodeURIComponent(sName)}/${chunkId++}.${cborExtensionName}`,
                       encoder.encode([batch.keys, processedValues]),
                     );
                     const p = yielder();
@@ -1366,7 +1368,7 @@
 
                 // Write the metadata record containing the reference
                 await tar.writeEntry(
-                  `data/cache/${encodeURIComponent(cacheName)}/${safeHash}.cbor`,
+                  `data/cache/${encodeURIComponent(cacheName)}/${safeHash}.${cborExtensionName}`,
                   encoder.encode({
                     meta: {
                       url: req.url,
@@ -1446,6 +1448,7 @@
         ...opts.cborOptions,
       });
 
+    const cborExtensionName = opts.cborExtensionName;
     let sourceInput = opts.source;
     if (!sourceInput) {
       throw new Error(
@@ -1951,7 +1954,7 @@
               const parts = name.split("/");
               const dbName = decodeURIComponent(parts[2]);
 
-              if (name.endsWith("schema.cbor")) {
+              if (name.endsWith("schema." + cborExtensionName)) {
                 if (!(await shouldProcess(TYPE.IDB, [dbName], dbName, "idb")))
                   continue;
 

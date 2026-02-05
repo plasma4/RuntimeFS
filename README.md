@@ -13,7 +13,7 @@ After the initial page loads, RuntimeFS no longer needs internet connection to f
 
 RuntimeFS utilizes [cbor-x](https://github.com/kriszyp/cbor-x) and my own [LittleExport](https://github.com/plasma4/LittleExport) tool. The entire application is MIT-Licensed. (LittleExport is integrated directly into RuntimeFS; no so separate license file is required for that.) Only `main.min.js`, `sw.min.js`, and `index.html` are required for RuntimeFS to function.
 
-Make sure to modify `APP_SHELL_FILES` in the SW and `SW_LINK` in the main code if you are changing the file configuration for proper caching. (Code is minified by using [JSCompress](https://jscompress.com/), which uses `UglifyJS` 3 and `babel-minify`.)
+Make sure to modify `APP_SHELL_FILES` in the SW and `SW_URL` in the main code if you are changing the file configuration for proper caching. (Code is minified by using [JSCompress](https://jscompress.com/), which uses `UglifyJS` 3 and `babel-minify`.)
 
 ## Usage
 

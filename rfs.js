@@ -403,7 +403,7 @@ async function processFilesAndStore(name, fileList) {
   let bytesUploaded = 0;
   const queue = Array.from(fileList);
 
-  const updateUI = async () => {
+  const updateUI = () => {
     const mb = (bytesUploaded / 1e6).toFixed(2);
     const totalMb = (totalBytes / 1e6).toFixed(2);
     const pct =
@@ -411,8 +411,7 @@ async function processFilesAndStore(name, fileList) {
         ? ((bytesUploaded / totalBytes) * 100).toFixed(2)
         : "100.00";
 
-    const p = logProgress(`Uploading: ${pct}% (${mb} / ${totalMb} MB)`);
-    if (p) await p;
+    return logProgress(`Uploading: ${pct}% (${mb} / ${totalMb} MB)`);
   };
 
   const worker = async () => {
@@ -436,8 +435,8 @@ async function processFilesAndStore(name, fileList) {
           bytesUploaded += delta;
           bytesSinceLastUI += delta;
           if (bytesSinceLastUI > 1048576) {
-            // 1MB throttle
-            await updateUI();
+            let p = updateUI();
+            if (p) await p;
             bytesSinceLastUI = 0;
           }
         },
@@ -481,7 +480,7 @@ async function processFolderStreaming(name, srcHandle) {
   let totalBytesDiscovered = 0;
   let bytesUploaded = 0;
 
-  const updateUI = async () => {
+  const updateUI = () => {
     const uploadedMB = (bytesUploaded / 1e6).toFixed(2);
     const totalFoundMB = (totalBytesDiscovered / 1e6).toFixed(2);
 
@@ -489,8 +488,7 @@ async function processFolderStreaming(name, srcHandle) {
       ? `Finishing: ${uploadedMB} MB / ${totalFoundMB} MB`
       : `Scanning: ${uploadedMB} MB / ${totalFoundMB} MB`;
 
-    const p = logProgress(msg);
-    if (p) await p;
+    return logProgress(msg);
   };
 
   const worker = async () => {
@@ -513,7 +511,8 @@ async function processFolderStreaming(name, srcHandle) {
           bytesUploaded += delta;
           bytesSinceLastUI += delta;
           if (bytesSinceLastUI > 1048576) {
-            await updateUI();
+            let p = updateUI();
+            if (p) await p;
             bytesSinceLastUI = 0;
           }
         },
@@ -538,7 +537,8 @@ async function processFolderStreaming(name, srcHandle) {
           totalBytesDiscovered += file.size;
 
           uploadQueue.push({ dest, entry, fileOverride: file });
-          await updateUI();
+          let p = updateUI();
+          if (p) await p;
 
           // Backpressure loop: prevent the scan from eating all RAM if I/O is slow
           while (uploadQueue.length > 500) {

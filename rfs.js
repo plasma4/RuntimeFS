@@ -414,11 +414,10 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
       if (!entryTask) break;
       const [originalPath, meta] = entryTask;
 
-      // Optimization: Only create a microtask if the yielder determines it is time.
-      const pLog = logProgress(
+      const p = logProgress(
         `Decrypting (${processedFiles}/${totalFiles}): ${originalPath}`,
       );
-      if (pLog) await pLog;
+      if (p) await p;
 
       const pathParts = originalPath.split("/");
       const fileName = pathParts.pop();
@@ -450,7 +449,7 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
         const handle = await contentDir.getFileHandle(meta.id);
         srcFile = await handle.getFile();
       } catch (e) {
-        console.warn(`Missing: ${originalPath}`);
+        console.warn(`Missing file: ${originalPath}`);
         processedFiles++;
         continue;
       }
@@ -727,7 +726,7 @@ async function writeStreamToOpfs(parentHandle, path, fileObj, options = {}) {
   }
 
   const fileHandle = await currentDir.getFileHandle(fileName, { create: true });
-  const writable = await fileHandle.createWritable();
+  const writable = await fileHandle.createWritable({ keepExistingData: false });
 
   try {
     if (!onProgress) {
@@ -936,100 +935,92 @@ async function importData() {
 
 async function startImport(sourceInput) {
   setUiBusy(true);
-  const TEMP_BLOB_DIR = ".rfs_temp_blobs";
   _registryCache = null;
+  localStorage.setItem("rfs_partial", "1"); // flag for incomplete import
 
   try {
-    const root = await navigator.storage.getDirectory();
+    let registryInImport;
+    logProgress("Starting import...", true);
 
-    // Clean up before import
-    await Promise.allSettled([
-      root.removeEntry(RFS_PREFIX, { recursive: true }),
-      root.removeEntry(SYSTEM_FILE),
-      root.removeEntry(TEMP_BLOB_DIR, { recursive: true }),
-    ]);
-    let successful = true;
-    let noerror = true;
-
-    logProgress("Starting...", true);
-
-    // Config object determines if source is a file/blob or a special stream object
     const importConfig = {
       graceful: true,
       logger: logProgress,
-      onerror: (e) => {
-        if (e.message === "A password is required to decrypt this data.") {
-          successful = false;
-        } else {
-          console.error(e);
-        }
-        noerror = false;
-        alert(e.message);
-      },
       onCustomItem: async (path, data) => {
         if (path === SYSTEM_FILE) {
-          const registry = JSON.parse(new TextDecoder().decode(data));
-          await saveRegistry(registry);
+          // Store the imported registry in memory for merging later
+          registryInImport = JSON.parse(new TextDecoder().decode(data));
+        }
+      },
+      onerror: (e) => {
+        if (e.message !== "A password is required to decrypt this data.") {
+          console.error(e);
+          alert("Import encountered an error: " + e.message);
         }
       },
     };
 
-    // If sourceInput has a stream function (LittleExport stream wrapper) or is a Blob/File
-    if (sourceInput.stream || sourceInput instanceof Blob) {
-      importConfig.source = sourceInput;
-    } else {
-      throw new Error("Invalid import source.");
-    }
-
+    importConfig.source = sourceInput;
     await LittleExport.importData(importConfig);
-    let registryRestored = false;
-    try {
-      await root.getFileHandle(SYSTEM_FILE);
-      registryRestored = true;
-    } catch (e) {}
 
-    if (!registryRestored) {
-      logProgress("Reconstructing registry...", true);
-      const newRegistry = {};
-      try {
-        const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX);
-        for await (const name of rfsRoot.keys()) {
-          // Default settings for discovered folders
-          newRegistry[name] = {
-            created: Date.now(),
-            headers: "",
-            rules: "",
-          };
-        }
-        await saveRegistry(newRegistry);
-      } catch (e) {
-        // Might not exist if import was empty
-      }
-    }
+    logProgress("Merging metadata...", true);
+    const existingRegistry = await getRegistry();
+    const mergedRegistry = {
+      ...existingRegistry,
+      ...(registryInImport || {}),
+    };
 
-    if (successful) {
-      await listFolders();
-      alert(
-        noerror
-          ? "Import finished! Reload to fix any issues."
-          : "Import finished; the import might have been incomplete or stopped. Reload to fix any issues.",
-      );
-      const rT = document.getElementById("regex");
-      const hT = document.getElementById("headers");
-      rT.value = localStorage.getItem("fsRegex") || "";
-      hT.value = localStorage.getItem("fsHeaders") || "";
-    }
+    await saveRegistry(mergedRegistry);
+    await validateAndRepairRegistry();
+    localStorage.removeItem("rfs_partial");
+    await listFolders();
+    alert("Import complete!");
   } catch (e) {
     console.error("Import failed:", e);
     alert("Import failed: " + e.message);
   } finally {
     setUiBusy(false);
     logProgress("", true);
-    if (navigator.serviceWorker.controller) {
-      navigator.serviceWorker.controller.postMessage({
-        type: "INVALIDATE_CACHE",
-      });
+  }
+}
+
+async function validateAndRepairRegistry() {
+  const root = await getOpfsRoot();
+  const registry = await getRegistry();
+  let changed = false;
+
+  try {
+    const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
+    const diskFolderNames = [];
+    for await (const name of rfsRoot.keys()) {
+      diskFolderNames.push(name);
     }
+
+    diskFolderNames.forEach((name) => {
+      if (!registry[name]) {
+        registry[name] = {
+          created: Date.now(),
+          headers: localStorage.getItem("fsHeaders") || "",
+          rules: localStorage.getItem("fsRegex") || "",
+        };
+        changed = true;
+      }
+    });
+
+    const registryNames = Object.keys(registry);
+    await Promise.all(
+      registryNames.map(async (name) => {
+        try {
+          await rfsRoot.getDirectoryHandle(name);
+        } catch (e) {
+          delete registry[name];
+          changed = true;
+        }
+      }),
+    );
+
+    if (changed) await saveRegistry(registry);
+  } catch (e) {
+    console.warn("Repair failed:", e);
   }
 }
 
@@ -1201,8 +1192,8 @@ async function uploadAndEncryptWithPassword() {
         if (entry.kind === "file") {
           const fileId = crypto.randomUUID();
           queue.push({ entry, entryPath, fileId });
-          // Backpressure during scan
           while (queue.length > 500) {
+            // handle backpressure
             await new Promise((resolve) => setTimeout(resolve, 20));
           }
         } else {
@@ -1554,6 +1545,13 @@ document.addEventListener("DOMContentLoaded", () => {
     if (e.data && e.data.type === "SW_READY") await listFolders();
     if (e.data && e.data.type === "INVALIDATE_CACHE") await listFolders();
   });
+
+  if (localStorage.getItem("rfs_partial")) {
+    validateAndRepairRegistry().then(() => {
+      localStorage.removeItem("rfs_partial");
+      listFolders();
+    });
+  }
 
   listFolders();
 

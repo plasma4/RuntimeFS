@@ -79,7 +79,7 @@
       if (typeof filter === "function") {
         return filter(pathStr);
       } else if (Array.isArray(filter) && filter.length > 0) {
-        return filter.some((t) => pathStr.startsWith(t));
+        return filter.some((t) => pathStr === t || pathStr.startsWith(t + "/"));
       }
     }
 
@@ -125,7 +125,7 @@
       const isSparse = keys.length < item.length || keys.some((k) => isNaN(k));
 
       if (isSparse) {
-        res = { __le_type: "sparse_array", length: item.length, data: {} };
+        res = { __le_sparse: true, length: item.length, data: {} };
         seen.set(item, res);
         for (const k of keys) {
           res.data[k] = LittleExport.prepForCBOR(
@@ -177,17 +177,11 @@
         return null; // Blob not found, gracefully return null
       }
     }
-    if (item.__le_blob) {
-      return new Blob([item.data], { type: item.type });
-    }
-    if (item.__le_circular) {
-      return null; // Can't restore circular references
-    }
-    if (item.__le_type === "sparse_array") {
+
+    if (item.__le_sparse) {
       const arr = new Array(item.length);
-      // data contains the indices
       for (const k in item.data) {
-        arr[k] = await LittleExport.restoreFromCBOR(item.data[k], tempBlobDir);
+        arr[k] = await restoreFromCBOR(item.data[k], tempBlobDir);
       }
       return arr;
     }
@@ -233,7 +227,7 @@
     let content = new Uint8Array(0);
 
     const addRecord = (keyword, value) => {
-      if (value === null || value === undefined) return;
+      if (value == null) return;
       const strVal = String(value);
       // Format: "length keyword=value\n"
       const suffix = ` ${keyword}=${strVal}\n`;
@@ -243,7 +237,7 @@
       let total = suffixBytes.length;
       let lenStr = String(total);
 
-      // Adjust length until it stabilizes (e.g. 9 -> 10 adds a digit)
+      // Adjust length until it stabilizes (since going from length 9 to 10 adds a digit)
       while (true) {
         const newTotal = suffixBytes.length + lenStr.length;
         if (newTotal === total) break;
@@ -275,13 +269,8 @@
 
     // Write filename
     const nameBytes = ENC.encode(filename);
-    if (nameBytes.length > 100) {
-      let cut = 100;
-      while (cut > 0 && (nameBytes[cut] & 0xc0) === 0x80) cut--;
-      buffer.set(nameBytes.subarray(0, cut), 0);
-    } else {
-      buffer.set(nameBytes, 0);
-    }
+    const copyLen = Math.min(nameBytes.length, 100);
+    buffer.set(nameBytes.subarray(0, copyLen), 0);
 
     if (mode) {
       ENC.encodeInto(mode.padEnd(7, "\0"), buffer.subarray(100, 108));
@@ -317,11 +306,9 @@
       this.writer = writableStream.getWriter();
       this.yielder = yielder;
       this.pos = 0;
-      this.bytesWritten = 0;
       this.time = Math.floor(Date.now() / 1000);
       this.buffer = new Uint8Array(TAR_BUFFER_SIZE);
       this.bufferOffset = 0;
-      this.headerBuffer = new Uint8Array(512);
     }
 
     async writeEntry(path, data) {
@@ -333,29 +320,6 @@
       });
 
       if (this.onFileProgress) this.onFileProgress(size, size);
-    }
-
-    async checkAndWritePax(path, size) {
-      const needsPaxPath = ENC.encode(path).length > 100;
-      const needsPaxSize = size > 8589934591;
-
-      if (needsPaxPath || needsPaxSize) {
-        const paxData = createPaxData(path, size);
-        const safeName =
-          "PaxHeaders/" + (path.length > 50 ? path.slice(0, 50) : path);
-
-        const paxHeader = createTarHeader(
-          safeName,
-          paxData.length,
-          this.time,
-          "x",
-        );
-        await this.write(paxHeader);
-        await this.write(paxData);
-        await this.pad();
-        return true;
-      }
-      return false;
     }
 
     async writeStream(path, size, readableStream) {
@@ -399,11 +363,11 @@
     }
 
     async smartWrite(path, size, contentFn) {
-      const pathBytes = ENC.encode(path); // byte length matters, not string
+      const pathBytes = ENC.encode(path);
       const needsPax = pathBytes.length > 100 || size > 8589934591;
 
       if (needsPax) {
-        const paxData = createPaxData(path, size);
+        const paxData = createPaxData(path, size); // Already handles encoding internally
         const safePaxName =
           "PaxHeaders/" + (path.length > 50 ? path.slice(0, 50) : path);
 
@@ -422,14 +386,29 @@
           size === 0 && path.endsWith("/") ? "5" : "0",
         ),
       );
-      this.bytesWritten = 0;
       if (contentFn) await contentFn();
       await this.pad();
-      this.bytesWritten = 0;
     }
 
     async writeDir(path) {
-      await this.checkAndWritePax(path, 0);
+      // Ensure path ends with /
+      if (!path.endsWith("/")) path += "/";
+
+      // Inline PAX logic
+      const pathBytes = ENC.encode(path);
+      const needsPax = pathBytes.length > 100;
+
+      if (needsPax) {
+        const paxData = createPaxData(path, 0);
+        const safePaxName =
+          "PaxHeaders/" + (path.length > 50 ? path.slice(0, 50) : path);
+        await this.write(
+          createTarHeader(safePaxName, paxData.length, this.time, "x"),
+        );
+        await this.write(paxData);
+        await this.pad();
+      }
+
       const header = createTarHeader(path, 0, this.time, "5", "000755");
       await this.write(header);
     }
@@ -449,7 +428,6 @@
       }
 
       this.pos += len;
-      this.bytesWritten += len;
     }
 
     async pad() {
@@ -763,20 +741,13 @@
     blobIdCounter = 0;
     const CBOR = window.CBOR;
 
+    // Check the LittleExport docs on all the options.
     const opts = {
       fileName: "archive",
-      opfs: true,
-      localStorage: true,
-      session: true,
-      cookies: true,
-      idb: true,
-      cache: true,
       logSpeed: 100,
       customItems: [],
-      include: {},
+      include: {}, // logic handled with checkSimpleFilter
       exclude: {},
-      graceful: false,
-      download: true,
       cborExtensionName: "cbor",
       ...config,
     };
@@ -793,7 +764,7 @@
     const cborExtensionName = opts.cborExtensionName;
     const logger = opts.logger || (() => {});
     const yielder = createYielder(opts.logSpeed);
-    const graceful = opts.graceful;
+    const graceful = opts.graceful !== false;
     const useOnVisit = typeof opts.onVisit === "function";
     const onVisit = opts.onVisit;
 
@@ -834,7 +805,7 @@
           logger("Export cancelled.");
           return;
         }
-        console.warn("FileSystem picker failed, falling back.");
+        LittleExport.warn("FileSystem picker failed, falling back.");
       }
     }
 
@@ -848,16 +819,12 @@
     }
 
     let outputBytesWritten = 0;
-    let lastLogTime = 0;
     const countingStream = new TransformStream({
       async transform(chunk, controller) {
         outputBytesWritten += chunk.byteLength;
-        const now = Date.now();
-        // Optimization: Only update UI and check yield occasionally to prevent bottleneck
-        // Check yield approx every 100ms or logSpeed
-        if (now - lastLogTime > opts.logSpeed) {
-          lastLogTime = now;
-          if (status.category)
+        const p = yielder();
+        if (p) {
+          if (status.category) {
             if (status.category === "Finishing") {
               logger("Finishing...");
             } else {
@@ -869,8 +836,8 @@
               }
               logger(msg);
             }
-          const p = yielder();
-          if (p) await p;
+          }
+          await p;
         }
         controller.enqueue(chunk);
       },
@@ -919,7 +886,7 @@
 
       // OPFS
       if (!aborted && opts.opfs && navigator.storage) {
-        let categoryDecision = getDecision(TYPE.OPFS, undefined, undefined);
+        let categoryDecision = getDecision(TYPE.OPFS);
         if (categoryDecision && typeof categoryDecision.then === "function")
           categoryDecision = await categoryDecision;
 
@@ -975,9 +942,8 @@
                     );
                   }, `OPFS file ${pathStr}`);
                 } else {
-                  // Write directory entry
+                  // Write and recurse
                   await tar.writeDir(`opfs/${pathStr}`);
-                  // Recurse
                   await walkOpfs(
                     entry,
                     currentPath,
@@ -1004,7 +970,7 @@
 
       // IndexedDB
       if (!aborted && opts.idb && window.indexedDB && CBOR) {
-        let categoryDecision = getDecision(TYPE.IDB, undefined, undefined);
+        let categoryDecision = getDecision(TYPE.IDB);
         if (categoryDecision && typeof categoryDecision.then === "function")
           categoryDecision = await categoryDecision;
 
@@ -1211,7 +1177,7 @@
 
       // localStorage
       if (!aborted && opts.localStorage) {
-        let categoryDecision = getDecision(TYPE.LS, undefined, undefined);
+        let categoryDecision = getDecision(TYPE.LS);
         if (categoryDecision && typeof categoryDecision.then === "function")
           categoryDecision = await categoryDecision;
 
@@ -1259,7 +1225,7 @@
 
       // sessionStorage
       if (!aborted && opts.session) {
-        let categoryDecision = getDecision(TYPE.SS, undefined, undefined);
+        let categoryDecision = getDecision(TYPE.SS);
         if (categoryDecision && typeof categoryDecision.then === "function")
           categoryDecision = await categoryDecision;
 
@@ -1307,7 +1273,7 @@
 
       // Cookies
       if (!aborted && opts.cookies) {
-        let categoryDecision = getDecision(TYPE.COOKIE, undefined, undefined);
+        let categoryDecision = getDecision(TYPE.COOKIE);
         if (categoryDecision && typeof categoryDecision.then === "function")
           categoryDecision = await categoryDecision;
 
@@ -1367,7 +1333,7 @@
 
       // Cache storage
       if (!aborted && opts.cache && window.caches && CBOR) {
-        let categoryDecision = getDecision(TYPE.CACHE, undefined, undefined);
+        let categoryDecision = getDecision(TYPE.CACHE);
         if (categoryDecision && typeof categoryDecision.then === "function")
           categoryDecision = await categoryDecision;
 
@@ -1451,7 +1417,7 @@
 
       let result = null;
 
-      if (!window.showSaveFilePicker) {
+      if (chunks.length > 0) {
         result = new Blob(chunks, { type: "application/octet-stream" });
       }
 
@@ -1491,15 +1457,9 @@
   async function importData(config = {}) {
     const CBOR = window.CBOR;
 
+    // Check the LittleExport docs on all the options.
     const opts = {
-      opfs: true,
-      localStorage: true,
-      session: true,
-      cookies: true,
-      idb: true,
-      cache: true,
       logSpeed: 100,
-      graceful: false,
       ...config,
     };
 
@@ -1523,11 +1483,12 @@
 
     const logger = opts.logger || (() => {});
     const yielder = createYielder(opts.logSpeed);
-    const graceful = opts.graceful;
+    const graceful = opts.graceful !== false;
     const useOnVisit = typeof opts.onVisit === "function";
     const onVisit = opts.onVisit;
 
     let aborted = false;
+    let rootOpfs = null;
     const categoryDecisions = {};
     const trustedPaths = {};
 
@@ -1552,7 +1513,7 @@
 
       if (categoryDecisions[categoryKey] === undefined) {
         if (useOnVisit) {
-          let decision = getDecision(type, undefined, undefined);
+          let decision = getDecision(type);
           if (decision && typeof decision.then === "function")
             decision = await decision;
           categoryDecisions[categoryKey] = decision;
@@ -1604,7 +1565,7 @@
     try {
       let rawStream;
       if (typeof sourceInput === "string") {
-        const response = await fetch(sourceInput);
+        const response = await fetch(sourceInput, config.fetchInit);
         if (!response.ok) throw new Error("Fetching of URL failed.");
         rawStream = response.body;
       } else if (sourceInput && typeof sourceInput.stream === "function") {
@@ -1661,6 +1622,9 @@
       let inputStream;
 
       if (sig === "LE_ENC") {
+        if (opts.password === null) {
+          throw new Error("A password is required to decrypt this data.");
+        }
         let password = opts.password || prompt("Enter the password:");
         if (!password)
           throw new Error("A password is required to decrypt this data.");
@@ -1701,14 +1665,13 @@
       }
 
       async function skip(n) {
-        while (n > 0) {
+        let remaining = n;
+        while (remaining > 0) {
           if (streamBuffer.totalSize === 0 && !done) await ensure(1);
           if (streamBuffer.totalSize === 0) break;
-
-          // Consume chunks logic handled internally by ChunkBuffer now via read/consume
-          // But to just skip without callback:
-          await streamBuffer.consume(n, () => {});
-          n = 0; // consumed
+          const toSkip = Math.min(remaining, streamBuffer.totalSize);
+          streamBuffer.read(toSkip); // discard
+          remaining -= toSkip;
         }
       }
 
@@ -1754,12 +1717,18 @@
         }
       }
 
-      const rootOpfs = await navigator.storage.getDirectory();
+      rootOpfs =
+        opts.opfs !== false && navigator.storage
+          ? await navigator.storage.getDirectory()
+          : null;
+
       let tempBlobDir;
       try {
-        tempBlobDir = await rootOpfs.getDirectoryHandle(TEMP_BLOB_DIR, {
-          create: true,
-        });
+        if (rootOpfs) {
+          tempBlobDir = await rootOpfs.getDirectoryHandle(TEMP_BLOB_DIR, {
+            create: true,
+          });
+        }
       } catch (e) {}
 
       const processedDbSchemas = new Set();
@@ -1805,12 +1774,11 @@
 
         if (!hasHeader) {
           // Stream ended but we never saw the two null blocks
-          if (!foundEofMarker) {
-            // Relaxed check: if we processed at least one file, we consider it a success with a warning,
-            // otherwise it's a hard error.
+          if (opts.verifyFile !== false && !foundEofMarker) {
+            // If we processed at least one file, consider it successful anyway
             if (filesProcessed > 0 && streamBuffer.totalSize === 0) {
-              logger(
-                "Warning: Stream ended without standard EOF blocks. Import likely successful.",
+              LittleExport.warn(
+                "Warning: Stream ended without standard EOF blocks; import likely successful.",
               );
             } else {
               throw new Error("Archive truncated: Stream ended prematurely.");
@@ -1822,12 +1790,16 @@
         const header = streamBuffer.read(512);
 
         // Check for the first EOF block (all zeros)
-        if (header[0] === 0 && header.every((b) => b === 0)) {
+        if (
+          opts.verifyFile !== false &&
+          header[0] === 0 &&
+          header.every((b) => b === 0)
+        ) {
           foundEofMarker = true;
           continue;
         }
 
-        if (!verifyChecksum(header)) {
+        if (opts.verifyFile !== false && !verifyChecksum(header)) {
           // Relaxed check: if we are at EOF (trailing garbage) and have processed files, stop.
           if (filesProcessed > 0 && streamBuffer.totalSize === 0 && done) {
             break;
@@ -1897,8 +1869,8 @@
                 const fh = await tempBlobDir.getFileHandle(uuid, {
                   create: true,
                 });
-                dataConsumed = true;
                 await streamToWriter(await fh.createWritable(), size);
+                dataConsumed = true;
               }, `Blob ${uuid}`);
               if (!dataConsumed) {
                 await skip(size);
@@ -2163,7 +2135,15 @@
                 await tryGraceful(async () => {
                   const data = decoder.decode(d);
                   const cache = await caches.open(cacheName);
-                  const response = new Response(data.data, {
+                  const restoredData = await LittleExport.restoreFromCBOR(
+                    data.data,
+                    tempBlobDir,
+                  );
+                  const blob =
+                    restoredData instanceof Blob
+                      ? restoredData
+                      : new Blob([restoredData]);
+                  const response = new Response(blob, {
                     status: data.meta.status,
                     headers: data.meta.headers,
                   });
@@ -2225,12 +2205,6 @@
         await skip(padding);
       }
 
-      if (tempBlobDir) {
-        try {
-          await rootOpfs.removeEntry(TEMP_BLOB_DIR, { recursive: true });
-        } catch (e) {}
-      }
-
       Object.values(dbCache).forEach((d) => d.close());
       if (!aborted) {
         logger("Import complete!");
@@ -2246,9 +2220,11 @@
       if (opts.onerror) opts.onerror(e);
       if (!graceful) throw e;
     } finally {
-      try {
-        await rootOpfs.removeEntry(TEMP_BLOB_DIR, { recursive: true });
-      } catch (e) {}
+      if (rootOpfs) {
+        try {
+          await rootOpfs.removeEntry(TEMP_BLOB_DIR, { recursive: true });
+        } catch (e) {}
+      }
     }
   }
 
@@ -2308,8 +2284,11 @@
   }
 
   async function importFromFolder(config = {}) {
-    const opts = { ...config };
+    const opts = {
+      ...config,
+    };
     const yielder = createYielder(opts.logSpeed);
+    let logger = opts.logger || (() => {});
 
     // Helper to run the importData logic using our custom stream
     const runImport = (streamSource) => {
@@ -2332,7 +2311,7 @@
           return;
         }
         logger("Directory Picker failed, falling back to legacy input.");
-        console.warn(
+        LittleExport.warn(
           "Directory Picker failed, falling back to legacy input.",
           e,
         );
@@ -2354,7 +2333,6 @@
         }
 
         try {
-          // Convert FileList to Stream
           const stream = folderToTarStream(input.files, yielder);
           await runImport(stream);
           resolve();
@@ -2394,7 +2372,7 @@
           await root.removeEntry(name, { recursive: true });
         }
       } catch (e) {
-        console.warn("Failed to clear OPFS:", e);
+        LittleExport.warn("Failed to clear OPFS:", e);
       }
     }
 
@@ -2402,7 +2380,7 @@
       try {
         localStorage.clear();
       } catch (e) {
-        console.warn("Failed to clear localStorage:", e);
+        LittleExport.warn("Failed to clear localStorage:", e);
       }
     }
 
@@ -2410,20 +2388,20 @@
       try {
         sessionStorage.clear();
       } catch (e) {
-        console.warn("Failed to clear sessionStorage:", e);
+        LittleExport.warn("Failed to clear sessionStorage:", e);
       }
     }
 
     if (types.cookies) {
       try {
-        // Note that cookie logic is not guaranteed to clear custom paths.
+        // Note that this cookie logic is not guaranteed to clear custom domains or non-standard paths.
         const cookies = document.cookie.split(";");
 
         for (let i = 0; i < cookies.length; i++) {
           const cookie = cookies[i];
           const eqPos = cookie.indexOf("=");
           const name =
-            eqPos > -1 ? cookie.trim().substr(0, eqPos) : cookie.trim();
+            eqPos > -1 ? cookie.trim().substring(0, eqPos) : cookie.trim();
 
           document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/`; // current path
           document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; domain=${window.location.hostname}; path=/`; // current domain
@@ -2434,7 +2412,7 @@
           }
         }
       } catch (e) {
-        console.warn("Failed to clear cookies:", e); // might be possible technically
+        LittleExport.warn("Failed to clear cookies:", e); // might be possible technically
       }
     }
 
@@ -2443,7 +2421,7 @@
         const keys = await caches.keys();
         for (const k of keys) await caches.delete(k);
       } catch (e) {
-        console.warn("Failed to clear cache:", e); // might be possible technically
+        LittleExport.warn("Failed to clear cache:", e); // might be possible technically
       }
     }
 
@@ -2454,7 +2432,7 @@
           indexedDB.deleteDatabase(name);
         }
       } catch (e) {
-        console.warn("Failed to clear IndexedDB:", e);
+        LittleExport.warn("Failed to clear IndexedDB:", e);
       }
     }
   }
@@ -2469,6 +2447,7 @@
     folderToTarStream,
     clearData,
     TYPE,
+    warn: console.warn,
     DECISION,
   };
 })();

@@ -5,9 +5,11 @@ View the [working demo](https://plasma4.org/projects/RuntimeFS/)!
 
 RuntimeFS is a no-nonsense `OPFS` and `ServiceWorker` file-system, served in your browser, allowing you to import custom folders and access them like a localhost. It allows you to open HTML projects, use some encryption techniques, and comes with **full offline** and **complete .tar.gz or encrypted data export** functionality.
 
-Imagine an offline localhost, in your browser with no server-based storage of files. It saves all files and data locally, and can easily be integrated within an existing website too (the code is MIT Licensed, and less than 100KB).
+Imagine an offline localhost, in your browser with no server-based storage of files. It saves all files and data locally, and can easily be integrated within an existing website too (the code is MIT Licensed, and around 100KB in size).
 
 After the initial page loads, RuntimeFS no longer needs internet connection to function. RuntimeFS also supports in-place opening of files, which doesn't require opening another tab.
+
+RuntimeFS may encounter a `QuotaExceededError` when out of memory or executing in private tabs, or an `InvalidStateError` after clearing site data.
 
 ## Dependencies and Requirements
 
@@ -17,13 +19,13 @@ Make sure to modify `APP_SHELL_FILES` in the SW and `SW_URL` in the main code if
 
 ## Usage
 
-You can use Enter on text inputs to perform actions, instead of clicking buttons. On the Folder to Open section text inputs you can use Shift+Enter to open in-place and Ctrl/Cmd+Enter to sync and open. (Syncing will only show up after uploading a folder, through a supported browser. Drag-and-drop should work for all browsers but won't allow syncing.)
+You can use Enter on text inputs to perform actions, instead of clicking buttons. On the Folder to Open section text inputs you can use Shift+Enter to open in-place and Ctrl/Cmd+Enter to sync and open. (Syncing will only show up after uploading a folder, through a supported browser. Drag-and-drop should work for all browsers but won't allow syncing.) You can extract a `.tar.gz` file and re-upload that folder.
 
 Custom regex and headers save on reload or export but do not affect stored files; they simply modify headers when opening a file in the `/n/` virtual path from the RuntimeFS menu (reloading or navigating to the URL directly do not yet). Many headers won't work when opening in-place like CORS.
 
 It's possible to import or export specified data types in the Data Management menu, and you can also drag-and-drop import files (.tar.gz or .enc).
 
-To update to a newer version, a single-file plugin exists for customizing cache in `plugin/index.html` (or simply to request an update), allowing for you to fully customize RuntimeFS from any site hosting it. Note that simply hard reloading won't update the cache. If this isn't included in the way you use RuntimeFS, you can upload it as a virtual folder. Example link with the demo [here](https://plasma4.org/projects/RuntimeFS/plugin/).
+To update to a newer version, a single-file plugin exists for customizing RuntimeFS at `plugin/index.html`, allowing for you to fully customize RuntimeFS from any site hosting it. Note that hard-reloading should update the cache and serve the latest version, but isn't guaranteed. If the plugin isn't included in the way you use RuntimeFS, you can upload it as a folder and access it directly. Example link with the demo [here](https://plasma4.org/projects/RuntimeFS/plugin/).
 
 ## Browser Support
 
@@ -79,12 +81,13 @@ Also note:
 - There may be some highly specific crash cases when exporting; check LittleExport documentation for details.
 - `.cbor` files are non-standard (`with bundleStrings`). To read a more JS-friendly version of these files, please check LittleExport documentation.
 - Regex attempts to only operate on text files; the checking should be performant and accurate for almost all cases. You can customize the `isActuallyText` function in the SW if necessary.
+- RuntimeFS does **not** make any attempts to prevent network activities to external domains (or the domain hosting RuntimeFS); you may want to consider using custom headers and/or changing `document.cookie` writes/accesses to be local-only for folders you upload.
 - Check `getMimeType` in the ServiceWorker for the supported MIME types; you may need to add your own in some cases.
-- You might encounter freezing of all RuntimeFS-related tabs if any tab is stuck or waiting for something (such as making a IndexedDB writable). RuntimeFS might also encounter a QuotaExceededError in certain situations (like running out of memory or private tabs).
+- You might encounter freezing of all RuntimeFS-related tabs if any tab is stuck or waiting for something (such as making a IndexedDB writable).
 
 ### TODO
 
 - RuntimeCode, an MIT-licensed fork of VSCode that integrates with RuntimeFS with dedicated web development components, plus Eruda to act as a fake inspector
 - More plugin features with granular export options
-- LittleExport improvements (see its [dedicated repo](https://github.com/plasma4/LittleExport))
+- LittleExport improvements (see its [dedicated repo](https://github.com/plasma4/LittleExport) for TODOs)
 - More complete documentation

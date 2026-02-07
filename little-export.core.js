@@ -360,6 +360,7 @@
 
     async writeStream(path, size, readableStream) {
       let contentWritten = 0;
+      await this.flush();
       await this.smartWrite(path, size, async () => {
         const reader = readableStream.getReader();
         try {
@@ -552,6 +553,7 @@
     constructor() {
       this.chunks = [];
       this.totalSize = 0;
+      this.offset = 0; // Pointer to start of valid data in chunks[0]
     }
 
     push(chunk) {
@@ -566,18 +568,18 @@
 
     _internalConsume(n, callback) {
       let consumed = 0;
-      while (consumed < n) {
+      while (consumed < n && this.chunks.length > 0) {
         const chunk = this.chunks[0];
+        const availableInChunk = chunk.byteLength - this.offset;
         const remainingNeeded = n - consumed;
-        const toTake = Math.min(chunk.byteLength, remainingNeeded);
+        const toTake = Math.min(availableInChunk, remainingNeeded);
 
-        // Provide the segment to the requester
-        callback(chunk.subarray(0, toTake));
+        callback(chunk.subarray(this.offset, this.offset + toTake));
 
-        if (toTake === chunk.byteLength) {
+        this.offset += toTake;
+        if (this.offset >= chunk.byteLength) {
           this.chunks.shift();
-        } else {
-          this.chunks[0] = chunk.subarray(toTake);
+          this.offset = 0;
         }
 
         this.totalSize -= toTake;
@@ -589,10 +591,17 @@
       if (n === 0) return new Uint8Array(0);
       if (this.totalSize < n) throw new Error("Insufficient chunk data.");
 
-      if (this.chunks[0].byteLength >= n) {
-        const res = this.chunks[0].subarray(0, n);
-        if (this.chunks[0].byteLength === n) this.chunks.shift();
-        else this.chunks[0] = this.chunks[0].subarray(n);
+      // Fast path: data is fully contained in the first chunk
+      if (
+        this.chunks.length > 0 &&
+        this.chunks[0].byteLength - this.offset >= n
+      ) {
+        const res = this.chunks[0].subarray(this.offset, this.offset + n);
+        this.offset += n;
+        if (this.offset >= this.chunks[0].byteLength) {
+          this.chunks.shift();
+          this.offset = 0;
+        }
         this.totalSize -= n;
         return res;
       }
@@ -608,17 +617,17 @@
 
     async consume(n, callback) {
       let remaining = n;
-      while (remaining > 0) {
+      while (remaining > 0 && this.chunks.length > 0) {
         const chunk = this.chunks[0];
-        const toProcess = Math.min(chunk.byteLength, remaining);
+        const availableInChunk = chunk.byteLength - this.offset;
+        const toProcess = Math.min(availableInChunk, remaining);
 
-        // Pass the existing memory view to the callback
-        await callback(chunk.subarray(0, toProcess));
+        await callback(chunk.subarray(this.offset, this.offset + toProcess));
 
-        if (toProcess === chunk.byteLength) {
+        this.offset += toProcess;
+        if (this.offset >= chunk.byteLength) {
           this.chunks.shift();
-        } else {
-          this.chunks[0] = chunk.subarray(toProcess);
+          this.offset = 0;
         }
 
         this.totalSize -= toProcess;
@@ -840,11 +849,15 @@
     }
 
     let outputBytesWritten = 0;
+    let lastLogTime = 0;
     const countingStream = new TransformStream({
       async transform(chunk, controller) {
         outputBytesWritten += chunk.byteLength;
-        const p = yielder();
-        if (p) {
+        const now = Date.now();
+        // Optimization: Only update UI and check yield occasionally to prevent bottleneck
+        // Check yield approx every 100ms or logSpeed
+        if (now - lastLogTime > opts.logSpeed) {
+          lastLogTime = now;
           if (status.category)
             if (status.category === "Finishing") {
               logger("Finishing...");
@@ -857,7 +870,8 @@
               }
               logger(msg);
             }
-          await p;
+          const p = yielder();
+          if (p) await p;
         }
         controller.enqueue(chunk);
       },
@@ -1132,7 +1146,7 @@
 
                 while (hasMore && !aborted) {
                   const batch = await tryGraceful(async () => {
-                    const batchSizeLimit = 100;
+                    const batchSizeLimit = 25;
                     return await new Promise((resolve, reject) => {
                       const innerTx = db.transaction(sName, "readonly");
                       const store = innerTx.objectStore(sName);
@@ -1464,7 +1478,7 @@
       try {
         await outputStream.abort(e).catch(() => {});
       } catch (z) {}
-      logger(`Error: ${context} - ${e.message}`);
+      logger(`Error: ${e.message}`);
       if (opts.onerror) opts.onerror(e);
       if (!graceful) throw e;
     }
@@ -1669,6 +1683,7 @@
       const reader = inputStream.getReader();
       const streamBuffer = new ChunkBuffer();
       let done = false;
+      let filesProcessed = 0;
 
       async function ensure(n) {
         while (!streamBuffer.has(n) && !done) {
@@ -1686,17 +1701,10 @@
           if (streamBuffer.totalSize === 0 && !done) await ensure(1);
           if (streamBuffer.totalSize === 0) break;
 
-          const chunk = streamBuffer.chunks[0];
-          const toSkip = Math.min(chunk.byteLength, n);
-
-          if (toSkip === chunk.byteLength) {
-            streamBuffer.chunks.shift(); // Drop the whole chunk
-          } else {
-            streamBuffer.chunks[0] = chunk.subarray(toSkip); // Slice (Cheap View)
-          }
-
-          streamBuffer.totalSize -= toSkip;
-          n -= toSkip;
+          // Consume chunks logic handled internally by ChunkBuffer now via read/consume
+          // But to just skip without callback:
+          await streamBuffer.consume(n, () => {});
+          n = 0; // consumed
         }
       }
 
@@ -1794,7 +1802,15 @@
         if (!hasHeader) {
           // Stream ended but we never saw the two null blocks
           if (!foundEofMarker) {
-            throw new Error("Archive truncated: Stream ended prematurely.");
+            // Relaxed check: if we processed at least one file, we consider it a success with a warning,
+            // otherwise it's a hard error.
+            if (filesProcessed > 0 && streamBuffer.totalSize === 0) {
+              logger(
+                "Warning: Stream ended without standard EOF blocks. Import likely successful.",
+              );
+            } else {
+              throw new Error("Archive truncated: Stream ended prematurely.");
+            }
           }
           break;
         }
@@ -1808,6 +1824,10 @@
         }
 
         if (!verifyChecksum(header)) {
+          // Relaxed check: if we are at EOF (trailing garbage) and have processed files, stop.
+          if (filesProcessed > 0 && streamBuffer.totalSize === 0 && done) {
+            break;
+          }
           throw new Error("Corrupt TAR header: Checksum mismatch.");
         }
 
@@ -1833,6 +1853,8 @@
           if (paxOverrides.size) size = parseInt(paxOverrides.size, 10);
           paxOverrides = null;
         }
+
+        filesProcessed++;
 
         if (name.startsWith("data/idb/")) {
           status.category = "IndexedDB";
@@ -2348,6 +2370,71 @@
     });
   }
 
+  async function clearData(types = {}) {
+    // default to clearing everything if no types provided
+    if (Object.keys(types).length === 0) {
+      types = {
+        opfs: true,
+        idb: true,
+        localStorage: true,
+        session: true,
+        cookies: true,
+        cache: true,
+      };
+    }
+
+    if (types.opfs && navigator.storage) {
+      try {
+        const root = await navigator.storage.getDirectory();
+        for await (const name of root.keys()) {
+          await root.removeEntry(name, { recursive: true });
+        }
+      } catch (e) {
+        console.warn("Failed to clear OPFS", e);
+      }
+    }
+
+    if (types.localStorage) {
+      try {
+        localStorage.clear();
+      } catch (e) {}
+    }
+
+    if (types.session) {
+      try {
+        sessionStorage.clear();
+      } catch (e) {}
+    }
+
+    if (types.cookies) {
+      const cookies = document.cookie.split(";");
+      for (let i = 0; i < cookies.length; i++) {
+        const cookie = cookies[i];
+        const eqPos = cookie.indexOf("=");
+        const name = eqPos > -1 ? cookie.substr(0, eqPos) : cookie;
+        document.cookie = name + "=;expires=Thu, 01 Jan 1970 00:00:00 GMT";
+      }
+    }
+
+    if (types.cache && window.caches) {
+      try {
+        const keys = await caches.keys();
+        for (const k of keys) await caches.delete(k);
+      } catch (e) {}
+    }
+
+    if (types.idb && window.indexedDB) {
+      try {
+        const dbs = await window.indexedDB.databases();
+        for (const { name } of dbs) {
+          indexedDB.deleteDatabase(name);
+        }
+      } catch (e) {
+        console.warn("Failed to clear IndexedDB", e);
+      }
+    }
+  }
+
   window.LittleExport = {
     importData,
     exportData,
@@ -2356,6 +2443,7 @@
     restoreFromCBOR,
     importFromFolder,
     folderToTarStream,
+    clearData,
     TYPE,
     DECISION,
   };

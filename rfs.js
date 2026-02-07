@@ -184,24 +184,134 @@ async function updateRegistryEntry(name, data) {
   );
 }
 
-async function uploadFolder() {
-  const folderNameInput = document.getElementById("folderName");
-  const name = folderNameInput.value.trim();
-  if (!name) return alert("Please enter a name.");
+async function analyzeAndImportFolder(handleOrEntry, filesArray = null) {
+  // Check for manifest.enc (Encrypted)
+  let isEncrypted = false;
+  let isSystemExport = false;
 
+  // Helper to check file existence inside handle/entry/array
+  async function checkFile(pathParts) {
+    try {
+      if (filesArray) {
+        const targetPath = pathParts.join("/");
+        return filesArray.some(
+          (f) =>
+            f.webkitRelativePath.endsWith(`/${targetPath}`) ||
+            f.webkitRelativePath === targetPath,
+        );
+      } else if (handleOrEntry.kind === "directory") {
+        // Modern FileSystemHandle
+        let cur = handleOrEntry;
+        for (let i = 0; i < pathParts.length - 1; i++) {
+          cur = await cur.getDirectoryHandle(pathParts[i]);
+        }
+        await cur.getFileHandle(pathParts[pathParts.length - 1]);
+        return true;
+      } else if (handleOrEntry.isDirectory) {
+        return new Promise((resolve) => {
+          handleOrEntry.getFile(
+            pathParts.join("/"),
+            { create: false },
+            () => resolve(true),
+            () => resolve(false),
+          );
+        });
+      }
+    } catch (e) {
+      return false;
+    }
+  }
+
+  if (await checkFile(["manifest.enc"])) isEncrypted = true;
+  if (!isEncrypted) {
+    if (await checkFile(["data", "custom", SYSTEM_FILE])) isSystemExport = true;
+    else if (await checkFile(["custom", SYSTEM_FILE])) isSystemExport = true;
+  }
+
+  if (isEncrypted) {
+    const encName = prompt(
+      `"${handleOrEntry.name || "Folder"}" appears to be an encrypted folder. Enter a name to mount it as:`,
+      handleOrEntry.name,
+    );
+    if (!encName) return;
+
+    setUiBusy(true);
+    if (filesArray) {
+      alert(
+        "Encrypted folder import via file input not supported yet. Use Drag & Drop or Directory Picker.",
+      );
+      setUiBusy(false);
+    } else {
+      if (handleOrEntry.kind === "directory") {
+        await processFolderSelection(encName, handleOrEntry);
+      } else {
+        alert("Please use the 'Upload Folder' button for encrypted folders.");
+        setUiBusy(false);
+      }
+    }
+    return;
+  }
+
+  if (isSystemExport) {
+    if (
+      confirm(
+        "Found system configuration folder. (This may modify multiple folders or local data.)",
+      )
+    ) {
+      let stream;
+      if (filesArray) {
+        stream = LittleExport.folderToTarStream(filesArray, checkYield);
+      } else {
+        stream = LittleExport.folderToTarStream(handleOrEntry, checkYield);
+      }
+      await startImport({ stream: () => stream });
+      return;
+    }
+  }
+
+  const name =
+    document.getElementById("folderName").value.trim() ||
+    prompt("Enter a name for the folder:", handleOrEntry.name || "");
+  if (!name) return;
+
+  setUiBusy(true);
+  if (filesArray) {
+    await processFilesAndStore(name, filesArray);
+  } else if (handleOrEntry.kind === "directory") {
+    await processFolderSelection(name, handleOrEntry);
+  } else {
+    alert("Please use drag-and-drop for this folder.");
+    setUiBusy(false);
+  }
+}
+
+async function uploadFolder() {
   try {
     if (window.showDirectoryPicker) {
-      const localDirHandle = await window.showDirectoryPicker({ mode: "read" });
       setUiBusy(true);
-      await processFolderSelection(name, localDirHandle);
+      const handle = await window.showDirectoryPicker({ mode: "read" });
+      await analyzeAndImportFolder(handle);
     } else {
       document.getElementById("folderUploadFallbackInput").click();
     }
   } catch (e) {
-    if (e.name !== "AbortError") throw e;
+    if (e.name !== "AbortError") {
+      console.error(e);
+      alert("Error accessing folder: " + e.message);
+    }
   } finally {
     setUiBusy(false);
   }
+}
+
+async function uploadFolderFallback(e) {
+  const input = e.target;
+  if (!input.files.length) {
+    setUiBusy(false);
+    return;
+  }
+  await analyzeAndImportFolder({}, Array.from(input.files));
+  input.value = "";
 }
 
 async function processFolderSelection(name, handle) {
@@ -257,6 +367,8 @@ async function processFolderSelection(name, handle) {
   changes.length = 0;
   document.getElementById("folderName").value = "";
   document.getElementById("openFolderName").value = name;
+  await updateRegistryEntry(name, { encryptionType: null });
+  await logProgress("", true);
   setUiBusy(false);
   await listFolders();
 }
@@ -290,107 +402,118 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
   const ENCRYPTED_CHUNK_OVERHEAD = 12 + 16;
 
   const entries = Object.entries(manifestData);
-  let processedFiles = 0;
   const totalFiles = entries.length;
+  let processedFiles = 0;
 
-  for (const [originalPath, meta] of entries) {
-    const p = logProgress(
-      `Decrypting (${processedFiles}/${totalFiles}): ${originalPath}`,
-    );
-    if (p) await p;
+  const dirCache = new Map();
+  dirCache.set(".", destDir);
 
-    const pathParts = originalPath.split("/");
-    const fileName = pathParts.pop();
-    let currentDir = destDir;
-    for (const part of pathParts) {
-      currentDir = await currentDir.getDirectoryHandle(part, { create: true });
-    }
+  const worker = async () => {
+    while (entries.length > 0) {
+      const entryTask = entries.shift();
+      if (!entryTask) break;
+      const [originalPath, meta] = entryTask;
 
-    let srcFile;
-    try {
-      const handle = await contentDir.getFileHandle(meta.id);
-      srcFile = await handle.getFile();
-    } catch (e) {
-      console.warn(`Missing: ${originalPath}`);
-      continue;
-    }
+      // Optimization: Only create a microtask if the yielder determines it is time.
+      const pLog = logProgress(
+        `Decrypting (${processedFiles}/${totalFiles}): ${originalPath}`,
+      );
+      if (pLog) await pLog;
 
-    const destFileHandle = await currentDir.getFileHandle(fileName, {
-      create: true,
-    });
-    const writable = await destFileHandle.createWritable();
+      const pathParts = originalPath.split("/");
+      const fileName = pathParts.pop();
+      let currentDir = destDir;
 
-    if (meta.size > 0) {
-      const reader = srcFile.stream().getReader();
-      const totalEncChunks = Math.ceil(meta.size / CHUNK_SIZE);
-      let buffer = new Uint8Array(0);
-      let chunkIndex = 0;
+      // Efficient path resolution using the cache
+      if (pathParts.length > 0) {
+        let pathAcc = ".";
+        for (const part of pathParts) {
+          pathAcc += "/" + part;
+          if (dirCache.has(pathAcc)) {
+            currentDir = dirCache.get(pathAcc);
+          } else {
+            currentDir = await currentDir.getDirectoryHandle(part, {
+              create: true,
+            });
+            dirCache.set(pathAcc, currentDir);
+          }
+        }
+      }
 
+      let srcFile;
       try {
-        while (chunkIndex < totalEncChunks) {
-          const p = checkYield();
-          if (p) await p;
+        const handle = await contentDir.getFileHandle(meta.id);
+        srcFile = await handle.getFile();
+      } catch (e) {
+        console.warn(`Missing: ${originalPath}`);
+        processedFiles++;
+        continue;
+      }
 
-          const isLast = chunkIndex === totalEncChunks - 1;
-          const plainSize = isLast
-            ? meta.size % CHUNK_SIZE || CHUNK_SIZE
-            : CHUNK_SIZE;
-          const encSize = plainSize + ENCRYPTED_CHUNK_OVERHEAD;
+      const destFileHandle = await currentDir.getFileHandle(fileName, {
+        create: true,
+      });
+      const writable = await destFileHandle.createWritable();
 
-          const chunks = [];
-          let currentLen = buffer.length;
+      if (meta.size > 0) {
+        const reader = srcFile.stream().getReader();
+        const totalEncChunks = Math.ceil(meta.size / CHUNK_SIZE);
+        let buffer = new Uint8Array(0);
+        let chunkIndex = 0;
 
-          while (currentLen < encSize) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            chunks.push(value);
-            currentLen += value.length;
-          }
+        try {
+          while (chunkIndex < totalEncChunks) {
+            const pY = checkYield();
+            if (pY) await pY;
 
-          if (chunks.length > 0) {
-            const newBuf = new Uint8Array(currentLen);
-            newBuf.set(buffer);
-            let offset = buffer.length;
-            for (const chunk of chunks) {
-              newBuf.set(chunk, offset);
-              offset += chunk.length;
+            const isLast = chunkIndex === totalEncChunks - 1;
+            const plainSize = isLast
+              ? meta.size % CHUNK_SIZE || CHUNK_SIZE
+              : CHUNK_SIZE;
+            const encSize = plainSize + ENCRYPTED_CHUNK_OVERHEAD;
+
+            // Collect enough data for a full encrypted chunk
+            while (buffer.length < encSize) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              const newBuf = new Uint8Array(buffer.length + value.length);
+              newBuf.set(buffer);
+              newBuf.set(value, buffer.length);
+              buffer = newBuf;
             }
-            buffer = newBuf;
-          }
-          if (buffer.length < encSize) break;
 
-          const chunkData = buffer.subarray(0, encSize);
-          buffer = buffer.subarray(encSize);
+            if (buffer.length < encSize) break;
 
-          const chunkIv = chunkData.subarray(0, 12);
-          const chunkCipher = chunkData.subarray(12);
+            const chunkData = buffer.subarray(0, encSize);
+            buffer = buffer.subarray(encSize);
 
-          try {
+            const chunkIv = chunkData.subarray(0, 12);
+            const chunkCipher = chunkData.subarray(12);
+
             const plainChunk = await crypto.subtle.decrypt(
               { name: "AES-GCM", iv: chunkIv },
               key,
               chunkCipher,
             );
             await writable.write(new Uint8Array(plainChunk));
-          } catch (e) {
-            console.error(
-              `Decryption error at chunk ${chunkIndex} for ${originalPath}`,
-            );
+            chunkIndex++;
           }
-          chunkIndex++;
+        } finally {
+          reader.releaseLock();
         }
-      } finally {
-        reader.releaseLock();
       }
-    }
 
-    try {
-      await writable.close();
-    } catch (e) {
-      if (e.name !== "TypeError") throw e;
+      try {
+        await writable.close();
+      } catch (e) {
+        if (e.name !== "TypeError") throw e;
+      }
+      processedFiles++;
     }
-    processedFiles++;
-  }
+  };
+
+  // Run in parallel
+  await Promise.all(Array(CONCURRENCY).fill(null).map(worker));
   await logProgress("", true);
 }
 
@@ -681,7 +804,7 @@ async function deleteFolder(folderNameToDelete, skipConfirm = false) {
 
 async function openFile(overrideFolderName) {
   const folderName = (
-    overrideFolderName || document.getElementById("openFolderName").value
+    overrideFolderName || document.getElementById("openFolderName").value.trim()
   ).trim();
   const fileName = document.getElementById("fileName").value.trim();
   if (!folderName) return alert("Provide a folder name.");
@@ -745,13 +868,11 @@ async function exportData() {
     const exportSession = document.getElementById("c7").checked;
 
     const customItems = [];
-    if (exportRFS) {
+    if (exportRFS || exportOPFS) {
       const registry = await getRegistry();
       const sanitizedRegistry = {};
       for (const [folderName, meta] of Object.entries(registry)) {
         sanitizedRegistry[folderName] = { ...meta };
-        const p = checkYield();
-        if (p) await p;
       }
 
       customItems.push({
@@ -811,9 +932,10 @@ async function importData() {
   input.click();
 }
 
-async function startImport(file) {
+async function startImport(sourceInput) {
   setUiBusy(true);
   const TEMP_BLOB_DIR = ".rfs_temp_blobs";
+  _registryCache = null;
 
   try {
     const root = await navigator.storage.getDirectory();
@@ -828,8 +950,9 @@ async function startImport(file) {
     let noerror = true;
 
     logProgress("Starting...", true);
-    await LittleExport.importData({
-      source: file,
+
+    // Config object determines if source is a file/blob or a special stream object
+    const importConfig = {
       graceful: true,
       logger: logProgress,
       onerror: (e) => {
@@ -847,13 +970,42 @@ async function startImport(file) {
           await saveRegistry(registry);
         }
       },
-    });
-    if (successful) {
-      if (navigator.serviceWorker.controller) {
-        navigator.serviceWorker.controller.postMessage({
-          type: "INVALIDATE_CACHE",
-        });
+    };
+
+    // If sourceInput has a stream function (LittleExport stream wrapper) or is a Blob/File
+    if (sourceInput.stream || sourceInput instanceof Blob) {
+      importConfig.source = sourceInput;
+    } else {
+      throw new Error("Invalid import source.");
+    }
+
+    await LittleExport.importData(importConfig);
+    let registryRestored = false;
+    try {
+      await root.getFileHandle(SYSTEM_FILE);
+      registryRestored = true;
+    } catch (e) {}
+
+    if (!registryRestored) {
+      logProgress("Reconstructing registry...", true);
+      const newRegistry = {};
+      try {
+        const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX);
+        for await (const name of rfsRoot.keys()) {
+          // Default settings for discovered folders
+          newRegistry[name] = {
+            created: Date.now(),
+            headers: "",
+            rules: "",
+          };
+        }
+        await saveRegistry(newRegistry);
+      } catch (e) {
+        // Might not exist if import was empty
       }
+    }
+
+    if (successful) {
       await listFolders();
       alert(
         noerror
@@ -871,6 +1023,11 @@ async function startImport(file) {
   } finally {
     setUiBusy(false);
     logProgress("", true);
+    if (navigator.serviceWorker.controller) {
+      navigator.serviceWorker.controller.postMessage({
+        type: "INVALIDATE_CACHE",
+      });
+    }
   }
 }
 
@@ -906,20 +1063,6 @@ async function deriveKeyFromPassword(password, salt) {
     true,
     ["encrypt", "decrypt"],
   );
-}
-
-async function uploadFolderFallback(e) {
-  const name = document.getElementById("folderName").value.trim();
-  if (!name) return alert("Please enter a name.");
-  const input = e.target;
-  if (!input.files.length) {
-    setUiBusy(false);
-    return;
-  }
-  setUiBusy(true);
-  await processFilesAndStore(name, input.files);
-  input.value = "";
-  setUiBusy(false);
 }
 
 let syncTimeout = -1;
@@ -1283,6 +1426,17 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const items = Array.from(e.dataTransfer.items);
     if (!items.length) return;
+
+    if (items[0].kind === "file" && window.FileSystemDirectoryHandle) {
+      try {
+        const handle = await items[0].getAsFileSystemHandle();
+        if (handle && handle.kind === "directory") {
+          await analyzeAndImportFolder(handle);
+          return;
+        }
+      } catch (e) {}
+    }
+
     const entry = items[0].webkitGetAsEntry
       ? items[0].webkitGetAsEntry()
       : null;
@@ -1293,14 +1447,12 @@ document.addEventListener("DOMContentLoaded", () => {
         setUiBusy(true);
         // Scan iteratively
         const files = [];
-        const queue = [
-          {
-            entry,
-            path: "",
-          },
-        ];
+        const queue = [{ entry, path: "" }];
 
         let scannedCount = 0;
+        let isSystem = false;
+        let isEncrypted = false;
+
         while (queue.length > 0) {
           const { entry: curr, path } = queue.shift();
 
@@ -1310,6 +1462,19 @@ document.addEventListener("DOMContentLoaded", () => {
               value: path + f.name,
             });
             files.push(f);
+
+            // Check during scan
+            const rel = f.webkitRelativePath;
+            if (
+              rel.endsWith(`data/custom/${SYSTEM_FILE}`) ||
+              rel.endsWith(`custom/${SYSTEM_FILE}`)
+            ) {
+              isSystem = true;
+            }
+            if (rel.endsWith("manifest.enc")) {
+              isEncrypted = true;
+            }
+
             scannedCount++;
           } else if (curr.isDirectory) {
             const reader = curr.createReader();
@@ -1328,8 +1493,29 @@ document.addEventListener("DOMContentLoaded", () => {
           }
 
           let p = logProgress(`Scanned ${scannedCount} files...`);
-          if (p) {
-            await p;
+          if (p) await p;
+        }
+
+        if (isEncrypted) {
+          alert(
+            "Encrypted folder import via drag-and-drop legacy mode is not supported in your browser.",
+          );
+          setUiBusy(false);
+          return;
+        }
+
+        if (isSystem) {
+          if (
+            confirm(
+              "Found system configuration folder. Import? (This may modify multiple folders or already existing data.)",
+            )
+          ) {
+            const stream = LittleExport.folderToTarStream(files, checkYield);
+            await startImport({ stream: () => stream });
+            setUiBusy(false);
+            return;
+          } else {
+            setUiBusy(false);
           }
         }
 

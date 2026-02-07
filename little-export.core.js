@@ -820,7 +820,6 @@
     const status = { category: "", detail: "" };
 
     let outputStream,
-      downloadUrl,
       chunks = [];
 
     if (window.showSaveFilePicker && opts.download !== false) {
@@ -1450,14 +1449,15 @@
       await tar.close();
       await exportFinishedPromise;
 
-      if (chunks.length > 0) {
-        downloadUrl = URL.createObjectURL(
-          new Blob(chunks, { type: "application/octet-stream" }),
-        );
+      let result = null;
+
+      if (!window.showSaveFilePicker) {
+        result = new Blob(chunks, { type: "application/octet-stream" });
       }
 
-      if (downloadUrl) {
-        if (opts.download !== false) {
+      if (opts.download !== false) {
+        if (result) {
+          const downloadUrl = URL.createObjectURL(result);
           const a = document.createElement("a");
           a.href = downloadUrl;
           let fileName = opts.fileName;
@@ -1467,17 +1467,21 @@
               ? `${fileName}.enc`
               : `${fileName}.tar.gz`;
           a.click();
+
+          // Cleanup URL after a delay
+          setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
         }
-        if (opts.onsuccess) opts.onsuccess(downloadUrl);
-      } else if (!opts.download && opts.onsuccess) {
-        opts.onsuccess(null);
+
+        logger("Export complete!");
+        return null;
       }
 
       logger("Export complete!");
+      return result;
     } catch (e) {
       try {
         await outputStream.abort(e).catch(() => {});
-      } catch (z) {}
+      } catch (e) {}
       logger(`Error: ${e.message}`);
       if (opts.onerror) opts.onerror(e);
       if (!graceful) throw e;
@@ -2390,29 +2394,47 @@
           await root.removeEntry(name, { recursive: true });
         }
       } catch (e) {
-        console.warn("Failed to clear OPFS", e);
+        console.warn("Failed to clear OPFS:", e);
       }
     }
 
     if (types.localStorage) {
       try {
         localStorage.clear();
-      } catch (e) {}
+      } catch (e) {
+        console.warn("Failed to clear localStorage:", e);
+      }
     }
 
     if (types.session) {
       try {
         sessionStorage.clear();
-      } catch (e) {}
+      } catch (e) {
+        console.warn("Failed to clear sessionStorage:", e);
+      }
     }
 
     if (types.cookies) {
-      const cookies = document.cookie.split(";");
-      for (let i = 0; i < cookies.length; i++) {
-        const cookie = cookies[i];
-        const eqPos = cookie.indexOf("=");
-        const name = eqPos > -1 ? cookie.substr(0, eqPos) : cookie;
-        document.cookie = name + "=;expires=Thu, 01 Jan 1970 00:00:00 GMT";
+      try {
+        // Note that cookie logic is not guaranteed to clear custom paths.
+        const cookies = document.cookie.split(";");
+
+        for (let i = 0; i < cookies.length; i++) {
+          const cookie = cookies[i];
+          const eqPos = cookie.indexOf("=");
+          const name =
+            eqPos > -1 ? cookie.trim().substr(0, eqPos) : cookie.trim();
+
+          document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/`; // current path
+          document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; domain=${window.location.hostname}; path=/`; // current domain
+          const domainParts = window.location.hostname.split(".");
+          if (domainParts.length > 2) {
+            const baseDomain = domainParts.slice(-2).join(".");
+            document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; domain=.${baseDomain}; path=/`; // clear base domain
+          }
+        }
+      } catch (e) {
+        console.warn("Failed to clear cookies:", e); // might be possible technically
       }
     }
 
@@ -2420,7 +2442,9 @@
       try {
         const keys = await caches.keys();
         for (const k of keys) await caches.delete(k);
-      } catch (e) {}
+      } catch (e) {
+        console.warn("Failed to clear cache:", e); // might be possible technically
+      }
     }
 
     if (types.idb && window.indexedDB) {
@@ -2430,7 +2454,7 @@
           indexedDB.deleteDatabase(name);
         }
       } catch (e) {
-        console.warn("Failed to clear IndexedDB", e);
+        console.warn("Failed to clear IndexedDB:", e);
       }
     }
   }

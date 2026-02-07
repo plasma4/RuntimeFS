@@ -424,19 +424,24 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
       const fileName = pathParts.pop();
       let currentDir = destDir;
 
-      // Efficient path resolution using the cache
       if (pathParts.length > 0) {
         let pathAcc = ".";
+        currentDir = await dirCache.get(".");
+
         for (const part of pathParts) {
+          const parentPath = pathAcc;
           pathAcc += "/" + part;
-          if (dirCache.has(pathAcc)) {
-            currentDir = dirCache.get(pathAcc);
-          } else {
-            currentDir = await currentDir.getDirectoryHandle(part, {
-              create: true,
-            });
-            dirCache.set(pathAcc, currentDir);
+
+          if (!dirCache.has(pathAcc)) {
+            const parentDirPromise = dirCache.get(parentPath);
+            const newDirPromise = parentDirPromise.then((parent) =>
+              parent.getDirectoryHandle(part, { create: true }),
+            );
+            dirCache.set(pathAcc, newDirPromise);
           }
+
+          // Await the promise in the cache
+          currentDir = await dirCache.get(pathAcc);
         }
       }
 
@@ -909,11 +914,8 @@ async function exportData() {
         console.error("Error while exporting:", e);
         alert("Error while exporting: " + e);
       },
-      onsuccess: () => {
-        alert("Export complete!");
-        logProgress("", true);
-      },
     });
+    alert("Export complete!");
   } catch (e) {
     console.error("Export failed:", e);
     alert("Export failed: " + e.message);

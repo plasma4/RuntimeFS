@@ -280,7 +280,12 @@
       const str = Math.floor(num)
         .toString(8)
         .padStart(len - 1, "0");
-      if (str.length >= len) return;
+      if (str.length >= len) {
+        LittleExport.warn(
+          "PAX attempted to write octal that was too long (due to either sizes or timestamp).",
+        );
+        return;
+      }
       ENC.encodeInto(str, buffer.subarray(offset, offset + len - 1));
       buffer[offset + len - 1] = 0; // Space/null termination
     };
@@ -437,7 +442,7 @@
 
     async flush() {
       if (this.bufferOffset > 0) {
-        await this.writer.write(this.buffer.subarray(0, this.bufferOffset));
+        await this.writer.write(this.buffer.slice(0, this.bufferOffset));
         this.bufferOffset = 0;
       }
     }
@@ -1224,7 +1229,7 @@
       }
 
       // sessionStorage
-      if (!aborted && opts.session) {
+      if (!aborted && opts.sessionStorage) {
         let categoryDecision = getDecision(TYPE.SS);
         if (categoryDecision && typeof categoryDecision.then === "function")
           categoryDecision = await categoryDecision;
@@ -1256,7 +1261,7 @@
                 }
                 shouldInclude = keyDecision !== DECISION.SKIP;
               } else {
-                shouldInclude = checkSimpleFilter("session", k, opts);
+                shouldInclude = checkSimpleFilter("sessionStorage", k, opts);
               }
             }
 
@@ -1460,6 +1465,7 @@
     // Check the LittleExport docs on all the options.
     const opts = {
       logSpeed: 100,
+      cborExtensionName: "cbor",
       ...config,
     };
 
@@ -1476,9 +1482,16 @@
     const cborExtensionName = opts.cborExtensionName;
     let sourceInput = opts.source;
     if (!sourceInput) {
-      throw new Error(
-        "No source provided. Pass a URL, Blob, or File via the source config property.",
-      );
+      await new Promise((resolve) => {
+        const input = document.createElement("input");
+        input.type = "file";
+        input.onchange = (e) => {
+          const file = e.target.files[0];
+          resolve(file);
+        };
+
+        input.click();
+      });
     }
 
     const logger = opts.logger || (() => {});
@@ -1710,6 +1723,11 @@
               }
             }
           }
+        } catch (e) {
+          try {
+            await writer.abort();
+          } catch (_) {}
+          throw e;
         } finally {
           try {
             await writer.close();
@@ -1926,11 +1944,11 @@
               }
             }
             // sessionStorage
-            else if (name === "data/ss.json" && opts.session !== false) {
-              if (await shouldProcess(TYPE.SS, null, null, "session")) {
+            else if (name === "data/ss.json" && opts.sessionStorage !== false) {
+              if (await shouldProcess(TYPE.SS, null, null, "sessionStorage")) {
                 const data = JSON.parse(DEC.decode(d));
                 const trustAll =
-                  categoryDecisions["session"] === DECISION.TRUST;
+                  categoryDecisions["sessionStorage"] === DECISION.TRUST;
 
                 for (const k in data) {
                   if (aborted) break;
@@ -1951,7 +1969,7 @@
                       }
                       shouldSet = keyDecision !== DECISION.SKIP;
                     } else {
-                      shouldSet = checkSimpleFilter("session", k, opts);
+                      shouldSet = checkSimpleFilter("sessionStorage", k, opts);
                     }
                   }
 
@@ -2228,10 +2246,13 @@
     }
   }
 
-  function folderToTarStream(source, yielder) {
+  function folderToTarStream(source, yielder, options = {}) {
     const { readable, writable } = new TransformStream();
     // Generate stream on the fly
     const tar = new TarWriter(writable, yielder);
+    const pathPrefix = options.pathPrefix || "";
+    const safePrefix =
+      pathPrefix && !pathPrefix.endsWith("/") ? pathPrefix + "/" : pathPrefix;
 
     (async () => {
       try {
@@ -2239,16 +2260,17 @@
           window.FileSystemDirectoryHandle &&
           source instanceof FileSystemDirectoryHandle
         ) {
-          async function walk(dir, pathPrefix) {
+          async function walk(dir, currentPath) {
             for await (const [name, entry] of dir.entries()) {
               if (entry.kind === "directory" && name === "PaxHeaders") continue;
-              const fullPath = pathPrefix ? `${pathPrefix}/${name}` : name;
+              const fullPath = currentPath ? `${currentPath}/${name}` : name;
+              const destPath = safePrefix + fullPath;
 
               if (entry.kind === "file") {
                 const file = await entry.getFile();
-                await tar.writeStream(fullPath, file.size, file.stream());
+                await tar.writeStream(destPath, file.size, file.stream());
               } else if (entry.kind === "directory") {
-                await tar.writeDir(fullPath);
+                await tar.writeDir(destPath);
                 await walk(entry, fullPath);
               }
             }
@@ -2259,17 +2281,24 @@
           (Array.isArray(source) && source[0] instanceof File)
         ) {
           const files = Array.from(source);
-          const relativePath = files[0].webkitRelativePath;
-          const rootName = relativePath ? relativePath.split("/")[0] + "/" : ""; // Only strip root if webkitRelativePath exists (indicates folder upload)
+          const refFile =
+            files.find(
+              (f) => f.webkitRelativePath && f.webkitRelativePath.includes("/"),
+            ) || files[0];
+          const relativePath = refFile ? refFile.webkitRelativePath : "";
+          const rootName =
+            relativePath && relativePath.includes("/")
+              ? relativePath.split("/")[0] + "/"
+              : ""; // Only strip root if valid structure found
 
           for (const file of files) {
             let path = file.webkitRelativePath;
-            if (path.startsWith(rootName)) {
+            if (path && path.startsWith(rootName)) {
               path = path.slice(rootName.length);
             }
 
             if (!path) path = file.name;
-            await tar.writeStream(path, file.size, file.stream());
+            await tar.writeStream(safePrefix + path, file.size, file.stream());
           }
         }
         await tar.close();
@@ -2284,9 +2313,7 @@
   }
 
   async function importFromFolder(config = {}) {
-    const opts = {
-      ...config,
-    };
+    const opts = config;
     const yielder = createYielder(opts.logSpeed);
     let logger = opts.logger || (() => {});
 
@@ -2303,7 +2330,9 @@
     if (window.showDirectoryPicker && opts.legacy !== true) {
       try {
         const handle = await window.showDirectoryPicker();
-        const stream = folderToTarStream(handle, yielder);
+        const stream = folderToTarStream(handle, yielder, {
+          pathPrefix: opts.pathPrefix,
+        });
         return await runImport(stream);
       } catch (e) {
         if (e.name === "AbortError") {
@@ -2333,7 +2362,9 @@
         }
 
         try {
-          const stream = folderToTarStream(input.files, yielder);
+          const stream = folderToTarStream(input.files, yielder, {
+            pathPrefix: opts.pathPrefix,
+          });
           await runImport(stream);
           resolve();
         } catch (e) {
@@ -2384,7 +2415,7 @@
       }
     }
 
-    if (types.session) {
+    if (types.sessionStorage) {
       try {
         sessionStorage.clear();
       } catch (e) {
@@ -2412,7 +2443,7 @@
           }
         }
       } catch (e) {
-        LittleExport.warn("Failed to clear cookies:", e); // might be possible technically
+        LittleExport.warn("Failed to clear cookies:", e);
       }
     }
 
@@ -2421,7 +2452,7 @@
         const keys = await caches.keys();
         for (const k of keys) await caches.delete(k);
       } catch (e) {
-        LittleExport.warn("Failed to clear cache:", e); // might be possible technically
+        LittleExport.warn("Failed to clear cache:", e);
       }
     }
 

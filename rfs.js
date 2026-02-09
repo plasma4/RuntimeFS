@@ -185,9 +185,10 @@ async function updateRegistryEntry(name, data) {
 }
 
 async function analyzeAndImportFolder(handleOrEntry, filesArray = null) {
-  // Check for manifest.enc (Encrypted)
+  // Check for manifest.enc
   let isEncrypted = false;
   let isSystemExport = false;
+  let pathPrefix = "";
 
   // Helper to check file existence inside handle/entry/array
   async function checkFile(pathParts) {
@@ -224,8 +225,22 @@ async function analyzeAndImportFolder(handleOrEntry, filesArray = null) {
 
   if (await checkFile(["manifest.enc"])) isEncrypted = true;
   if (!isEncrypted) {
-    if (await checkFile(["data", "custom", SYSTEM_FILE])) isSystemExport = true;
-    else if (await checkFile(["custom", SYSTEM_FILE])) isSystemExport = true;
+    if (await checkFile(["data", "custom", SYSTEM_FILE])) {
+      isSystemExport = true;
+    } else if (await checkFile(["opfs", "rfs", SYSTEM_FILE])) {
+      // Root folder upload containing opfs/rfs/...
+      isSystemExport = true;
+    } else if (await checkFile(["custom", SYSTEM_FILE])) {
+      isSystemExport = true;
+      pathPrefix = "data";
+    } else if (await checkFile(["rfs", SYSTEM_FILE])) {
+      // Direct "opfs" folder upload containing rfs/...
+      isSystemExport = true;
+      pathPrefix = "opfs";
+    } else if (await checkFile(["ls.json"])) {
+      isSystemExport = true;
+      pathPrefix = "data";
+    }
   }
 
   if (isEncrypted) {
@@ -245,7 +260,7 @@ async function analyzeAndImportFolder(handleOrEntry, filesArray = null) {
       if (handleOrEntry.kind === "directory") {
         await processFolderSelection(encName, handleOrEntry);
       } else {
-        alert("Please use the 'Upload Folder' button for encrypted folders.");
+        alert("Please use Upload Folder for encrypted folders.");
         setUiBusy(false);
       }
     }
@@ -255,14 +270,18 @@ async function analyzeAndImportFolder(handleOrEntry, filesArray = null) {
   if (isSystemExport) {
     if (
       confirm(
-        "Found system configuration folder. (This may modify multiple folders or local data.)",
+        "Found system configuration folder. Import? (This may modify multiple folders or local data.)",
       )
     ) {
       let stream;
       if (filesArray) {
-        stream = LittleExport.folderToTarStream(filesArray, checkYield);
+        stream = LittleExport.folderToTarStream(filesArray, checkYield, {
+          pathPrefix,
+        });
       } else {
-        stream = LittleExport.folderToTarStream(handleOrEntry, checkYield);
+        stream = LittleExport.folderToTarStream(handleOrEntry, checkYield, {
+          pathPrefix,
+        });
       }
       await startImport({ stream: () => stream });
       return;
@@ -894,7 +913,7 @@ async function exportData() {
       exclude.opfs.push(RFS_PREFIX);
     }
 
-    // If both or neither, include.opfs stays empty (export all / export none based on opts.opfs)
+    let status = 1; // successful
     await LittleExport.exportData({
       fileName: "result",
       password: password,
@@ -910,11 +929,16 @@ async function exportData() {
       graceful: true, // Continue on non-fatal errors
       logger: logProgress,
       onerror: (e) => {
+        status = 0;
         console.error("Error while exporting:", e);
         alert("Error while exporting: " + e);
       },
     });
-    alert("Export complete!");
+    alert(
+      status === 1
+        ? "Export complete!"
+        : "Export may have failed or been incomplete.",
+    );
   } catch (e) {
     console.error("Export failed:", e);
     alert("Export failed: " + e.message);
@@ -952,13 +976,18 @@ async function startImport(sourceInput) {
         }
       },
       onerror: (e) => {
-        if (e.message !== "A password is required to decrypt this data.") {
+        if (e.message === "A password is required to decrypt this data.") {
+          alert("A password is required to decrypt this data.");
+          status = 1; // user error
+        } else {
           console.error(e);
+          status = 0; // non-user error
           alert("Import encountered an error: " + e.message);
         }
       },
     };
 
+    let status = 2; // successful
     importConfig.source = sourceInput;
     await LittleExport.importData(importConfig);
 
@@ -973,10 +1002,15 @@ async function startImport(sourceInput) {
     await validateAndRepairRegistry();
     localStorage.removeItem("rfs_partial");
     await listFolders();
-    alert("Import complete!");
+    if (status !== 1)
+      alert(
+        status === 2
+          ? "Import complete! Reload to fix any issues."
+          : "Import may have failed or been incomplete; reload to fix any issues.",
+      );
   } catch (e) {
     console.error("Import failed:", e);
-    alert("Import failed: " + e.message);
+    alert("Import failed:", e);
   } finally {
     setUiBusy(false);
     logProgress("", true);
@@ -1445,6 +1479,7 @@ document.addEventListener("DOMContentLoaded", () => {
         let scannedCount = 0;
         let isSystem = false;
         let isEncrypted = false;
+        let pathPrefix = "";
 
         while (queue.length > 0) {
           const { entry: curr, path } = queue.shift();
@@ -1458,11 +1493,21 @@ document.addEventListener("DOMContentLoaded", () => {
 
             // Check during scan
             const rel = f.webkitRelativePath;
-            if (
-              rel.endsWith(`data/custom/${SYSTEM_FILE}`) ||
-              rel.endsWith(`custom/${SYSTEM_FILE}`)
-            ) {
+            if (rel.endsWith(`data/custom/${SYSTEM_FILE}`)) {
               isSystem = true;
+            } else if (rel.endsWith(`custom/${SYSTEM_FILE}`)) {
+              isSystem = true;
+              pathPrefix = "data";
+            } else if (rel === "ls.json" || rel.endsWith("/ls.json")) {
+              // Heuristic: if ls.json
+              const parts = rel.split("/");
+              if (
+                parts.length === 1 ||
+                (parts.length === 2 && parts[0] === entry.name)
+              ) {
+                isSystem = true;
+                pathPrefix = "data";
+              }
             }
             if (rel.endsWith("manifest.enc")) {
               isEncrypted = true;
@@ -1503,7 +1548,9 @@ document.addEventListener("DOMContentLoaded", () => {
               "Found system configuration folder. Import? (This may modify multiple folders or already existing data.)",
             )
           ) {
-            const stream = LittleExport.folderToTarStream(files, checkYield);
+            const stream = LittleExport.folderToTarStream(files, checkYield, {
+              pathPrefix,
+            });
             await startImport({ stream: () => stream });
             setUiBusy(false);
             return;

@@ -37,7 +37,7 @@ Firefox with Private browsing is known not allow folder uploading, and similar i
 
 In the future, non-Chromium browsers might adopt parts of the File System API that allow for streamed exports. The RAM-only fallback should still work for exporting a few hundred MBs.
 
-RuntimeFS requires ES11 or later (supported by over 95% of all browsers).
+RuntimeFS requires OPFS support (supported by over 92% of all browsers and part of Baseline). Brave's sandboxing prevents custom headers from working (but everything else should be okay; you should also be able to set those headers from server-side if truly necessary), while browsers that disable ServiceWorkers like Tor/Mullvad will fail entirely.
 
 | Feature                           | 🟢 Chromium                | 🟡 Firefox/Safari/Brave                         |
 | :-------------------------------- | :------------------------- | :---------------------------------------------- |

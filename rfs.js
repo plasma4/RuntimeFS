@@ -913,9 +913,10 @@ async function exportData() {
       exclude.opfs.push(RFS_PREFIX);
     }
 
-    let status = 1; // successful
+    let status = 2; // successful
     await LittleExport.exportData({
       fileName: "result",
+      // download implied to be true
       password: password,
       cookies: exportCookies,
       localStorage: exportLS,
@@ -927,18 +928,25 @@ async function exportData() {
       include: include.opfs.length > 0 ? include : {},
       exclude: exclude,
       graceful: true, // Continue on non-fatal errors
-      logger: logProgress,
+      logger: function (arg) {
+        if (arg === "Export cancelled.") {
+          status = 1;
+        } else {
+          logProgress(arg);
+        }
+      },
       onerror: (e) => {
         status = 0;
         console.error("Error while exporting:", e);
         alert("Error while exporting: " + e);
       },
     });
-    alert(
-      status === 1
-        ? "Export complete!"
-        : "Export may have failed or been incomplete.",
-    );
+    if (status !== 1)
+      alert(
+        status === 2
+          ? "Export complete!"
+          : "Export may have failed or been incomplete.",
+      );
   } catch (e) {
     console.error("Export failed:", e);
     alert("Export failed: " + e.message);

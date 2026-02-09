@@ -798,11 +798,14 @@
     let outputStream,
       chunks = [];
 
+    let fileName = opts.fileName.includes(".")
+      ? opts.fileName
+      : opts.password
+        ? `${opts.fileName}.enc`
+        : `${opts.fileName}.tar.gz`;
     if (window.showSaveFilePicker && opts.download !== false) {
       try {
-        const name = opts.password
-          ? `${opts.fileName}.enc`
-          : `${opts.fileName}.tar.gz`;
+        const name = fileName;
         const handle = await window.showSaveFilePicker({ suggestedName: name });
         outputStream = await handle.createWritable();
       } catch (e) {
@@ -1431,12 +1434,7 @@
           const downloadUrl = URL.createObjectURL(result);
           const a = document.createElement("a");
           a.href = downloadUrl;
-          let fileName = opts.fileName;
-          a.download = fileName.includes(".")
-            ? fileName
-            : opts.password
-              ? `${fileName}.enc`
-              : `${fileName}.tar.gz`;
+          a.download = fileName;
           a.click();
 
           // Cleanup URL after a delay

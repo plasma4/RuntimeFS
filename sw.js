@@ -524,7 +524,10 @@ async function handleEncryptedRequest(
       }
     }
 
-    const fileMeta = manifest[filePath] || manifest[filePath + "/index.html"];
+    const fileMeta =
+      manifest[filePath] ||
+      manifest[filePath + ".html"] ||
+      manifest[filePath + "/index.html"];
     if (!fileMeta) return new Response("File not found", { status: 404 });
 
     const totalSize = fileMeta.size;
@@ -757,13 +760,36 @@ async function generateResponseForVirtualFile(
 
     let handle = await getCachedFileHandle(root, folderName, relativePath);
 
-    // Fallback to index.html for navigation requests (SPA)
+    if (!handle && !relativePath.includes(".") && !relativePath.endsWith("/")) {
+      const htmlHandle = await getCachedFileHandle(
+        root,
+        folderName,
+        relativePath + ".html",
+      );
+      if (htmlHandle) {
+        handle = htmlHandle;
+        relativePath += ".html";
+      }
+    }
+
+    let status = 200;
+
     if (
       !handle &&
       (mode === "navigate" ||
         (request.headers.get("Accept") || "").includes("text/html"))
     ) {
-      if (!relativePath.endsWith("index.html")) {
+      const errorHandle = await getCachedFileHandle(
+        root,
+        folderName,
+        "404.html",
+      );
+      if (errorHandle) {
+        handle = errorHandle;
+        relativePath = "404.html";
+        status = 404;
+      } else if (!relativePath.endsWith("index.html")) {
+        // Standard SPA fallback
         const indexHandle = await getCachedFileHandle(
           root,
           folderName,
@@ -832,7 +858,7 @@ async function generateResponseForVirtualFile(
     }
 
     const rangeHeader = request.headers.get("Range");
-    if (rangeHeader) {
+    if (rangeHeader && status === 200) {
       const parts = rangeHeader.replace(/bytes=/, "").split("-");
       let start = parseInt(parts[0], 10) || 0;
       let end = parts[1] ? parseInt(parts[1], 10) : processedSize - 1;
@@ -855,7 +881,7 @@ async function generateResponseForVirtualFile(
     }
 
     finalHeaders["Content-Length"] = processedSize.toString();
-    return new Response(responseBody, { headers: finalHeaders });
+    return new Response(responseBody, { status, headers: finalHeaders });
   } catch (e) {
     console.error("SW fetch error:", e);
     return new Response("Internal server error", { status: 500 });

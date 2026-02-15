@@ -185,122 +185,121 @@ async function updateRegistryEntry(name, data) {
 }
 
 async function analyzeAndImportFolder(handleOrEntry, filesArray = null) {
-  // Check for manifest.enc
-  let isEncrypted = false;
-  let isSystemExport = false;
-  let pathPrefix = "";
+  setUiBusy(true);
+  try {
+    let isEncrypted = false;
+    let isSystemExport = false;
+    let pathPrefix = "";
 
-  // Helper to check file existence inside handle/entry/array
-  async function checkFile(pathParts) {
-    try {
-      if (filesArray) {
-        const targetPath = pathParts.join("/");
-        return filesArray.some(
-          (f) =>
-            f.webkitRelativePath.endsWith(`/${targetPath}`) ||
-            f.webkitRelativePath === targetPath,
-        );
-      } else if (handleOrEntry.kind === "directory") {
-        // Modern FileSystemHandle
-        let cur = handleOrEntry;
-        for (let i = 0; i < pathParts.length - 1; i++) {
-          cur = await cur.getDirectoryHandle(pathParts[i]);
-        }
-        await cur.getFileHandle(pathParts[pathParts.length - 1]);
-        return true;
-      } else if (handleOrEntry.isDirectory) {
-        return new Promise((resolve) => {
-          handleOrEntry.getFile(
-            pathParts.join("/"),
-            { create: false },
-            () => resolve(true),
-            () => resolve(false),
+    async function checkFile(pathParts) {
+      try {
+        if (filesArray) {
+          const targetPath = pathParts.join("/");
+          return filesArray.some(
+            (f) =>
+              f.webkitRelativePath.endsWith(`/${targetPath}`) ||
+              f.webkitRelativePath === targetPath,
           );
-        });
+        } else if (handleOrEntry.kind === "directory") {
+          let cur = handleOrEntry;
+          for (let i = 0; i < pathParts.length - 1; i++) {
+            cur = await cur.getDirectoryHandle(pathParts[i]);
+          }
+          await cur.getFileHandle(pathParts[pathParts.length - 1]);
+          return true;
+        } else if (handleOrEntry.isDirectory) {
+          return new Promise((resolve) => {
+            handleOrEntry.getFile(
+              pathParts.join("/"),
+              { create: false },
+              () => resolve(true),
+              () => resolve(false),
+            );
+          });
+        }
+      } catch (e) {
+        return false;
       }
-    } catch (e) {
-      return false;
     }
-  }
 
-  if (await checkFile(["manifest.enc"])) isEncrypted = true;
-  if (!isEncrypted) {
-    if (await checkFile(["data", "custom", SYSTEM_FILE])) {
-      isSystemExport = true;
-    } else if (await checkFile(["opfs", "rfs", SYSTEM_FILE])) {
-      // Root folder upload containing opfs/rfs/...
-      isSystemExport = true;
-    } else if (await checkFile(["custom", SYSTEM_FILE])) {
-      isSystemExport = true;
-      pathPrefix = "data";
-    } else if (await checkFile(["rfs", SYSTEM_FILE])) {
-      // Direct "opfs" folder upload containing rfs/...
-      isSystemExport = true;
-      pathPrefix = "opfs";
-    } else if (await checkFile(["ls.json"])) {
-      isSystemExport = true;
-      pathPrefix = "data";
+    if (await checkFile(["manifest.enc"])) isEncrypted = true;
+    if (!isEncrypted) {
+      if (await checkFile(["data", "custom", SYSTEM_FILE])) {
+        isSystemExport = true;
+      } else if (await checkFile(["opfs", "rfs", SYSTEM_FILE])) {
+        isSystemExport = true;
+      } else if (await checkFile(["custom", SYSTEM_FILE])) {
+        isSystemExport = true;
+        pathPrefix = "data";
+      } else if (await checkFile(["rfs", SYSTEM_FILE])) {
+        isSystemExport = true;
+        pathPrefix = "opfs";
+      } else if (await checkFile(["ls.json"])) {
+        isSystemExport = true;
+        pathPrefix = "data";
+      }
     }
-  }
 
-  if (isEncrypted) {
-    const encName = prompt(
-      `"${handleOrEntry.name || "Folder"}" appears to be an encrypted folder. Enter a name to mount it as:`,
-      handleOrEntry.name,
-    );
-    if (!encName) return;
-
-    setUiBusy(true);
-    if (filesArray) {
-      alert(
-        "Encrypted folder import via file input not supported yet. Use Drag & Drop or Directory Picker.",
+    if (isEncrypted) {
+      const encName = prompt(
+        `"${handleOrEntry.name || "Folder"}" appears to be an encrypted folder. Enter a name to mount it as:`,
+        handleOrEntry.name,
       );
-      setUiBusy(false);
-    } else {
-      if (handleOrEntry.kind === "directory") {
-        await processFolderSelection(encName, handleOrEntry);
-      } else {
-        alert("Please use Upload Folder for encrypted folders.");
-        setUiBusy(false);
-      }
-    }
-    return;
-  }
+      if (!encName) return;
 
-  if (isSystemExport) {
-    if (
-      confirm(
-        "Found system configuration folder. Import? (This may modify multiple folders or local data.)",
-      )
-    ) {
-      let stream;
       if (filesArray) {
-        stream = LittleExport.folderToTarStream(filesArray, checkYield, {
-          pathPrefix,
-        });
+        alert(
+          "Encrypted folder import via file input not supported yet. Use drag-and-drop or the directory picker.",
+        );
       } else {
-        stream = LittleExport.folderToTarStream(handleOrEntry, checkYield, {
-          pathPrefix,
-        });
+        if (handleOrEntry.kind === "directory") {
+          await processFolderSelection(encName, handleOrEntry);
+        } else {
+          alert("Please use Upload Folder for encrypted folders.");
+        }
       }
-      await startImport({ stream: () => stream });
       return;
     }
-  }
 
-  const name =
-    document.getElementById("folderName").value.trim() ||
-    prompt("Enter a name for the folder:", handleOrEntry.name || "");
-  if (!name) return;
+    if (isSystemExport) {
+      if (
+        confirm(
+          "Found system configuration folder. Import? (This may overwrite multiple folders and already existing data.)",
+        )
+      ) {
+        let stream;
+        if (filesArray) {
+          stream = LittleExport.folderToTarStream(filesArray, checkYield, {
+            pathPrefix,
+          });
+        } else {
+          stream = LittleExport.folderToTarStream(handleOrEntry, checkYield, {
+            pathPrefix,
+          });
+        }
+        await startImport({ stream: () => stream });
+      }
+      return;
+    }
 
-  setUiBusy(true);
-  if (filesArray) {
-    await processFilesAndStore(name, filesArray);
-  } else if (handleOrEntry.kind === "directory") {
-    await processFolderSelection(name, handleOrEntry);
-  } else {
-    alert("Please use drag-and-drop for this folder.");
-    setUiBusy(false);
+    const name =
+      document.getElementById("folderName").value.trim() ||
+      prompt("Enter a name for the folder:", handleOrEntry.name || "");
+
+    if (!name) return;
+
+    if (filesArray) {
+      await processFilesAndStore(name, filesArray);
+    } else if (handleOrEntry.kind === "directory") {
+      await processFolderSelection(name, handleOrEntry);
+    } else {
+      alert("Please use drag-and-drop for this folder.");
+    }
+  } catch (e) {
+    console.error("Import error:", e);
+    alert("An error occurred during import: " + e.message);
+  } finally {
+    setUiBusy(false); // Guarantees UI unlocks in all browsers
   }
 }
 
@@ -1393,7 +1392,7 @@ async function uploadAndEncryptWithPassword() {
 document.addEventListener("DOMContentLoaded", () => {
   if (window.location.protocol === "file:") {
     alert(
-      "RuntimeFS cannot run from a local file:// context; use an online version or localhost instead.",
+      "RuntimeFS cannot run from a local file:// context; use an online version or test from localhost instead.",
     );
     return;
   }
@@ -1469,7 +1468,11 @@ document.addEventListener("DOMContentLoaded", () => {
           await analyzeAndImportFolder(handle);
           return;
         }
-      } catch (e) {}
+      } catch (e) {
+        console.warn(
+          "FileSystemHandle access denied, falling back to webkitGetAsEntry",
+        );
+      }
     }
 
     const entry = items[0].webkitGetAsEntry
@@ -1553,7 +1556,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (isSystem) {
           if (
             confirm(
-              "Found system configuration folder. Import? (This may modify multiple folders or already existing data.)",
+              "Found system configuration folder. Import? (This may overwrite multiple folders and already existing data.)",
             )
           ) {
             const stream = LittleExport.folderToTarStream(files, checkYield, {

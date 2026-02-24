@@ -9,7 +9,7 @@ const clientSessionStore = new Map();
 const handleCache = new Map();
 const manifestCache = new Map();
 const ruleCache = new Map();
-const MAX_REGEX_SIZE = 10 * 1024 * 1024; // Technically 10 MiB and not 10 MB, but it's fine this way
+const MAX_REGEX_SIZE = 10 * 1024 * 1024; // 10 MiB default
 
 const dirHandleCache = new Map(); // Cache for directory handles
 const MAX_DIR_CACHE_SIZE = 1000; // Prevent memory leaks
@@ -178,7 +178,7 @@ function applyRegexRules(filePath, fileBuffer, fileType, compiledRules) {
     )
   )
     return fileBuffer;
-  if (fileBuffer.byteLength > 10 * 1024 * 1024) return fileBuffer;
+  if (fileBuffer.byteLength > MAX_REGEX_SIZE) return fileBuffer;
 
   try {
     let content = new TextDecoder().decode(fileBuffer);
@@ -528,7 +528,8 @@ async function handleEncryptedRequest(
       manifest[filePath] ||
       manifest[filePath + ".html"] ||
       manifest[filePath + "/index.html"];
-    if (!fileMeta) return new Response("File not found", { status: 404 });
+    if (!fileMeta)
+      return new Response("File not found: " + filePath, { status: 404 });
 
     const totalSize = fileMeta.size;
 
@@ -802,7 +803,11 @@ async function generateResponseForVirtualFile(
       }
     }
 
-    if (!handle) return new Response("File not found", { status: 404 });
+    if (!handle)
+      return new Response(
+        "File not found: " + folderName + "/" + relativePath,
+        { status: 404 },
+      );
 
     const file = await handle.getFile();
     const totalSize = file.size;
@@ -831,7 +836,7 @@ async function generateResponseForVirtualFile(
       compiledRules &&
       compiledRules.length > 0 &&
       totalSize > 0 &&
-      totalSize < MAX_REGEX_SIZE
+      totalSize <= MAX_REGEX_SIZE
     ) {
       if (isLikelyText(contentType, relativePath)) {
         // Only read the first 4KB to check if it's actually text

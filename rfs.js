@@ -1,9 +1,36 @@
 const SW_URL = "./sw.min.js"; // Change if needed!
+const ALWAYS_CONFIRM_LEAVE = false; // Set to true to always create the "Leave site?" prompt before unload, regardless if currentlyBusy is false.
 const RFS_PREFIX = "rfs"; // OPFS prefix
 const SYSTEM_FILE = "rfs_system.json"; // File with a little bit of extra data
 const CHUNK_SIZE = 4194304; // 4MB, for encrypted chunks
 const CONCURRENCY = 4; // Number of "workers" for folder uploading stuff
 const YIELD_TIME = 50; // Amount of ms before yielding; used for logging and pauses so UI can update.
+
+// List of ignored internal files. If you have a usecase for LittleExport such as transferring programming files (but want to exclude certain folders like node_modules), please add to IGNORED_NAMES or modify functionality.
+const IGNORED_NAMES = new Set([
+  ".DS_Store",
+  "Thumbs.db",
+  "desktop.ini",
+  "__MACOSX",
+  ".AppleDouble",
+  ".LSOverride",
+  ".Trashes",
+  ".TemporaryItems",
+  ".Spotlight-V100",
+  ".fseventsd",
+  ".DocumentRevisions-V100",
+  "System Volume Information",
+  "$RECYCLE.BIN",
+]);
+
+// Check if a file/folder should be ignored.
+function isJunk(name) {
+  return (
+    IGNORED_NAMES.has(name) ||
+    name.startsWith("._") ||
+    name.startsWith(".Trash-")
+  );
+}
 
 let isListingFolders = false;
 let currentlyBusy = false;
@@ -81,9 +108,10 @@ const logProgress = createLogger(
 );
 
 window.addEventListener("beforeunload", function (e) {
-  if (currentlyBusy) {
+  if (ALWAYS_CONFIRM_LEAVE || currentlyBusy) {
     e.preventDefault();
-    return "Changes you made may not be saved."; // not that the string text matters
+    e.returnValue = "Changes you made may not be saved.";
+    return "Changes you made may not be saved."; // not that the string text here matters
   }
 });
 
@@ -343,11 +371,11 @@ async function processFolderSelection(name, handle) {
     try {
       await rfs.removeEntry(name, { recursive: true });
     } catch (e) {
-      if (e.name !== "NotFoundError")
-        alert(
+      if (e.name !== "NotFoundError") {
+        throw new Error(
           "RuntimeFS cannot currently remove this folder; try closing other open RuntimeFS tabs.",
         );
-      return;
+      }
     }
 
     await decryptAndLoadFolderToOpfs(
@@ -357,6 +385,11 @@ async function processFolderSelection(name, handle) {
     );
     await updateRegistryEntry(name, { encryptionType: null });
   } catch (e) {
+    if (e.message && e.message.includes("RuntimeFS cannot currently remove")) {
+      alert(e.message);
+      setUiBusy(false);
+      return;
+    }
     await processFolderStreaming(name, handle);
   }
 
@@ -370,7 +403,7 @@ async function processFolderSelection(name, handle) {
   if ("FileSystemObserver" in window) {
     try {
       observer = new FileSystemObserver((recs) => changes.push(...recs));
-      observer.observe(dirHandle, { recursive: true });
+      await observer.observe(dirHandle, { recursive: true });
       if (!showingSync) {
         Array.from(
           document.body.getElementsByClassName("supportCheck"),
@@ -379,6 +412,14 @@ async function processFolderSelection(name, handle) {
       }
     } catch (e) {
       console.warn("Observer failed:", e);
+      // Hide sync functionality on failure (e.g., ChromeOS unsupported filesystems)
+      if (showingSync) {
+        Array.from(
+          document.body.getElementsByClassName("supportCheck"),
+        ).forEach((elem) => (elem.style.display = "none"));
+        showingSync = false;
+      }
+      observer = null;
     }
   }
 
@@ -485,8 +526,8 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
 
         try {
           while (chunkIndex < totalEncChunks) {
-            const pY = checkYield();
-            if (pY) await pY;
+            const py = checkYield();
+            if (py) await py;
 
             const isLast = chunkIndex === totalEncChunks - 1;
             const plainSize = isLast
@@ -552,7 +593,7 @@ async function processFilesAndStore(name, fileList) {
   for (const file of fileList) totalBytes += file.size;
 
   let bytesUploaded = 0;
-  const queue = Array.from(fileList);
+  const queue = Array.from(fileList).filter((f) => !isJunk(f.name));
 
   const updateUI = () => {
     const mb = (bytesUploaded / 1e6).toFixed(2);
@@ -620,6 +661,7 @@ async function processFolderStreaming(name, srcHandle) {
       alert(
         "RuntimeFS cannot currently remove this folder; try closing other open RuntimeFS tabs.",
       );
+      setUiBusy(false);
       return;
     }
   }
@@ -628,6 +670,7 @@ async function processFolderStreaming(name, srcHandle) {
 
   const uploadQueue = [];
   let scanComplete = false;
+  let hasError = false;
   let totalBytesDiscovered = 0;
   let bytesUploaded = 0;
 
@@ -644,11 +687,11 @@ async function processFolderStreaming(name, srcHandle) {
 
   const worker = async () => {
     const dirCache = new Map();
-    while (true) {
+    while (!hasError) {
       const task = uploadQueue.shift();
       if (!task) {
         if (scanComplete) break;
-        await new Promise((res) => setTimeout(res, 50));
+        await new Promise((res) => setTimeout(res, 20));
         continue;
       }
 
@@ -674,45 +717,53 @@ async function processFolderStreaming(name, srcHandle) {
     }
   };
 
-  const workerPromises = Array(CONCURRENCY).fill(null).map(worker);
-  const scanStack = [{ source: srcHandle, dest: destRoot }];
+  const scanner = async () => {
+    const scanStack = [{ source: srcHandle, dest: destRoot }];
+    while (scanStack.length > 0 && !hasError) {
+      const { source, dest } = scanStack.shift();
 
-  while (scanStack.length > 0) {
-    const { source, dest } = scanStack.shift();
+      try {
+        for await (const entry of source.values()) {
+          if (hasError) break;
+          if (isJunk(entry.name)) continue;
+          if (entry.kind === "file") {
+            // Scanner does the heavy lifting of opening the file
+            const file = await entry.getFile();
+            totalBytesDiscovered += file.size;
 
-    try {
-      for await (const entry of source.values()) {
-        if (entry.kind === "file") {
-          // Scanner does the heavy lifting of opening the file
-          const file = await entry.getFile();
-          totalBytesDiscovered += file.size;
+            uploadQueue.push({ dest, entry, fileOverride: file });
+            let p = updateUI();
+            if (p) await p;
 
-          uploadQueue.push({ dest, entry, fileOverride: file });
-          let p = updateUI();
-          if (p) await p;
-
-          // Backpressure loop: prevent the scan from eating all RAM if I/O is slow
-          while (uploadQueue.length > 500) {
-            await new Promise((res) => setTimeout(res, 50));
-            const p = checkYield();
-            if (p) await p; // Yield while waiting!
+            // Backpressure loop (if IO is slow)
+            while (uploadQueue.length > 500 && !hasError) {
+              await new Promise((res) => setTimeout(res, 20));
+              const py = checkYield();
+              if (py) await py;
+            }
+          } else if (entry.kind === "directory") {
+            const nextDest = await dest.getDirectoryHandle(entry.name, {
+              create: true,
+            });
+            scanStack.push({ source: entry, dest: nextDest });
           }
-        } else if (entry.kind === "directory") {
-          const nextDest = await dest.getDirectoryHandle(entry.name, {
-            create: true,
-          });
-          scanStack.push({ source: entry, dest: nextDest });
+          const p = checkYield();
+          if (p) await p;
         }
-        const p = checkYield();
-        if (p) await p;
+      } catch (e) {
+        console.warn("Error reading directory stream:", e);
       }
-    } catch (e) {
-      console.warn("Error reading directory stream:", e);
     }
-  }
+    scanComplete = true;
+  };
 
-  scanComplete = true;
-  await Promise.all(workerPromises);
+  try {
+    const workerPromises = Array(CONCURRENCY).fill(null).map(worker);
+    await Promise.all([scanner(), ...workerPromises]);
+  } catch (e) {
+    hasError = true;
+    throw e;
+  }
 
   document.getElementById("folderName").value = "";
   document.getElementById("openFolderName").value = name;
@@ -832,39 +883,47 @@ async function openFile(overrideFolderName) {
   if (!folderName) return alert("Provide a folder name.");
 
   setUiBusy(true);
-  const registry = await getRegistry();
-  const meta = registry[folderName];
-  if (!meta) {
+
+  try {
+    const registry = await getRegistry();
+    const meta = registry[folderName];
+    if (!meta) {
+      alert("Folder not found.");
+      return;
+    }
+
+    const rules = document.getElementById("regex").value.trim();
+    const headers = document.getElementById("headers").value.trim();
+
+    if (meta.rules !== rules || meta.headers !== headers) {
+      await updateRegistryEntry(folderName, { rules, headers });
+    }
+
+    let key = null;
+    if (meta.encryptionType === "password") {
+      const password = prompt(`Enter password for "${folderName}":`);
+      if (!password) return;
+      key = await deriveKeyFromPassword(password, base64ToBuffer(meta.salt));
+    }
+
+    const sw = await waitForController();
+    await new Promise((resolve, reject) => {
+      const channel = new MessageChannel();
+      channel.port1.onmessage = () => resolve();
+      sw.postMessage({ type: "SET_RULES", rules, headers, key, folderName }, [
+        channel.port2,
+      ]);
+      setTimeout(() => reject(new Error("Service Worker timeout.")), 4000);
+    });
+
+    const encodedPath = fileName.split("/").map(encodeURIComponent).join("/");
+    window.open(`n/${encodeURIComponent(folderName)}/${encodedPath}`, "_blank");
+  } catch (e) {
+    console.error(e);
+    alert(e.message);
+  } finally {
     setUiBusy(false);
-    return alert("Folder not found.");
   }
-
-  const rules = document.getElementById("regex").value.trim();
-  const headers = document.getElementById("headers").value.trim();
-
-  if (meta.rules !== rules || meta.headers !== headers) {
-    await updateRegistryEntry(folderName, { rules, headers });
-  }
-
-  let key = null;
-  if (meta.encryptionType === "password") {
-    const password = prompt(`Enter password for "${folderName}":`);
-    if (!password) return setUiBusy(false);
-    key = await deriveKeyFromPassword(password, base64ToBuffer(meta.salt));
-  }
-
-  const sw = await waitForController();
-  await new Promise((resolve) => {
-    const channel = new MessageChannel();
-    channel.port1.onmessage = () => resolve();
-    sw.postMessage({ type: "SET_RULES", rules, headers, key, folderName }, [
-      channel.port2,
-    ]);
-  });
-
-  const encodedPath = fileName.split("/").map(encodeURIComponent).join("/");
-  window.open(`n/${encodeURIComponent(folderName)}/${encodedPath}`, "_blank");
-  setUiBusy(false);
 }
 
 async function exportData() {
@@ -912,6 +971,7 @@ async function exportData() {
       exclude.opfs.push(RFS_PREFIX);
     }
 
+    logProgress("Starting export...", true);
     let status = 2; // successful
     await LittleExport.exportData({
       fileName: "result",
@@ -1137,7 +1197,9 @@ async function syncAndOpenFile() {
 }
 
 async function performSyncToOpfs() {
-  console.log(`Syncing ${changes.length} changes...`);
+  console.log(
+    `Syncing ${changes.length}${changes.length === 1 ? " change..." : " changes..."}`,
+  );
 
   // Use a lock to prevent UI and SW conflict
   await navigator.locks.request(`lock_rfs_${folderName}`, async () => {
@@ -1146,7 +1208,7 @@ async function performSyncToOpfs() {
     const folderHandle = await rfsRoot.getDirectoryHandle(folderName);
 
     // Create a copy and clear global to prevent race conditions during sync
-    const processing = changes.slice(0);
+    const processing = changes.splice(0, changes.length);
     changes.length = 0;
 
     for (const change of processing) {
@@ -1229,12 +1291,13 @@ async function uploadAndEncryptWithPassword() {
     while (scanQueue.length > 0) {
       const { dir, path } = scanQueue.shift();
       for await (const entry of dir.values()) {
+        if (isJunk(entry.name)) continue;
         const entryPath = path ? `${path}/${entry.name}` : entry.name;
         if (entry.kind === "file") {
           const fileId = crypto.randomUUID();
           queue.push({ entry, entryPath, fileId });
           while (queue.length > 500) {
-            // handle backpressure
+            // handle backpressure if IO is slow
             await new Promise((resolve) => setTimeout(resolve, 20));
           }
         } else {
@@ -1494,6 +1557,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         while (queue.length > 0) {
           const { entry: curr, path } = queue.shift();
+          if (isJunk(curr.name)) continue;
 
           if (curr.isFile) {
             const f = await new Promise((res, rej) => curr.file(res, rej));
@@ -1510,7 +1574,6 @@ document.addEventListener("DOMContentLoaded", () => {
               isSystem = true;
               pathPrefix = "data";
             } else if (rel === "ls.json" || rel.endsWith("/ls.json")) {
-              // Heuristic: if ls.json
               const parts = rel.split("/");
               if (
                 parts.length === 1 ||
@@ -1635,89 +1698,95 @@ async function openFileInPlace() {
   if (!folderName) return alert("Provide a folder name.");
 
   setUiBusy(true);
-  const registry = await getRegistry();
-  const meta = registry[folderName];
-  if (!meta) {
-    setUiBusy(false);
-    return alert("Folder not found.");
-  }
 
-  const rules = document.getElementById("regex").value.trim();
-  const headers = document.getElementById("headers").value.trim();
-
-  if (meta.rules !== rules || meta.headers !== headers) {
-    await updateRegistryEntry(folderName, { rules, headers });
-  }
-
-  let key = null;
-  if (meta.encryptionType === "password") {
-    const password = prompt(`Enter password for "${folderName}":`);
-    if (!password) {
-      return setUiBusy(false);
+  try {
+    const registry = await getRegistry();
+    const meta = registry[folderName];
+    if (!meta) {
+      alert("Folder not found.");
+      return;
     }
-    key = await deriveKeyFromPassword(password, base64ToBuffer(meta.salt));
-  }
 
-  const sw = await waitForController();
-  // Wrap SW communication in a race to prevent hanging
-  await Promise.race([
-    new Promise((resolve) => {
-      const channel = new MessageChannel();
-      channel.port1.onmessage = () => resolve();
-      sw.postMessage({ type: "SET_RULES", rules, headers, key, folderName }, [
-        channel.port2,
-      ]);
-    }),
-    new Promise((_, reject) =>
-      setTimeout(
-        () => reject(new Error("Service Worker response timed out.")),
-        4000,
+    const rules = document.getElementById("regex").value.trim();
+    const headers = document.getElementById("headers").value.trim();
+
+    if (meta.rules !== rules || meta.headers !== headers) {
+      await updateRegistryEntry(folderName, { rules, headers });
+    }
+
+    let key = null;
+    if (meta.encryptionType === "password") {
+      const password = prompt(`Enter password for "${folderName}":`);
+      if (!password) {
+        return;
+      }
+      key = await deriveKeyFromPassword(password, base64ToBuffer(meta.salt));
+    }
+
+    const sw = await waitForController();
+    // Wrap SW communication in a race to prevent hanging
+    await Promise.race([
+      new Promise((resolve) => {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = () => resolve();
+        sw.postMessage({ type: "SET_RULES", rules, headers, key, folderName }, [
+          channel.port2,
+        ]);
+      }),
+      new Promise((_, reject) =>
+        setTimeout(
+          () => reject(new Error("Service Worker response timed out.")),
+          4000,
+        ),
       ),
-    ),
-  ]);
+    ]);
 
-  const encodedPath = fileName
-    ? fileName.split("/").map(encodeURIComponent).join("/")
-    : "index.html";
-  const virtualUrl = `n/${encodeURIComponent(folderName)}/${encodedPath}`;
+    const encodedPath = fileName
+      ? fileName.split("/").map(encodeURIComponent).join("/")
+      : "index.html";
+    const virtualUrl = `n/${encodeURIComponent(folderName)}/${encodedPath}`;
 
-  const resp = await fetch(virtualUrl, {
-    headers: { Accept: "text/html" },
-  });
+    const resp = await fetch(virtualUrl, {
+      headers: { Accept: "text/html" },
+    });
 
-  if (!resp.ok) {
-    if (resp.status === 403) {
-      setUiBusy(false);
-      return alert("Session authentication failed.");
+    if (!resp.ok) {
+      if (resp.status === 403) {
+        return alert("Session authentication failed.");
+      }
+      throw new Error(`Failed to load HTML: ${resp.status} ${resp.statusText}`);
     }
-    throw new Error(`Failed to load HTML: ${resp.status} ${resp.statusText}`);
+    let html = await resp.text();
+
+    const basePath = virtualUrl.substring(0, virtualUrl.lastIndexOf("/") + 1);
+    const baseTag = `<base href="${basePath}">`;
+
+    let metaTags = "";
+    resp.headers.forEach((val, key) => {
+      metaTags += `<meta http-equiv="${key.replace(
+        /"/g,
+        "&quot;",
+      )}" content="${val.replace(/"/g, "&quot;")}">\n`;
+    });
+
+    if (/<head\b[^>]*>/i.test(html)) {
+      html = html.replace(/(<head\b[^>]*>)/i, `$1${baseTag}${metaTags}`);
+    } else if (/<html\b[^>]*>/i.test(html)) {
+      html = html.replace(
+        /(<html\b[^>]*>)/i,
+        `$1<head>${baseTag}${metaTags}</head>`,
+      );
+    } else {
+      html = `<head>${baseTag}${metaTags}</head>${html}`;
+    }
+
+    document.open();
+    document.write(html);
+    document.close();
+  } catch (e) {
+    console.error(e);
+    alert(e.message);
+  } finally {
+    setUiBusy(false);
   }
-  let html = await resp.text();
-
-  const basePath = virtualUrl.substring(0, virtualUrl.lastIndexOf("/") + 1);
-  const baseTag = `<base href="${basePath}">`;
-
-  let metaTags = "";
-  resp.headers.forEach((val, key) => {
-    metaTags += `<meta http-equiv="${key.replace(
-      /"/g,
-      "&quot;",
-    )}" content="${val.replace(/"/g, "&quot;")}">\n`;
-  });
-
-  if (/<head\b[^>]*>/i.test(html)) {
-    html = html.replace(/(<head\b[^>]*>)/i, `$1${baseTag}${metaTags}`);
-  } else if (/<html\b[^>]*>/i.test(html)) {
-    html = html.replace(
-      /(<html\b[^>]*>)/i,
-      `$1<head>${baseTag}${metaTags}</head>`,
-    );
-  } else {
-    html = `<head>${baseTag}${metaTags}</head>${html}`;
-  }
-
-  document.open();
-  document.write(html);
-  document.close();
-  setUiBusy(false);
 }

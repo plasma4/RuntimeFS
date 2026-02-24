@@ -209,18 +209,19 @@
         </legend>
 
         <h3>Regex Replacement</h3>
-        Spaces required; disabled for files over 10MB. File name matching also uses regex.
+        Spaces required; disabled for files over 10MiB. File name matching uses regex.
         <br>
         Replace | with || and $ with $$ to only match the first instance.
         Replace regexHere or plain text with <code>{{SCRIPT}}</code> to inject a script into the HTML.
         <ul>
             <li><code>* | regexHere -> replacement</code></li>
-            <li><code>file.js $ plain text -> replacement</code></li>
-            <li><code>index.html $ {{SCRIPT}} -> alert(1)</code></li>
+            <li><code>file\.js $ plain text -> replacement</code></li>
+            <li><code>index\.html $ {{SCRIPT}} -> alert(1)</code></li>
         </ul>
         <textarea id="regex" rows="5" cols="40" placeholder="Enter rules here..."></textarea>
         <hr>
         <h3>Custom Headers</h3>
+        Custom headers do not use regex for file-matching
         <ul>
             <li><code># Override the default headers for network requests.</code></li>
             <li><code>* -> X-Frame-Options: DENY</code></li>

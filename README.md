@@ -21,11 +21,19 @@ Make sure to modify `APP_SHELL_FILES` in the SW and `SW_URL` in the main code if
 
 You can use Enter on text inputs to perform actions, instead of clicking buttons. On the Folder to Open section text inputs you can use Shift+Enter to open in-place and Ctrl/Cmd+Enter to sync and open. (Syncing will only show up after uploading a folder, through a supported browser. Drag-and-drop should work for all browsers but won't allow syncing.) You can extract a `.tar.gz` file and re-upload that folder.
 
-Custom regex and headers save on reload or export but do not affect stored files; they simply modify headers when opening a file in the `/n/` virtual path from the RuntimeFS menu (reloading or navigating to the URL directly do not yet). Many headers won't work when opening in-place like CORS.
+Custom regex and headers save on reload or export but do not affect stored files; they simply modify headers when opening a file in the `/n/` virtual path from the RuntimeFS menu (reloading or navigating to the URL directly do not yet). Many headers won't work when opening in-place like CORS. **Regex replacement uses regex for file-matching. Custom Headers do not.**
 
-It's possible to import or export specified data types in the Data Management menu, and you can also drag-and-drop import files (.tar.gz or .enc).
+It's also possible to import or export specified data types in the Data Management menu, and you can also drag-and-drop import files (.tar.gz or .enc).
 
-To update to a newer version, a single-file plugin exists for customizing RuntimeFS at `plugin/index.html`, allowing for you to fully customize RuntimeFS from any site hosting it. Note that hard-reloading should update the cache and serve the latest version, but isn't guaranteed. If the plugin isn't included in the way you use RuntimeFS, you can upload it as a folder and access it directly. Example link with the demo [here](https://plasma4.org/projects/RuntimeFS/plugin/).
+> [!TIP]
+> Check the Notes/Edge Cases section for additional reasons why your code might not work. If you ever encounter a site that breaks, see if the code you downloaded was an already compiled web project, and if it is, try these headers for easy CORS isolation:
+>
+> ```
+> * -> Cross-Origin-Embedder-Policy: require-corp
+> * -> Cross-Origin-Opener-Policy: same-origin
+> ```
+
+To update to a newer version, hard-reloading should update the cache and serve the latest version. A single-file plugin exists for customizing RuntimeFS at `plugin/index.html`, allowing for you to fully customize RuntimeFS from any site hosting it (or clear the cache, if you're a browser that can't hard reload). If the plugin isn't included in the way you use RuntimeFS, you can upload it as a folder and access it directly. Example plugin link with the demo [here](https://plasma4.org/projects/RuntimeFS/plugin/).
 
 ## Browser Support
 
@@ -68,7 +76,7 @@ Not all applications will work! Out of the many sites I tested, there were the m
 >
 > In theory, a malicious site hosted inside RuntimeFS could exfiltrate your data. Keep in mind you are basically using a localhost **but without subdomain/site isolation**. If this is a concern, use Content-Security-Policy (CSP) headers to stop external requests.
 
-Also note:
+## Edge Cases
 
 - File names are case-sensitive.
 - On first load, uploading a folder in Firefox and opening it might not work; reloading should fix this issue.
@@ -76,6 +84,7 @@ Also note:
 - Some headers like CSP currently **do not work** for in-place opening. Headers might also pose security risks!
 - Cookie exporting does not store `max-age`; only the key and value.
 - Some extensions, such as Chrome compatibility plugins for Firefox, might actively interfere with the features presented. Make sure that your extensions aren't breaking anything!
+- If you are using RuntimeFS for code development or want to upload ALL files in a folder, please note that while internal files like `Thumbs.db`/`.DS_Store` aren't processed. You can modify `isJunk()` or add custom checks, so it's suggested to fork RuntimeFS if you have a custom usecase.
 - The most likely reason that data export fails when transferring between sites is because those websites use URL properties as part of the key (either from `document.URL` or `location`). You might be able to force a site to use a hardcoded URL for storage with clever regex or code changes.
 - Using regex requires any matched files to be fully loaded into memory, reducing performance. Be careful!
 - There may be some highly specific crash cases when exporting; check LittleExport documentation for details.

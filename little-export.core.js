@@ -974,6 +974,9 @@
 
           await walkOpfs(root, [], trustAll ? DECISION.TRUST : false);
         }
+
+        currentFileProgress.written = 0;
+        currentFileProgress.total = 0;
       }
 
       // IndexedDB
@@ -1181,6 +1184,9 @@
             }
           }
         }
+
+        currentFileProgress.written = 0;
+        currentFileProgress.total = 0;
       }
 
       // localStorage
@@ -1417,6 +1423,9 @@
             }, `Cache ${cacheName}`);
           }
         }
+
+        currentFileProgress.written = 0;
+        currentFileProgress.total = 0;
       }
 
       status.category = "Finishing";
@@ -1861,7 +1870,7 @@
           status.detail = name.replace("opfs/", "");
         } else if (name.startsWith("data/blobs/")) {
           status.category = "Blobs";
-          status.detail = "restoring...";
+          status.detail = "Re-linking Data";
         } else {
           status.category = "Config";
           status.detail = name;

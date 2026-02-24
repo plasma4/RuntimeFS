@@ -1245,7 +1245,7 @@ async function performSyncToOpfs() {
 
 async function uploadAndEncryptWithPassword() {
   const name = document.getElementById("encryptFolderName").value.trim();
-  const password = prompt("Password:");
+  const password = prompt("Enter a password:");
   if (!name || !password) return;
 
   setUiBusy(true);

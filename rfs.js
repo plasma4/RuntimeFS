@@ -2,7 +2,7 @@ const SW_URL = "./sw.min.js"; // Change if needed!
 const ALWAYS_CONFIRM_LEAVE = false; // Set to true to always create the "Leave site?" prompt before unload, regardless if currentlyBusy is false.
 const RFS_PREFIX = "rfs"; // OPFS prefix
 const SYSTEM_FILE = "rfs_system.json"; // File with a little bit of extra data
-const CHUNK_SIZE = 4194304; // 4MB, for encrypted chunks
+const CHUNK_SIZE = 4194304; // 4MiB, for encrypted chunks
 const CONCURRENCY = 4; // Number of "workers" for folder uploading stuff
 const YIELD_TIME = 50; // Amount of ms before yielding; used for logging and pauses so UI can update.
 

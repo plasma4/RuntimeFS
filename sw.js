@@ -359,17 +359,37 @@ self.addEventListener("message", (e) => {
 function parseCustomHeaders(rulesString) {
   if (!rulesString || !rulesString.trim()) return [];
   const rules = [];
+
   rulesString
     .trim()
     .split("\n")
     .forEach((line) => {
       line = line.trim();
-      if (line.startsWith("#") || line === "") return;
-      const parts = line.split("->");
-      if (parts.length < 2) return;
-      const [globPart, ...headerParts] = parts;
-      const glob = globPart.trim();
-      const fullHeaderString = headerParts.join("->").trim();
+      if (line.length === 0 || line.startsWith("#")) return;
+
+      let separator = "";
+      let isRawRegex = false;
+
+      const rawIndex = line.indexOf("-->"); // regex
+      const globIndex = line.indexOf("->"); // escaped
+
+      if (rawIndex !== -1) {
+        separator = "-->";
+        isRawRegex = true;
+      } else if (globIndex !== -1) {
+        separator = "->";
+        isRawRegex = false;
+      } else {
+        return;
+      }
+
+      const sepIndex = line.indexOf(separator);
+      const globPart = line.substring(0, sepIndex).trim();
+      const fullHeaderString = line
+        .substring(sepIndex + separator.length)
+        .trim();
+
+      // Split only at the first occurrence of the colon
       const colonIndex = fullHeaderString.indexOf(":");
       if (colonIndex === -1) return;
 
@@ -377,20 +397,23 @@ function parseCustomHeaders(rulesString) {
       const headerValue = fullHeaderString
         .substring(colonIndex + 1)
         .trim()
-        .replace(/^['"]|['"]$/g, ""); // remove quotes at start and end
+        .replace(/^['"]|['"]$/g, "");
 
       try {
-        const regex = new RegExp(
-          "^" +
-            glob
-              .replace(/\./g, "\\.")
-              .replace(/\*/g, ".*")
-              .replace(/\?/g, ".") +
-            "$",
-        );
-        rules.push({ regex, header: headerName, value: headerValue });
-      } catch (e) {}
+        const pattern = isRawRegex
+          ? globPart
+          : "^" + globPart.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$";
+
+        rules.push({
+          regex: new RegExp(pattern),
+          header: headerName,
+          value: headerValue,
+        });
+      } catch (e) {
+        console.error("Invalid pattern on line:", line);
+      }
     });
+
   return rules;
 }
 

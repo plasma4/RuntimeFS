@@ -8,6 +8,7 @@ let pendingNavData = null; // for next navigation request
 const clientSessionStore = new Map();
 const handleCache = new Map();
 const manifestCache = new Map();
+const compiledHeaderCache = new Map();
 const ruleCache = new Map();
 const MAX_REGEX_SIZE = 10 * 1024 * 1024; // 10 MiB default
 
@@ -297,6 +298,12 @@ self.addEventListener("message", (e) => {
       const compiledRules = compileRules(rules);
       const compiledHeaders = parseCustomHeaders(headers);
 
+      // Update the global cache so cold navigations are immediately correct
+      compiledHeaderCache.set(folderName, {
+        raw: headers,
+        compiled: compiledHeaders,
+      });
+
       if (!pendingNavData) pendingNavData = {};
       pendingNavData[folderName] = {
         rules,
@@ -426,6 +433,22 @@ function applyCustomHeaders(baseHeaders, filePath, headerRulesArray) {
     }
   }
   return baseHeaders;
+}
+
+function getCompiledHeaders(folderName, rawHeaders) {
+  // If in-memory and the raw string hasn't changed, return it
+  const cached = compiledHeaderCache.get(folderName);
+  if (cached && cached.raw === rawHeaders) {
+    return cached.compiled;
+  }
+
+  // Otherwise, parse and cache
+  const compiled = parseCustomHeaders(rawHeaders);
+  compiledHeaderCache.set(folderName, {
+    raw: rawHeaders,
+    compiled: compiled,
+  });
+  return compiled;
 }
 
 self.addEventListener("fetch", (e) => {
@@ -761,7 +784,7 @@ async function generateResponseForVirtualFile(
     if (folderData.encryptionType === "password") {
       if (!session.key) return new Response("Session locked", { status: 403 });
       const compiledHeaders =
-        session.compiledHeaders || parseCustomHeaders(folderData.headers);
+        session.compiledHeaders || getCompiledHeaders(folderData.headers);
       const headers = applyCustomHeaders(
         {
           "Content-Type": getMimeType(relativePath),
@@ -838,7 +861,8 @@ async function generateResponseForVirtualFile(
       file.type || getMimeType(relativePath) || "application/octet-stream";
 
     const compiledHeaders =
-      session.compiledHeaders || parseCustomHeaders(folderData.headers);
+      session.compiledHeaders ||
+      getCompiledHeaders(folderName, folderData.headers);
     const compiledRules =
       session.compiledRules || compileRules(folderData.rules);
 

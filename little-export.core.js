@@ -38,7 +38,6 @@
   const TAR_BUFFER_SIZE = 65536;
   const ENC = new TextEncoder();
   const DEC = new TextDecoder("utf-8", { fatal: false });
-  const TEMP_BLOB_DIR = ".rfs_temp_blobs";
 
   async function deriveKey(password, salt) {
     const km = await crypto.subtle.importKey(
@@ -776,7 +775,7 @@
     let aborted = false;
 
     function getDecision(type, path, meta) {
-      if (!useOnVisit) return DECISION.TRUST;
+      if (!useOnVisit) return DECISION.PROCESS;
       return onVisit(type, path, meta);
     }
 
@@ -893,7 +892,7 @@
       }
 
       // OPFS
-      if (!aborted && opts.opfs && navigator.storage) {
+      if (!aborted && opts.opfs !== false && navigator.storage) {
         let categoryDecision = getDecision(TYPE.OPFS);
         if (categoryDecision && typeof categoryDecision.then === "function")
           categoryDecision = await categoryDecision;
@@ -934,7 +933,7 @@
                     if (decision === DECISION.SKIP) continue;
                   } else {
                     if (!checkSimpleFilter("opfs", pathStr, opts)) continue;
-                    decision = DECISION.TRUST;
+                    decision = DECISION.PROCESS;
                   }
                 }
 
@@ -980,7 +979,7 @@
       }
 
       // IndexedDB
-      if (!aborted && opts.idb && window.indexedDB && CBOR) {
+      if (!aborted && opts.idb !== false && window.indexedDB && CBOR) {
         let categoryDecision = getDecision(TYPE.IDB);
         if (categoryDecision && typeof categoryDecision.then === "function")
           categoryDecision = await categoryDecision;
@@ -1190,7 +1189,7 @@
       }
 
       // localStorage
-      if (!aborted && opts.localStorage) {
+      if (!aborted && opts.localStorage !== false) {
         let categoryDecision = getDecision(TYPE.LS);
         if (categoryDecision && typeof categoryDecision.then === "function")
           categoryDecision = await categoryDecision;
@@ -1238,7 +1237,7 @@
       }
 
       // sessionStorage
-      if (!aborted && opts.sessionStorage) {
+      if (!aborted && opts.sessionStorage !== false) {
         let categoryDecision = getDecision(TYPE.SS);
         if (categoryDecision && typeof categoryDecision.then === "function")
           categoryDecision = await categoryDecision;
@@ -1286,7 +1285,7 @@
       }
 
       // Cookies
-      if (!aborted && opts.cookies) {
+      if (!aborted && opts.cookies !== false) {
         let categoryDecision = getDecision(TYPE.COOKIE);
         if (categoryDecision && typeof categoryDecision.then === "function")
           categoryDecision = await categoryDecision;
@@ -1346,7 +1345,7 @@
       }
 
       // Cache storage
-      if (!aborted && opts.cache && window.caches && CBOR) {
+      if (!aborted && opts.cache !== false && window.caches && CBOR) {
         let categoryDecision = getDecision(TYPE.CACHE);
         if (categoryDecision && typeof categoryDecision.then === "function")
           categoryDecision = await categoryDecision;
@@ -1513,7 +1512,7 @@
     const trustedPaths = {};
 
     function getDecision(type, path, meta) {
-      if (!useOnVisit) return DECISION.TRUST;
+      if (!useOnVisit) return DECISION.PROCESS;
       return onVisit(type, path, meta);
     }
 
@@ -1543,7 +1542,7 @@
             return false;
           }
         } else {
-          categoryDecisions[categoryKey] = DECISION.TRUST;
+          categoryDecisions[categoryKey] = DECISION.PROCESS;
         }
       }
 
@@ -1747,6 +1746,7 @@
           ? await navigator.storage.getDirectory()
           : null;
 
+      const TEMP_BLOB_DIR = "._littleexport_temp_" + crypto.randomUUID();
       let tempBlobDir;
       try {
         if (rootOpfs) {
@@ -2052,6 +2052,10 @@
                     const q = indexedDB.deleteDatabase(schema.name);
                     q.onsuccess = r;
                     q.onerror = r;
+                    q.onblocked = () =>
+                      rej(
+                        new Error(`Database ${schema.name} deletion blocked.`),
+                      );
                   });
                   await new Promise((res, rej) => {
                     const req = indexedDB.open(schema.name, schema.version);
@@ -2077,6 +2081,10 @@
                       res();
                     };
                     req.onerror = rej;
+                    req.onblocked = () =>
+                      rej(
+                        new Error(`Database ${schema.name} opening blocked.`),
+                      );
                   });
                 }, `IDB schema ${dbName}`);
               } else {
@@ -2111,7 +2119,9 @@
                       );
                       req.onblocked = () => {
                         clearTimeout(timeout);
-                        reject(new Error(`Database ${dbName} blocked.`));
+                        reject(
+                          new Error(`Database ${dbName} opening blocked.`),
+                        );
                       };
                       req.onsuccess = () => {
                         clearTimeout(timeout);
@@ -2267,27 +2277,61 @@
           window.FileSystemDirectoryHandle &&
           source instanceof FileSystemDirectoryHandle
         ) {
-          async function walk(dir, currentPath) {
+          const files = [];
+          const dirs = [];
+
+          async function collect(dir, currentPath) {
             for await (const [name, entry] of dir.entries()) {
               if (entry.kind === "directory" && name === "PaxHeaders") continue;
               const fullPath = currentPath ? `${currentPath}/${name}` : name;
-              const destPath = safePrefix + fullPath;
+              if (entry.kind === "file") files.push({ entry, fullPath });
+              else dirs.push({ entry, fullPath });
+            }
+            // Sort files so that 'schema.cbor' is processed before numbered chunks
+            files.sort((a, b) => {
+              if (
+                a.fullPath.includes("schema.") &&
+                !b.fullPath.includes("schema.")
+              )
+                return -1;
+              if (
+                !a.fullPath.includes("schema.") &&
+                b.fullPath.includes("schema.")
+              )
+                return 1;
+              return a.fullPath.localeCompare(b.fullPath);
+            });
 
-              if (entry.kind === "file") {
-                const file = await entry.getFile();
-                await tar.writeStream(destPath, file.size, file.stream());
-              } else if (entry.kind === "directory") {
-                await tar.writeDir(destPath);
-                await walk(entry, fullPath);
-              }
+            for (const f of files) {
+              const file = await f.entry.getFile();
+              await tar.writeStream(
+                safePrefix + f.fullPath,
+                file.size,
+                file.stream(),
+              );
+            }
+            for (const d of dirs) {
+              await tar.writeDir(safePrefix + d.fullPath);
+              await collect(d.entry, d.fullPath);
             }
           }
-          await walk(source, "");
+          await collect(source, "");
         } else if (
           source instanceof FileList ||
           (Array.isArray(source) && source[0] instanceof File)
         ) {
-          const files = Array.from(source);
+          // Sort the FileList/Array by path string
+          const files = Array.from(source).sort((a, b) => {
+            const pathA = a.webkitRelativePath || a.name;
+            const pathB = b.webkitRelativePath || b.name;
+            // Ensure schemas come first within their respective folders
+            if (pathA.includes("schema.") && !pathB.includes("schema."))
+              return -1;
+            if (!pathA.includes("schema.") && pathB.includes("schema."))
+              return 1;
+            return pathA.localeCompare(pathB);
+          });
+
           const refFile =
             files.find(
               (f) => f.webkitRelativePath && f.webkitRelativePath.includes("/"),
@@ -2334,7 +2378,7 @@
       });
     };
 
-    if (window.showDirectoryPicker && opts.legacy !== true) {
+    if (window.showDirectoryPicker && opts.legacy === false) {
       try {
         const handle = await window.showDirectoryPicker();
         const stream = folderToTarStream(handle, yielder, {
@@ -2466,9 +2510,20 @@
     if (types.idb && window.indexedDB) {
       try {
         const dbs = await window.indexedDB.databases();
-        for (const { name } of dbs) {
-          indexedDB.deleteDatabase(name);
-        }
+        // Create an array of promises to await all deletions
+        await Promise.all(
+          dbs.map((db) => {
+            return new Promise((resolve, reject) => {
+              const req = indexedDB.deleteDatabase(db.name);
+              req.onsuccess = resolve;
+              req.onerror = () => reject(req.error);
+              req.onblocked = () => {
+                LittleExport.warn(`Database ${db.name} deletion blocked.`);
+                resolve();
+              };
+            });
+          }),
+        );
       } catch (e) {
         LittleExport.warn("Failed to clear IndexedDB:", e);
       }

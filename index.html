@@ -95,53 +95,55 @@
         }
     </style>
     <script>
-        window.onerror = function (message, source, lineno, colno, error) {
-            var errorMessage = message || "An unknown error occurred."
-            var stackTrace = "No stack available"
+        const handleFatalError = (error, source, lineno, colno) => {
+            const actualError = error || {};
+            const message = actualError.message || String(error || "Unknown error");
+            let errorMessage = `An error occurred: ${message}`;
 
-            if (error instanceof Error) {
-                stackTrace = error.stack || "No stack available"
-                errorMessage = `Error: ${error.message}\r\nSource: ${source}:${lineno}:${colno}`
-            } else {
-                errorMessage = `Error: ${errorMessage}\r\nSource: ${source}:${lineno}:${colno}`
+            // Safari uses error.line/error.column
+            const finalLine = lineno || actualError.line;
+            const finalCol = colno || actualError.column;
+
+            if (source || finalLine || finalCol) {
+                const fileName = source ? source.split("/").pop() || source : "unknown";
+                errorMessage += `\nSource: ${fileName}:${finalLine || "?"}:${finalCol || "?"}`;
             }
 
-            alert("A script error occurred: " + errorMessage + "\r\nStack trace:\r\n" + stackTrace);
-            try {
-                setUiBusy(false)
-                logProgress("", true)
-                document.getElementById("syncInfo").textContent = ""
-            } finally { }
-        }
-        window.onunhandledrejection = function (e) {
-            var reason = e.reason
-            if (reason instanceof Error && reason.name === "NotSupportedError") {
-                console.warn("Caught and ignored a FileSystemObserver NotSupportedError. This is expected in some browsers.")
-                return
+            if (globalThis.engine && globalThis.engine.destroyedError) {
+                errorMessage += `\nDetails: ${globalThis.engine.destroyedError}`;
             }
 
-            var errorMessage = "An unknown error occurred."
-            if (reason instanceof Error) {
-                errorMessage = `Error: ${reason.message}\r\nStack trace: ${reason.stack || "No stack available"}`
-            } else if (typeof reason === "string") {
-                errorMessage = `Error: ${reason}`
-            } else if (reason !== null && typeof reason === "object") {
+            if (actualError.stack) {
+                errorMessage += `\n\nStack trace:\n${actualError.stack}`;
+            } else if (typeof error === "object" && error !== null) {
                 try {
-                    errorMessage = `Object error: ${JSON.stringify(reason)}`
-                } catch (e) {
-                    errorMessage = "Object error occured (cannot display object contents)"
+                    const json = JSON.stringify(error);
+                    if (json !== "{}") errorMessage += `\nObject state: ${json}`;
+                } catch {
+                    errorMessage += "\n(Object state hidden: circular reference)";
                 }
-            } else {
-                errorMessage = `Error: ${String(reason)}`
             }
 
-            alert("An unhandled rejection occurred:\r\n" + errorMessage)
+            alert(errorMessage);
             try {
-                setUiBusy(false)
-                logProgress("", true)
-                document.getElementById("syncInfo").textContent = ""
-            } finally { }
-        }
+                if (typeof setUiBusy === "function") setUiBusy(false);
+                if (typeof logProgress === "function") logProgress("", true);
+                const syncInfo = document.getElementById("syncInfo");
+                if (syncInfo) syncInfo.textContent = "";
+            } catch (e) { }
+        };
+
+        window.onerror = (message, source, lineno, colno, error) => {
+            handleFatalError(error || message, source, lineno, colno);
+        };
+
+        window.onunhandledrejection = (e) => {
+            if (reason instanceof Error && reason.name === "NotSupportedError") {
+                console.warn("Caught and ignored a FileSystemObserver NotSupportedError. This is expected in some browsers.");
+                return;
+            }
+            handleFatalError(e.reason);
+        };
     </script>
     <script src="main.min.js" defer></script>
 </head>

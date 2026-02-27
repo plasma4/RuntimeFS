@@ -32,6 +32,8 @@ It's also possible to import or export specified data types in the Data Manageme
 > * -> Cross-Origin-Embedder-Policy: require-corp
 > * -> Cross-Origin-Opener-Policy: same-origin
 > ```
+>
+> Note that you'll want to press Open File after changing either regex or cache to actually make the changes; reloading a virtual folder won't work.
 
 To update to a newer version, hard-reloading should update the cache and serve the latest version. A single-file plugin exists for customizing RuntimeFS at `plugin/index.html`, allowing for you to fully customize RuntimeFS from any site hosting it (or clear the cache, if you're a browser that can't hard reload). If the plugin isn't included in the way you use RuntimeFS, you can upload it as a folder and access it directly. Example plugin link with the demo [here](https://plasma4.org/projects/RuntimeFS/plugin/).
 

@@ -6,7 +6,7 @@ const CHUNK_SIZE = 4194304; // 4MiB, for encrypted chunks
 const CONCURRENCY = 4; // Number of "workers" for folder uploading stuff
 const YIELD_TIME = 50; // Amount of ms before yielding; used for logging and pauses so UI can update.
 
-// List of ignored internal files. If you have a usecase for LittleExport such as transferring programming files (but want to exclude certain folders like node_modules), please add to IGNORED_NAMES or modify functionality.
+// List of ignored internal files. If you have a custom use case for LittleExport such as transferring programming files (but want to exclude certain folders like node_modules), please add to IGNORED_NAMES or modify functionality.
 const IGNORED_NAMES = new Set([
   ".DS_Store",
   "Thumbs.db",
@@ -23,7 +23,7 @@ const IGNORED_NAMES = new Set([
   "$RECYCLE.BIN",
 ]);
 
-// Check if a file/folder should be ignored.
+// Check if a file/folder should be ignored. Can be customize
 function isJunk(name) {
   return (
     IGNORED_NAMES.has(name) ||
@@ -31,6 +31,14 @@ function isJunk(name) {
     name.startsWith(".Trash-")
   );
 }
+
+window.addEventListener("beforeunload", function (e) {
+  if (ALWAYS_CONFIRM_LEAVE || currentlyBusy) {
+    e.preventDefault();
+    e.returnValue = "Changes you made may not be saved.";
+    return "Changes you made may not be saved."; // not that the string text here matters
+  }
+});
 
 let isListingFolders = false;
 let currentlyBusy = false;
@@ -106,14 +114,6 @@ const logProgress = createLogger(
   document.getElementById("progress"),
   checkYield,
 );
-
-window.addEventListener("beforeunload", function (e) {
-  if (ALWAYS_CONFIRM_LEAVE || currentlyBusy) {
-    e.preventDefault();
-    e.returnValue = "Changes you made may not be saved.";
-    return "Changes you made may not be saved."; // not that the string text here matters
-  }
-});
 
 navigator.storage
   .persist()
@@ -292,7 +292,7 @@ async function analyzeAndImportFolder(handleOrEntry, filesArray = null) {
     if (isSystemExport) {
       if (
         confirm(
-          "Found system configuration folder. Import? (This may overwrite multiple folders and already existing data.)",
+          "Found RuntimeFS data archive. Import? (This may overwrite multiple folders and already existing data.)",
         )
       ) {
         let stream;
@@ -361,37 +361,42 @@ async function uploadFolderFallback(e) {
 }
 
 async function processFolderSelection(name, handle) {
-  dirHandle = handle;
-  folderName = name;
+  await navigator.locks.request(`rfs_write_${name}`, async () => {
+    dirHandle = handle;
+    folderName = name;
 
-  try {
-    const encManifest = await handle.getFileHandle("manifest.enc");
-    const root = await getOpfsRoot();
-    const rfs = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
     try {
-      await rfs.removeEntry(name, { recursive: true });
-    } catch (e) {
-      if (e.name !== "NotFoundError") {
-        throw new Error(
-          "RuntimeFS cannot currently remove this folder; try closing other open RuntimeFS tabs.",
-        );
+      const encManifest = await handle.getFileHandle("manifest.enc");
+      const root = await getOpfsRoot();
+      const rfs = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
+      try {
+        await rfs.removeEntry(name, { recursive: true });
+      } catch (e) {
+        if (e.name !== "NotFoundError") {
+          throw new Error(
+            "RuntimeFS cannot currently remove this folder; try closing other open RuntimeFS tabs.",
+          );
+        }
       }
-    }
 
-    await decryptAndLoadFolderToOpfs(
-      handle,
-      encManifest,
-      await rfs.getDirectoryHandle(name, { create: true }),
-    );
-    await updateRegistryEntry(name, { encryptionType: null });
-  } catch (e) {
-    if (e.message && e.message.includes("RuntimeFS cannot currently remove")) {
-      alert(e.message);
-      setUiBusy(false);
-      return;
+      await decryptAndLoadFolderToOpfs(
+        handle,
+        encManifest,
+        await rfs.getDirectoryHandle(name, { create: true }),
+      );
+      await updateRegistryEntry(name, { encryptionType: null });
+    } catch (e) {
+      if (
+        e.message &&
+        e.message.includes("RuntimeFS cannot currently remove")
+      ) {
+        alert(e.message);
+        setUiBusy(false);
+        return;
+      }
+      await processFolderStreaming(name, handle);
     }
-    await processFolderStreaming(name, handle);
-  }
+  });
 
   if (observer) {
     try {
@@ -412,7 +417,7 @@ async function processFolderSelection(name, handle) {
       }
     } catch (e) {
       console.warn("Observer failed:", e);
-      // Hide sync functionality on failure (e.g., ChromeOS unsupported filesystems)
+      // Hide sync functionality on failure (like unsupported filesystems)
       if (showingSync) {
         Array.from(
           document.body.getElementsByClassName("supportCheck"),
@@ -581,73 +586,75 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
 }
 
 async function processFilesAndStore(name, fileList) {
-  const root = await getOpfsRoot();
-  const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
-  try {
-    await rfsRoot.removeEntry(name, { recursive: true });
-  } catch (e) {}
+  await navigator.locks.request(`rfs_write_${name}`, async () => {
+    const root = await getOpfsRoot();
+    const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
+    try {
+      await rfsRoot.removeEntry(name, { recursive: true });
+    } catch (e) {}
 
-  const destRoot = await rfsRoot.getDirectoryHandle(name, { create: true });
+    const destRoot = await rfsRoot.getDirectoryHandle(name, { create: true });
 
-  let totalBytes = 0;
-  for (const file of fileList) totalBytes += file.size;
+    let totalBytes = 0;
+    for (const file of fileList) totalBytes += file.size;
 
-  let bytesUploaded = 0;
-  const queue = Array.from(fileList).filter((f) => !isJunk(f.name));
+    let bytesUploaded = 0;
+    const queue = Array.from(fileList).filter((f) => !isJunk(f.name));
 
-  const updateUI = () => {
-    const mb = (bytesUploaded / 1e6).toFixed(2);
-    const totalMb = (totalBytes / 1e6).toFixed(2);
-    const pct =
-      totalBytes > 0
-        ? ((bytesUploaded / totalBytes) * 100).toFixed(2)
-        : "100.00";
+    const updateUI = () => {
+      const mb = (bytesUploaded / 1e6).toFixed(2);
+      const totalMb = (totalBytes / 1e6).toFixed(2);
+      const pct =
+        totalBytes > 0
+          ? ((bytesUploaded / totalBytes) * 100).toFixed(2)
+          : "100.00";
 
-    return logProgress(`Uploading: ${pct}% (${mb} / ${totalMb} MB)`);
-  };
+      return logProgress(`Uploading: ${pct}% (${mb} / ${totalMb} MB)`);
+    };
 
-  const worker = async () => {
-    const dirCache = new Map();
+    const worker = async () => {
+      const dirCache = new Map();
 
-    while (queue.length > 0) {
-      const file = queue.shift();
-      if (!file) break;
+      while (queue.length > 0) {
+        const file = queue.shift();
+        if (!file) break;
 
-      let relativePath = file.webkitRelativePath || file.name;
-      const pathParts = relativePath.split("/");
-      if (pathParts.length > 1) pathParts.shift();
-      relativePath = pathParts.join("/");
+        let relativePath = file.webkitRelativePath || file.name;
+        const pathParts = relativePath.split("/");
+        if (pathParts.length > 1) pathParts.shift();
+        relativePath = pathParts.join("/");
 
-      // Throttle progress updates to avoid saturating the yield check
-      let bytesSinceLastUI = 0;
+        // Throttle progress updates to avoid saturating the yield check
+        let bytesSinceLastUI = 0;
 
-      await writeStreamToOpfs(destRoot, relativePath, file, {
-        dirCache,
-        onProgress: async (delta) => {
-          bytesUploaded += delta;
-          bytesSinceLastUI += delta;
-          if (bytesSinceLastUI > 1048576) {
-            let p = updateUI();
-            if (p) await p;
-            bytesSinceLastUI = 0;
-          }
-        },
-      });
+        await writeStreamToOpfs(destRoot, relativePath, file, {
+          dirCache,
+          onProgress: async (delta) => {
+            bytesUploaded += delta;
+            bytesSinceLastUI += delta;
+            if (bytesSinceLastUI > 1048576) {
+              let p = updateUI();
+              if (p) await p;
+              bytesSinceLastUI = 0;
+            }
+          },
+        });
 
-      // Always check yield after a full file completion
-      const p = checkYield();
-      if (p) await p;
-    }
-  };
+        // Always check yield after a full file completion
+        const p = checkYield();
+        if (p) await p;
+      }
+    };
 
-  const workers = Array(CONCURRENCY).fill(null).map(worker);
-  await Promise.all(workers);
+    const workers = Array(CONCURRENCY).fill(null).map(worker);
+    await Promise.all(workers);
 
-  document.getElementById("folderName").value = "";
-  document.getElementById("openFolderName").value = name;
-  await updateRegistryEntry(name, { encryptionType: null });
-  await logProgress("", true);
-  await listFolders();
+    document.getElementById("folderName").value = "";
+    document.getElementById("openFolderName").value = name;
+    await updateRegistryEntry(name, { encryptionType: null });
+    await logProgress("", true);
+    await listFolders();
+  });
 }
 
 async function processFolderStreaming(name, srcHandle) {
@@ -820,6 +827,42 @@ async function writeStreamToOpfs(parentHandle, path, fileObj, options = {}) {
   }
 }
 
+async function cleanupOrphans() {
+  await navigator.locks.request(
+    "rfs_global_import",
+    { ifAvailable: true },
+    async (importLock) => {
+      if (!importLock) return;
+      try {
+        const root = await getOpfsRoot();
+        const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX);
+        const registry = await getRegistry();
+        const registryKeys = new Set(Object.keys(registry));
+
+        // Batch read all keys first
+        const diskKeys = [];
+        for await (const name of rfsRoot.keys()) diskKeys.push(name);
+
+        // Filter and delete only what is necessary
+        for (const name of diskKeys) {
+          if (!registryKeys.has(name)) {
+            await navigator.locks.request(
+              `rfs_write_${name}`,
+              { ifAvailable: true },
+              async (lock) => {
+                if (lock)
+                  await rfsRoot
+                    .removeEntry(name, { recursive: true })
+                    .catch(() => {});
+              },
+            );
+          }
+        }
+      } catch (e) {}
+    },
+  );
+}
+
 async function listFolders() {
   if (isListingFolders) return;
   isListingFolders = true;
@@ -962,7 +1005,7 @@ async function exportData() {
       });
     }
 
-    const exclude = { opfs: [SYSTEM_FILE, ".rfs_temp_blobs"] };
+    const exclude = { opfs: [SYSTEM_FILE] };
     const include = { opfs: [] };
 
     if (exportRFS && !exportOPFS) {
@@ -1025,63 +1068,65 @@ async function importData() {
 }
 
 async function startImport(sourceInput) {
-  setUiBusy(true);
-  _registryCache = null;
-  localStorage.setItem("rfs_partial", "1"); // flag for incomplete import
+  await navigator.locks.request("rfs_global_import", async () => {
+    setUiBusy(true);
+    _registryCache = null;
+    localStorage.setItem("rfs_partial", "1"); // flag for incomplete import
 
-  try {
-    let registryInImport;
-    logProgress("Starting import...", true);
+    try {
+      let registryInImport;
+      logProgress("Starting import...", true);
 
-    const importConfig = {
-      graceful: true,
-      logger: logProgress,
-      onCustomItem: async (path, data) => {
-        if (path === SYSTEM_FILE) {
-          // Store the imported registry in memory for merging later
-          registryInImport = JSON.parse(new TextDecoder().decode(data));
-        }
-      },
-      onerror: (e) => {
-        if (e.message === "A password is required to decrypt this data.") {
-          alert("A password is required to decrypt this data.");
-          status = 1; // user error
-        } else {
-          console.error(e);
-          status = 0; // non-user error
-          alert("Import encountered an error: " + e.message);
-        }
-      },
-    };
+      const importConfig = {
+        graceful: true,
+        logger: logProgress,
+        onCustomItem: async (path, data) => {
+          if (path === SYSTEM_FILE) {
+            // Store the imported registry in memory for merging later
+            registryInImport = JSON.parse(new TextDecoder().decode(data));
+          }
+        },
+        onerror: (e) => {
+          if (e.message === "A password is required to decrypt this data.") {
+            alert("A password is required to decrypt this data.");
+            status = 1; // user error
+          } else {
+            console.error(e);
+            status = 0; // non-user error
+            alert("Import encountered an error: " + e.message);
+          }
+        },
+      };
 
-    let status = 2; // successful
-    importConfig.source = sourceInput;
-    await LittleExport.importData(importConfig);
+      let status = 2; // successful
+      importConfig.source = sourceInput;
+      await LittleExport.importData(importConfig);
 
-    logProgress("Merging metadata...", true);
-    const existingRegistry = await getRegistry();
-    const mergedRegistry = {
-      ...existingRegistry,
-      ...(registryInImport || {}),
-    };
+      logProgress("Merging metadata...", true);
+      const existingRegistry = await getRegistry();
+      const mergedRegistry = {
+        ...existingRegistry,
+        ...(registryInImport || {}),
+      };
 
-    await saveRegistry(mergedRegistry);
-    await validateAndRepairRegistry();
-    localStorage.removeItem("rfs_partial");
-    await listFolders();
-    if (status !== 1)
-      alert(
-        status === 2
-          ? "Import complete! Reload to fix any issues."
-          : "Import may have failed or been incomplete; reload to fix any issues.",
-      );
-  } catch (e) {
-    console.error("Import failed:", e);
-    alert("Import failed:", e);
-  } finally {
-    setUiBusy(false);
-    logProgress("", true);
-  }
+      await saveRegistry(mergedRegistry);
+      await validateAndRepairRegistry();
+      localStorage.removeItem("rfs_partial");
+      await listFolders();
+      if (status !== 1)
+        alert(
+          status === 2
+            ? "Import complete! Reload to fix any issues."
+            : "Import may have failed or been incomplete; reload to fix any issues.",
+        );
+    } catch (e) {
+      console.error("Import failed:", e);
+      alert("Import failed:", e);
+    } finally {
+      setUiBusy(false);
+      logProgress("", true);
+    }
+  });
 }
 
 async function validateAndRepairRegistry() {
@@ -1193,7 +1238,8 @@ async function syncAndOpenFile() {
     () => (document.getElementById("syncInfo").textContent = ""),
     1000,
   );
-  openFile(folderName);
+  await openFile(folderName);
+  setUiBusy(false);
 }
 
 async function performSyncToOpfs() {
@@ -1202,7 +1248,7 @@ async function performSyncToOpfs() {
   );
 
   // Use a lock to prevent UI and SW conflict
-  await navigator.locks.request(`lock_rfs_${folderName}`, async () => {
+  await navigator.locks.request(`rfs_write_${folderName}`, async () => {
     const root = await getOpfsRoot();
     const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX);
     const folderHandle = await rfsRoot.getDirectoryHandle(folderName);
@@ -1255,201 +1301,200 @@ async function uploadAndEncryptWithPassword() {
     localDir = await window.showDirectoryPicker({ mode: "read" });
   } catch (e) {
     if (e.name !== "AbortError") throw e;
-  } finally {
-    setUiBusy(false);
   }
+  await navigator.locks.request(`rfs_write_${name}`, async () => {
+    const root = await getOpfsRoot();
+    const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
 
-  const root = await getOpfsRoot();
-  const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
-
-  try {
-    await rfsRoot.removeEntry(name, { recursive: true });
-  } catch (e) {
-    if (e.name !== "NotFoundError") {
-      alert(
-        "RuntimeFS cannot currently remove this folder; try closing other open RuntimeFS tabs.",
-      );
-      return;
+    try {
+      await rfsRoot.removeEntry(name, { recursive: true });
+    } catch (e) {
+      if (e.name !== "NotFoundError") {
+        alert(
+          "RuntimeFS cannot currently remove this folder; try closing other open RuntimeFS tabs.",
+        );
+        return;
+      }
     }
-  }
 
-  const destDir = await rfsRoot.getDirectoryHandle(name, { create: true });
-  const contentDir = await destDir.getDirectoryHandle("content", {
-    create: true,
-  });
+    const destDir = await rfsRoot.getDirectoryHandle(name, { create: true });
+    const contentDir = await destDir.getDirectoryHandle("content", {
+      create: true,
+    });
 
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const key = await deriveKeyFromPassword(password, salt);
-  const manifestData = {};
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const key = await deriveKeyFromPassword(password, salt);
+    const manifestData = {};
 
-  const queue = [];
-  const scanQueue = [{ dir: localDir, path: "" }];
-  let scanning = true;
-  let totalBytesProcessed = 0;
+    const queue = [];
+    const scanQueue = [{ dir: localDir, path: "" }];
+    let scanning = true;
+    let totalBytesProcessed = 0;
 
-  const scanner = async () => {
-    while (scanQueue.length > 0) {
-      const { dir, path } = scanQueue.shift();
-      for await (const entry of dir.values()) {
-        if (isJunk(entry.name)) continue;
-        const entryPath = path ? `${path}/${entry.name}` : entry.name;
-        if (entry.kind === "file") {
-          const fileId = crypto.randomUUID();
-          queue.push({ entry, entryPath, fileId });
-          while (queue.length > 500) {
-            // handle backpressure if IO is slow
-            await new Promise((resolve) => setTimeout(resolve, 20));
+    const scanner = async () => {
+      while (scanQueue.length > 0) {
+        const { dir, path } = scanQueue.shift();
+        for await (const entry of dir.values()) {
+          if (isJunk(entry.name)) continue;
+          const entryPath = path ? `${path}/${entry.name}` : entry.name;
+          if (entry.kind === "file") {
+            const fileId = crypto.randomUUID();
+            queue.push({ entry, entryPath, fileId });
+            while (queue.length > 500) {
+              // handle backpressure if IO is slow
+              await new Promise((resolve) => setTimeout(resolve, 20));
+            }
+          } else {
+            scanQueue.push({ dir: entry, path: entryPath });
           }
-        } else {
-          scanQueue.push({ dir: entry, path: entryPath });
         }
       }
-    }
-    scanning = false;
-  };
+      scanning = false;
+    };
 
-  const worker = async () => {
-    while (true) {
-      if (queue.length === 0) {
-        if (!scanning) break;
+    const worker = async () => {
+      while (true) {
+        if (queue.length === 0) {
+          if (!scanning) break;
+          const p = checkYield();
+          if (p) await p;
+          continue;
+        }
+
+        const task = queue.shift();
+        const { entry, entryPath, fileId } = task;
+
+        // Check yield first, then construct string
         const p = checkYield();
-        if (p) await p;
-        continue;
-      }
+        if (p) {
+          const mb = (totalBytesProcessed / 1e6).toFixed(2);
+          await logProgress(`Encrypting: ${mb} MB (${task.entryPath})`);
+          await p;
+        }
 
-      const task = queue.shift();
-      const { entry, entryPath, fileId } = task;
+        const file = await entry.getFile();
+        totalBytesProcessed += file.size; // Update tracker
 
-      // Check yield first, then construct string
-      const p = checkYield();
-      if (p) {
-        const mb = (totalBytesProcessed / 1e6).toFixed(2);
-        await logProgress(`Encrypting: ${mb} MB (${task.entryPath})`);
-        await p;
-      }
+        manifestData[entryPath] = {
+          id: fileId,
+          size: file.size,
+          type: file.type,
+        };
 
-      const file = await entry.getFile();
-      totalBytesProcessed += file.size; // Update tracker
+        const destFileHandle = await contentDir.getFileHandle(fileId, {
+          create: true,
+        });
+        const writable = await destFileHandle.createWritable();
 
-      manifestData[entryPath] = {
-        id: fileId,
-        size: file.size,
-        type: file.type,
-      };
+        if (file.size > 0) {
+          const reader = file.stream().getReader();
+          let pendingChunks = [];
+          let pendingSize = 0;
 
-      const destFileHandle = await contentDir.getFileHandle(fileId, {
-        create: true,
-      });
-      const writable = await destFileHandle.createWritable();
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (value) {
+                pendingChunks.push(value);
+                pendingSize += value.byteLength;
+              }
 
-      if (file.size > 0) {
-        const reader = file.stream().getReader();
-        let pendingChunks = [];
-        let pendingSize = 0;
-
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (value) {
-              pendingChunks.push(value);
-              pendingSize += value.byteLength;
-            }
-
-            if (done || pendingSize >= CHUNK_SIZE) {
-              if (pendingSize > 0) {
-                const buffer = new Uint8Array(pendingSize);
-                let offset = 0;
-                for (const c of pendingChunks) {
-                  buffer.set(c, offset);
-                  offset += c.byteLength;
-                }
-
-                let cursor = 0;
-                while (cursor < pendingSize) {
-                  const remaining = pendingSize - cursor;
-                  if (!done && remaining < CHUNK_SIZE) {
-                    const leftover = buffer.slice(cursor);
-                    pendingChunks = [leftover];
-                    pendingSize = leftover.byteLength;
-                    break;
+              if (done || pendingSize >= CHUNK_SIZE) {
+                if (pendingSize > 0) {
+                  const buffer = new Uint8Array(pendingSize);
+                  let offset = 0;
+                  for (const c of pendingChunks) {
+                    buffer.set(c, offset);
+                    offset += c.byteLength;
                   }
 
-                  const pSub = checkYield();
-                  if (pSub) await pSub;
+                  let cursor = 0;
+                  while (cursor < pendingSize) {
+                    const remaining = pendingSize - cursor;
+                    if (!done && remaining < CHUNK_SIZE) {
+                      const leftover = buffer.slice(cursor);
+                      pendingChunks = [leftover];
+                      pendingSize = leftover.byteLength;
+                      break;
+                    }
 
-                  const sizeToEncrypt = Math.min(CHUNK_SIZE, remaining);
-                  const chunkToEncrypt = buffer.subarray(
-                    cursor,
-                    cursor + sizeToEncrypt,
-                  );
+                    const pSub = checkYield();
+                    if (pSub) await pSub;
 
-                  const iv = crypto.getRandomValues(new Uint8Array(12));
-                  const encryptedChunk = await crypto.subtle.encrypt(
-                    { name: "AES-GCM", iv },
-                    key,
-                    chunkToEncrypt,
-                  );
+                    const sizeToEncrypt = Math.min(CHUNK_SIZE, remaining);
+                    const chunkToEncrypt = buffer.subarray(
+                      cursor,
+                      cursor + sizeToEncrypt,
+                    );
 
-                  cursor += sizeToEncrypt;
-                  await writable.write(iv);
-                  await writable.write(new Uint8Array(encryptedChunk));
-                }
+                    const iv = crypto.getRandomValues(new Uint8Array(12));
+                    const encryptedChunk = await crypto.subtle.encrypt(
+                      { name: "AES-GCM", iv },
+                      key,
+                      chunkToEncrypt,
+                    );
 
-                if (cursor >= pendingSize) {
-                  pendingChunks = [];
-                  pendingSize = 0;
+                    cursor += sizeToEncrypt;
+                    await writable.write(iv);
+                    await writable.write(new Uint8Array(encryptedChunk));
+                  }
+
+                  if (cursor >= pendingSize) {
+                    pendingChunks = [];
+                    pendingSize = 0;
+                  }
                 }
               }
+              if (done) break;
             }
-            if (done) break;
+          } finally {
+            reader.releaseLock();
+            try {
+              await writable.close();
+            } catch (e) {}
           }
-        } finally {
-          reader.releaseLock();
-          try {
-            await writable.close();
-          } catch (e) {}
+        } else {
+          await writable.close();
         }
-      } else {
-        await writable.close();
       }
-    }
-  };
+    };
 
-  const scanPromise = scanner();
-  const workers = Array(CONCURRENCY).fill(null).map(worker);
+    const scanPromise = scanner();
+    const workers = Array(CONCURRENCY).fill(null).map(worker);
 
-  await scanPromise;
-  await Promise.all(workers);
+    await scanPromise;
+    await Promise.all(workers);
 
-  await logProgress("Saving manifest...", true);
+    await logProgress("Saving manifest...", true);
 
-  const manifestJson = JSON.stringify(manifestData);
-  const manifestBuffer = new TextEncoder().encode(manifestJson);
-  const manifestIv = crypto.getRandomValues(new Uint8Array(12));
-  const encManifest = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv: manifestIv },
-    key,
-    manifestBuffer,
-  );
+    const manifestJson = JSON.stringify(manifestData);
+    const manifestBuffer = new TextEncoder().encode(manifestJson);
+    const manifestIv = crypto.getRandomValues(new Uint8Array(12));
+    const encManifest = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: manifestIv },
+      key,
+      manifestBuffer,
+    );
 
-  const manifestHandle = await destDir.getFileHandle("manifest.enc", {
-    create: true,
+    const manifestHandle = await destDir.getFileHandle("manifest.enc", {
+      create: true,
+    });
+    const mw = await manifestHandle.createWritable();
+    await mw.write(salt);
+    await mw.write(manifestIv);
+    await mw.write(new Uint8Array(encManifest));
+    await mw.close();
+
+    await updateRegistryEntry(name, {
+      encryptionType: "password",
+      salt: bufferToBase64(salt),
+    });
+
+    document.getElementById("encryptFolderName").value = "";
+    await listFolders();
+    setUiBusy(false);
+    await logProgress("", true);
   });
-  const mw = await manifestHandle.createWritable();
-  await mw.write(salt);
-  await mw.write(manifestIv);
-  await mw.write(new Uint8Array(encManifest));
-  await mw.close();
-
-  await updateRegistryEntry(name, {
-    encryptionType: "password",
-    salt: bufferToBase64(salt),
-  });
-
-  document.getElementById("encryptFolderName").value = "";
-  await listFolders();
-  setUiBusy(false);
-  await logProgress("", true);
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -1619,7 +1664,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (isSystem) {
           if (
             confirm(
-              "Found system configuration folder. Import? (This may overwrite multiple folders and already existing data.)",
+              "Found RuntimeFS data archive. Import? (This may overwrite multiple folders and already existing data.)",
             )
           ) {
             const stream = LittleExport.folderToTarStream(files, checkYield, {
@@ -1640,9 +1685,53 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
 
-    const first = items[0].getAsFile();
-    if (items.length === 1 && first) {
-      if (confirm(`Import "${first.name}"?`)) startImport(first);
+    // Extract all actual files from the DataTransferItemList
+    const files = [];
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].kind === "file") {
+        const f = items[i].getAsFile();
+        if (f) files.push(f);
+      }
+    }
+
+    if (files.length === 0) return;
+
+    // Folder "bundle"
+    if (files.length > 1) {
+      const name = prompt(
+        `You dropped ${files.length} files. Enter a name to create a new folder for them:`,
+      );
+      if (name) {
+        setUiBusy(true);
+        await processFilesAndStore(name, files);
+        setUiBusy(false);
+      }
+    } else {
+      // Check if LittleExport-like
+      const file = files[0];
+      const isArchive =
+        /\.(tar\.gz|tar|enc|cbor)$/i.test(file.name) ||
+        file.name === SYSTEM_FILE;
+
+      if (isArchive) {
+        const msg = `Found RuntimeFS data archive. Import? (This may overwrite multiple folders and already existing data.)\nClick OK to extract and import it as system data or cancel to upload as file.`;
+        if (confirm(msg)) {
+          startImport(file);
+          return;
+        }
+      }
+
+      // If it's not an archive, or the user canceled the system import, upload it into a new folder.
+      const suggestedName = file.name.replace(/\.[^/.]+$/, ""); // strip extension for default name
+      const name = prompt(
+        `Enter a folder name to upload "${file.name}" into:`,
+        suggestedName,
+      );
+      if (name) {
+        setUiBusy(true);
+        await processFilesAndStore(name, [file]);
+        setUiBusy(false);
+      }
     }
   });
 
@@ -1668,13 +1757,21 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   if (localStorage.getItem("rfs_partial")) {
-    validateAndRepairRegistry().then(() => {
-      localStorage.removeItem("rfs_partial");
-      listFolders();
-    });
+    validateAndRepairRegistry()
+      .then(async () => {
+        const root = await getOpfsRoot();
+        for await (const name of root.keys()) {
+          if (name.startsWith("._littleexport_temp_")) {
+            await root.removeEntry(name, { recursive: true }).catch(() => {});
+          }
+        }
+        localStorage.removeItem("rfs_partial");
+        return cleanupOrphans();
+      })
+      .then(listFolders);
+  } else {
+    cleanupOrphans().then(listFolders);
   }
-
-  listFolders();
 
   const rT = document.getElementById("regex");
   const hT = document.getElementById("headers");

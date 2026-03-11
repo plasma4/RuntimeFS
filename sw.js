@@ -161,8 +161,8 @@ function compileRules(rulesString) {
       if (searchRegex && fileRegex) {
         compiled.push({ fileRegex, searchRegex, replacePart });
       }
-    } catch (e) {
-      console.warn("Rule compilation failed for line " + line + ":", e);
+    } catch (err) {
+      console.warn("Rule compilation failed for line " + line + ":", err);
       continue;
     }
   }
@@ -187,15 +187,16 @@ function applyRegexRules(filePath, fileBuffer, fileType, compiledRules) {
 
     for (const rule of compiledRules) {
       if (rule.fileRegex.test(filePath)) {
-        if (rule.searchRegex.test(content)) {
-          content = content.replace(rule.searchRegex, rule.replacePart);
+        const newContent = content.replace(rule.searchRegex, rule.replacePart);
+        if (newContent !== content) {
+          content = newContent;
           modified = true;
         }
       }
     }
     return modified ? new TextEncoder().encode(content).buffer : fileBuffer;
-  } catch (e) {
-    console.error(`Error applying regex rules to ${filePath}:`, e);
+  } catch (err) {
+    console.error(`Error applying regex rules to ${filePath}:`, err);
     return fileBuffer;
   }
 }
@@ -207,7 +208,7 @@ async function getRegistry() {
     const handle = await root.getFileHandle(SYSTEM_FILE);
     const file = await handle.getFile();
     registryCache = JSON.parse(await file.text());
-  } catch (e) {
+  } catch (err) {
     registryCache = {};
   }
   return registryCache;
@@ -252,7 +253,7 @@ async function getCachedFileHandle(root, folderName, relativePath) {
     const fileHandle = await currentDirHandle.getFileHandle(fileName);
     addToCache(handleCache, fileCacheKey, fileHandle);
     return fileHandle;
-  } catch (e) {
+  } catch (err) {
     return null;
   }
 }
@@ -264,7 +265,7 @@ self.addEventListener("install", async function installCache() {
       try {
         const response = await fetch(url, { cache: "reload" });
         if (response.ok) await cache.put(url, response);
-      } catch (e) {
+      } catch (err) {
         console.warn("Failed to cache app shell file:", url);
       }
     }),
@@ -279,7 +280,7 @@ self.addEventListener("activate", (e) => {
       registryCache = null;
       try {
         await getOpfsRoot();
-      } catch (e) {}
+      } catch (err) {}
       const allClients = await self.clients.matchAll({
         includeUncontrolled: true,
       });
@@ -416,7 +417,7 @@ function parseCustomHeaders(rulesString) {
           header: headerName,
           value: headerValue,
         });
-      } catch (e) {
+      } catch (err) {
         console.error("Invalid pattern on line:", line);
       }
     });
@@ -481,7 +482,7 @@ self.addEventListener("fetch", (e) => {
           virtualReferrerPath = pathParts[0];
         }
       }
-    } catch (e) {}
+    } catch (err) {}
   }
 
   if (virtualReferrerPath && !url.pathname.startsWith(virtualPathPrefix)) {
@@ -565,7 +566,7 @@ async function handleEncryptedRequest(
         }
 
         manifestCache.set(folderName, manifest);
-      } catch (e) {
+      } catch (err) {
         return new Response("Password Incorrect", { status: 403 });
       }
     }
@@ -618,53 +619,57 @@ async function handleEncryptedRequest(
 
     const startChunkIdx = Math.floor(start / CHUNK_SIZE);
     const endChunkIdx = Math.floor(end / CHUNK_SIZE);
+    let i = startChunkIdx;
 
     const stream = new ReadableStream({
-      async start(controller) {
-        try {
-          for (let i = startChunkIdx; i <= endChunkIdx; i++) {
-            const isLastChunk = i * CHUNK_SIZE + CHUNK_SIZE >= totalSize;
-            const plainChunkSize = isLastChunk
-              ? totalSize % CHUNK_SIZE || CHUNK_SIZE
-              : CHUNK_SIZE;
-
-            const rawOffset = i * (CHUNK_SIZE + ENCRYPTED_CHUNK_OVERHEAD);
-            const encChunkLen = plainChunkSize + ENCRYPTED_CHUNK_OVERHEAD;
-
-            const slicedBlob = rawFile.slice(
-              rawOffset,
-              rawOffset + encChunkLen,
-            );
-            const buf = await slicedBlob.arrayBuffer();
-
-            if (buf.byteLength === 0) break;
-
-            const chunkIv = buf.slice(0, 12);
-            const chunkCipher = buf.slice(12);
-
-            const plain = await crypto.subtle.decrypt(
-              { name: "AES-GCM", iv: chunkIv },
-              key,
-              chunkCipher,
-            );
-            const data = new Uint8Array(plain);
-
-            const globalChunkStart = i * CHUNK_SIZE;
-            const outputStart = Math.max(start, globalChunkStart);
-            const outputEnd = Math.min(end + 1, globalChunkStart + data.length);
-
-            if (outputStart < outputEnd) {
-              controller.enqueue(
-                data.subarray(
-                  outputStart - globalChunkStart,
-                  outputEnd - globalChunkStart,
-                ),
-              );
-            }
-          }
+      async pull(controller) {
+        if (i > endChunkIdx) {
           controller.close();
-        } catch (e) {
-          controller.error(e);
+          return;
+        }
+
+        try {
+          const isLastChunk = i * CHUNK_SIZE + CHUNK_SIZE >= totalSize;
+          const plainChunkSize = isLastChunk
+            ? totalSize % CHUNK_SIZE || CHUNK_SIZE
+            : CHUNK_SIZE;
+
+          const rawOffset = i * (CHUNK_SIZE + ENCRYPTED_CHUNK_OVERHEAD);
+          const encChunkLen = plainChunkSize + ENCRYPTED_CHUNK_OVERHEAD;
+
+          const slicedBlob = rawFile.slice(rawOffset, rawOffset + encChunkLen);
+          const buf = await slicedBlob.arrayBuffer();
+
+          if (buf.byteLength === 0) {
+            controller.close();
+            return;
+          }
+
+          const chunkIv = buf.slice(0, 12);
+          const chunkCipher = buf.slice(12);
+
+          const plain = await crypto.subtle.decrypt(
+            { name: "AES-GCM", iv: chunkIv },
+            key,
+            chunkCipher,
+          );
+          const data = new Uint8Array(plain);
+
+          const globalChunkStart = i * CHUNK_SIZE;
+          const outputStart = Math.max(start, globalChunkStart);
+          const outputEnd = Math.min(end + 1, globalChunkStart + data.length);
+
+          if (outputStart < outputEnd) {
+            controller.enqueue(
+              data.subarray(
+                outputStart - globalChunkStart,
+                outputEnd - globalChunkStart,
+              ),
+            );
+          }
+          i++;
+        } catch (err) {
+          controller.error(err);
         }
       },
     });
@@ -679,7 +684,7 @@ async function handleEncryptedRequest(
     };
 
     return new Response(stream, { status: 206, headers });
-  } catch (e) {
+  } catch (err) {
     return new Response("Internal Encryption Error", { status: 500 });
   }
 }
@@ -694,7 +699,7 @@ function isLikelyText(type, path) {
 }
 
 function isActuallyTextSniff(buffer) {
-  const view = new Uint8Array(buffer.slice(0, 4096));
+  const view = new Uint8Array(buffer, 0, Math.min(buffer.byteLength, 4096));
   if (view.length === 0) return true;
   else if (view.includes(0)) return false;
 
@@ -711,7 +716,7 @@ function isActuallyTextSniff(buffer) {
     const decoder = new TextDecoder("utf-8", { fatal: true });
     decoder.decode(view);
     return true;
-  } catch (e) {
+  } catch (err) {
     // If UTF-8 fails, check for legacy encodings (Latin-1)
     let suspiciousBytes = 0;
     for (let i = 0; i < view.length; i++) {
@@ -739,7 +744,7 @@ async function generateResponseForVirtualFile(
     const pathParts = virtualPath.split("/").map((p) => {
       try {
         return decodeURIComponent(p);
-      } catch (e) {
+      } catch (err) {
         return p;
       }
     });
@@ -784,7 +789,8 @@ async function generateResponseForVirtualFile(
     if (folderData.encryptionType === "password") {
       if (!session.key) return new Response("Session locked", { status: 403 });
       const compiledHeaders =
-        session.compiledHeaders || getCompiledHeaders(folderData.headers);
+        session.compiledHeaders ||
+        getCompiledHeaders(folderName, folderData.headers);
       const headers = applyCustomHeaders(
         {
           "Content-Type": getMimeType(relativePath),
@@ -934,8 +940,8 @@ async function generateResponseForVirtualFile(
 
     finalHeaders["Content-Length"] = processedSize.toString();
     return new Response(responseBody, { status, headers: finalHeaders });
-  } catch (e) {
-    console.error("SW fetch error:", e);
+  } catch (err) {
+    console.error("SW fetch error:", err);
     return new Response("Internal server error", { status: 500 });
   }
 }

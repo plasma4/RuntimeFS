@@ -145,7 +145,7 @@ async function getRegistry() {
         const file = await handle.getFile();
         const text = await file.text();
         _registryCache = text ? JSON.parse(text) : {};
-      } catch (e) {
+      } catch (err) {
         // If file doesn't exist or is empty
         _registryCache = {};
       }
@@ -182,7 +182,7 @@ async function updateRegistryEntry(name, data) {
         const handle = await root.getFileHandle(SYSTEM_FILE);
         const file = await handle.getFile();
         registry = JSON.parse(await file.text());
-      } catch (e) {
+      } catch (err) {
         registry = {};
       }
 
@@ -245,7 +245,7 @@ async function analyzeAndImportFolder(handleOrEntry, filesArray = null) {
             );
           });
         }
-      } catch (e) {
+      } catch (err) {
         return false;
       }
     }
@@ -323,11 +323,11 @@ async function analyzeAndImportFolder(handleOrEntry, filesArray = null) {
     } else {
       alert("Please use drag-and-drop for this folder.");
     }
-  } catch (e) {
-    console.error("Import error:", e);
-    alert("An error occurred during import: " + e.message);
+  } catch (err) {
+    console.error("Import error:", err);
+    alert("An error occurred during import: " + err.message);
   } finally {
-    setUiBusy(false); // Guarantees UI unlocks in all browsers
+    setUiBusy(false);
   }
 }
 
@@ -340,10 +340,10 @@ async function uploadFolder() {
     } else {
       document.getElementById("folderUploadFallbackInput").click();
     }
-  } catch (e) {
-    if (e.name !== "AbortError") {
-      console.error(e);
-      alert("Error accessing folder: " + e.message);
+  } catch (err) {
+    if (err.name !== "AbortError") {
+      console.error(err);
+      alert("Error accessing folder: " + err.message);
     }
   } finally {
     setUiBusy(false);
@@ -371,8 +371,8 @@ async function processFolderSelection(name, handle) {
       const rfs = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
       try {
         await rfs.removeEntry(name, { recursive: true });
-      } catch (e) {
-        if (e.name !== "NotFoundError") {
+      } catch (err) {
+        if (err.name !== "NotFoundError") {
           throw new Error(
             "RuntimeFS cannot currently remove this folder; try closing other open RuntimeFS tabs.",
           );
@@ -385,12 +385,12 @@ async function processFolderSelection(name, handle) {
         await rfs.getDirectoryHandle(name, { create: true }),
       );
       await updateRegistryEntry(name, { encryptionType: null });
-    } catch (e) {
+    } catch (err) {
       if (
-        e.message &&
-        e.message.includes("RuntimeFS cannot currently remove")
+        err.message &&
+        err.message.includes("RuntimeFS cannot currently remove")
       ) {
-        alert(e.message);
+        alert(err.message);
         setUiBusy(false);
         return;
       }
@@ -401,7 +401,7 @@ async function processFolderSelection(name, handle) {
   if (observer) {
     try {
       observer.disconnect();
-    } catch (e) {}
+    } catch (err) {}
     observer = null;
   }
 
@@ -415,8 +415,8 @@ async function processFolderSelection(name, handle) {
         ).forEach((elem) => (elem.style.display = "revert"));
         showingSync = true;
       }
-    } catch (e) {
-      console.warn("Observer failed:", e);
+    } catch (err) {
+      console.warn("Observer failed:", err);
       // Hide sync functionality on failure (like unsupported filesystems)
       if (showingSync) {
         Array.from(
@@ -458,7 +458,7 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
       encData,
     );
     manifestData = JSON.parse(new TextDecoder().decode(decryptedManifestBytes));
-  } catch (e) {
+  } catch (err) {
     throw new Error("Decryption failed. Wrong password?");
   }
 
@@ -512,7 +512,7 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
       try {
         const handle = await contentDir.getFileHandle(meta.id);
         srcFile = await handle.getFile();
-      } catch (e) {
+      } catch (err) {
         console.warn(`Missing file: ${originalPath}`);
         processedFiles++;
         continue;
@@ -573,8 +573,8 @@ async function decryptAndLoadFolderToOpfs(srcHandle, manifestHandle, destDir) {
 
       try {
         await writable.close();
-      } catch (e) {
-        if (e.name !== "TypeError") throw e;
+      } catch (err) {
+        if (err.name !== "TypeError") throw err;
       }
       processedFiles++;
     }
@@ -591,7 +591,7 @@ async function processFilesAndStore(name, fileList) {
     const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX, { create: true });
     try {
       await rfsRoot.removeEntry(name, { recursive: true });
-    } catch (e) {}
+    } catch (err) {}
 
     const destRoot = await rfsRoot.getDirectoryHandle(name, { create: true });
 
@@ -663,8 +663,8 @@ async function processFolderStreaming(name, srcHandle) {
 
   try {
     await rfs.removeEntry(name, { recursive: true });
-  } catch (e) {
-    if (e.name !== "NotFoundError") {
+  } catch (err) {
+    if (err.name !== "NotFoundError") {
       alert(
         "RuntimeFS cannot currently remove this folder; try closing other open RuntimeFS tabs.",
       );
@@ -757,8 +757,8 @@ async function processFolderStreaming(name, srcHandle) {
           const p = checkYield();
           if (p) await p;
         }
-      } catch (e) {
-        console.warn("Error reading directory stream:", e);
+      } catch (err) {
+        console.warn("Error reading directory stream:", err);
       }
     }
     scanComplete = true;
@@ -767,9 +767,9 @@ async function processFolderStreaming(name, srcHandle) {
   try {
     const workerPromises = Array(CONCURRENCY).fill(null).map(worker);
     await Promise.all([scanner(), ...workerPromises]);
-  } catch (e) {
+  } catch (err) {
     hasError = true;
-    throw e;
+    throw err;
   }
 
   document.getElementById("folderName").value = "";
@@ -789,14 +789,24 @@ async function writeStreamToOpfs(parentHandle, path, fileObj, options = {}) {
   if (parts.length > 0) {
     let pathAcc = "";
     for (const part of parts) {
+      const parentPathAcc = pathAcc;
       pathAcc += (pathAcc ? "/" : "") + part;
-      if (dirCache && dirCache.has(pathAcc)) {
-        currentDir = dirCache.get(pathAcc);
+
+      if (dirCache) {
+        if (!dirCache.has(pathAcc)) {
+          const parentPromise = parentPathAcc
+            ? dirCache.get(parentPathAcc)
+            : Promise.resolve(parentHandle);
+          const dirPromise = parentPromise.then((p) =>
+            p.getDirectoryHandle(part, { create: true }),
+          );
+          dirCache.set(pathAcc, dirPromise);
+        }
+        currentDir = await dirCache.get(pathAcc);
       } else {
         currentDir = await currentDir.getDirectoryHandle(part, {
           create: true,
         });
-        if (dirCache) dirCache.set(pathAcc, currentDir);
       }
     }
   }
@@ -823,7 +833,7 @@ async function writeStreamToOpfs(parentHandle, path, fileObj, options = {}) {
   } finally {
     try {
       await writable.close();
-    } catch (e) {}
+    } catch (err) {}
   }
 }
 
@@ -858,7 +868,7 @@ async function cleanupOrphans() {
             );
           }
         }
-      } catch (e) {}
+      } catch (err) {}
     },
   );
 }
@@ -888,29 +898,46 @@ async function listFolders() {
 }
 
 async function deleteFolder(folderNameToDelete, skipConfirm = false) {
-  const folderName =
+  const targetFolder =
     folderNameToDelete ||
     document.getElementById("deleteFolderName").value.trim();
-  if (!folderName) return alert("Enter a folder name first.");
-  // skipConfirm no longer used but whatever
-  if (!skipConfirm && !confirm(`Remove "${folderName}"?`)) return;
+  if (!targetFolder) return alert("Enter a folder name first.");
+  if (!skipConfirm && !confirm(`Remove "${targetFolder}"?`)) return;
 
   setUiBusy(true);
   logProgress("Deleting...", true);
   const root = await getOpfsRoot();
   try {
     const rfsRoot = await root.getDirectoryHandle(RFS_PREFIX);
-    await rfsRoot.removeEntry(folderName, { recursive: true });
-  } catch (e) {
-    if (e.name !== "NotFoundError") {
+    await rfsRoot.removeEntry(targetFolder, { recursive: true });
+  } catch (err) {
+    if (err.name !== "NotFoundError") {
       alert(
         "RuntimeFS cannot currently remove this folder; try closing other open RuntimeFS tabs.",
       );
+      setUiBusy(false);
       return;
     }
   }
 
-  await updateRegistryEntry(folderName, null);
+  await updateRegistryEntry(targetFolder, null);
+
+  if (folderName === targetFolder) {
+    folderName = undefined;
+    dirHandle = undefined;
+    document.getElementById("openFolderName").value = "";
+    if (observer) {
+      observer.disconnect();
+      observer = null;
+    }
+    if (showingSync) {
+      Array.from(document.body.getElementsByClassName("supportCheck")).forEach(
+        (elem) => (elem.style.display = "none"),
+      );
+      showingSync = false;
+    }
+  }
+
   if (!folderNameToDelete)
     document.getElementById("deleteFolderName").value = "";
   await listFolders();
@@ -961,9 +988,9 @@ async function openFile(overrideFolderName) {
 
     const encodedPath = fileName.split("/").map(encodeURIComponent).join("/");
     window.open(`n/${encodeURIComponent(folderName)}/${encodedPath}`, "_blank");
-  } catch (e) {
-    console.error(e);
-    alert(e.message);
+  } catch (err) {
+    console.error(err);
+    alert(err.message);
   } finally {
     setUiBusy(false);
   }
@@ -1049,9 +1076,9 @@ async function exportData() {
           ? "Export complete!"
           : "Export may have failed or been incomplete.",
       );
-  } catch (e) {
-    console.error("Export failed:", e);
-    alert("Export failed: " + e.message);
+  } catch (err) {
+    console.error("Export failed:", err);
+    alert("Export failed: " + err.message);
   } finally {
     setUiBusy(false);
     logProgress("", true);
@@ -1119,9 +1146,9 @@ async function startImport(sourceInput) {
             ? "Import complete! Reload to fix any issues."
             : "Import may have failed or been incomplete; reload to fix any issues.",
         );
-    } catch (e) {
-      console.error("Import failed:", e);
-      alert("Import failed:", e);
+    } catch (err) {
+      console.error("Import failed:", err);
+      alert("Import failed:", err);
     } finally {
       setUiBusy(false);
       logProgress("", true);
@@ -1157,7 +1184,7 @@ async function validateAndRepairRegistry() {
       registryNames.map(async (name) => {
         try {
           await rfsRoot.getDirectoryHandle(name);
-        } catch (e) {
+        } catch (err) {
           delete registry[name];
           changed = true;
         }
@@ -1165,8 +1192,8 @@ async function validateAndRepairRegistry() {
     );
 
     if (changed) await saveRegistry(registry);
-  } catch (e) {
-    console.warn("Repair failed:", e);
+  } catch (err) {
+    console.warn("Repair failed:", err);
   }
 }
 
@@ -1282,9 +1309,16 @@ async function performSyncToOpfs() {
             totalSize: f.size,
           });
         }
-      } catch (e) {
-        console.warn(`Sync failed for ${pathStr}:`, e);
+      } catch (err) {
+        console.warn(`Sync failed for ${pathStr}:`, err);
       }
+    }
+
+    if (navigator.serviceWorker.controller) {
+      navigator.serviceWorker.controller.postMessage({
+        type: "INVALIDATE_CACHE",
+        folderName: folderName,
+      });
     }
   });
 }
@@ -1299,8 +1333,8 @@ async function uploadAndEncryptWithPassword() {
   let localDir;
   try {
     localDir = await window.showDirectoryPicker({ mode: "read" });
-  } catch (e) {
-    if (e.name !== "AbortError") throw e;
+  } catch (err) {
+    if (err.name !== "AbortError") throw err;
   }
   await navigator.locks.request(`rfs_write_${name}`, async () => {
     const root = await getOpfsRoot();
@@ -1308,8 +1342,8 @@ async function uploadAndEncryptWithPassword() {
 
     try {
       await rfsRoot.removeEntry(name, { recursive: true });
-    } catch (e) {
-      if (e.name !== "NotFoundError") {
+    } catch (err) {
+      if (err.name !== "NotFoundError") {
         alert(
           "RuntimeFS cannot currently remove this folder; try closing other open RuntimeFS tabs.",
         );
@@ -1451,7 +1485,7 @@ async function uploadAndEncryptWithPassword() {
             reader.releaseLock();
             try {
               await writable.close();
-            } catch (e) {}
+            } catch (err) {}
           }
         } else {
           await writable.close();
@@ -1569,23 +1603,44 @@ document.addEventListener("DOMContentLoaded", () => {
     const items = Array.from(e.dataTransfer.items);
     if (!items.length) return;
 
-    if (items[0].kind === "file" && window.FileSystemDirectoryHandle) {
-      try {
-        const handle = await items[0].getAsFileSystemHandle();
-        if (handle && handle.kind === "directory") {
-          await analyzeAndImportFolder(handle);
-          return;
-        }
-      } catch (e) {
-        console.warn(
-          "FileSystemHandle access denied, falling back to webkitGetAsEntry",
-        );
-      }
-    }
-
+    // do note that DataTransfer objects become invalid after the synchronous event handler finishes
     const entry = items[0].webkitGetAsEntry
       ? items[0].webkitGetAsEntry()
       : null;
+
+    const droppedFiles = [];
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].kind === "file") {
+        const f = items[i].getAsFile();
+        if (f) droppedFiles.push(f);
+      }
+    }
+
+    let handlePromise = null;
+    if (items[0].kind === "file" && window.FileSystemDirectoryHandle) {
+      try {
+        handlePromise = items[0].getAsFileSystemHandle();
+      } catch (err) {
+        console.warn("FileSystemHandle access denied.");
+      }
+    }
+
+    let handle = null;
+    if (handlePromise) {
+      try {
+        handle = await handlePromise;
+      } catch (err) {
+        // webkitGetAsEntry fallback
+      }
+    }
+
+    // Modals (prompt/confirm/alert) are blocked synchronously inside drop events.
+    await new Promise((res) => setTimeout(res, 10));
+
+    if (handle && handle.kind === "directory") {
+      await analyzeAndImportFolder(handle);
+      return;
+    }
 
     if (entry && entry.isDirectory) {
       const name = prompt("Please choose a folder name:", entry.name);
@@ -1686,14 +1741,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     // Extract all actual files from the DataTransferItemList
-    const files = [];
-    for (let i = 0; i < items.length; i++) {
-      if (items[i].kind === "file") {
-        const f = items[i].getAsFile();
-        if (f) files.push(f);
-      }
-    }
-
+    const files = droppedFiles;
     if (files.length === 0) return;
 
     // Folder "bundle"
@@ -1880,9 +1928,9 @@ async function openFileInPlace() {
     document.open();
     document.write(html);
     document.close();
-  } catch (e) {
-    console.error(e);
-    alert(e.message);
+  } catch (err) {
+    console.error(err);
+    alert(err.message);
   } finally {
     setUiBusy(false);
   }

@@ -172,7 +172,7 @@
         const fh = await tempBlobDir.getFileHandle(item.__le_blob_ref);
         const file = await fh.getFile();
         return file.slice(0, file.size, item.type);
-      } catch (e) {
+      } catch (err) {
         return null; // Blob not found, gracefully return null
       }
     }
@@ -669,7 +669,7 @@
                 key,
                 initCipher,
               );
-            } catch (e) {
+            } catch (err) {
               throw new Error("Incorrect password or corrupt file.");
             }
 
@@ -714,8 +714,8 @@
               controller.enqueue(new Uint8Array(plain));
             }
             controller.close();
-          } catch (e) {
-            controller.error(e);
+          } catch (err) {
+            controller.error(err);
           } finally {
             reader.releaseLock();
           }
@@ -782,13 +782,13 @@
     async function tryGraceful(fn, context) {
       try {
         return await fn();
-      } catch (e) {
+      } catch (err) {
+        if (opts.onerror) opts.onerror(err);
         if (graceful) {
-          if (opts.onerror) opts.onerror(e);
-          logger(`Error: ${context} - ${e.message}`);
+          logger(`Error: ${context} - ${err.message}`);
           return null;
         }
-        throw e;
+        throw err;
       }
     }
 
@@ -807,8 +807,8 @@
         const name = fileName;
         const handle = await window.showSaveFilePicker({ suggestedName: name });
         outputStream = await handle.createWritable();
-      } catch (e) {
-        if (e.name === "AbortError") {
+      } catch (err) {
+        if (err.name === "AbortError") {
           logger("Export cancelled.");
           return;
         }
@@ -961,13 +961,13 @@
                 const p = yielder();
                 if (p) await p;
               }
-            } catch (e) {
+            } catch (err) {
               // Log error but allow other folders to continue processing
               logger(
-                `Error: accessing OPFS folder /${pathArray.join("/")} failed (${e.message})`,
+                `Error: accessing OPFS folder /${pathArray.join("/")} failed (${err.message})`,
               );
-              if (opts.onerror) opts.onerror(e);
-              if (!graceful) throw e;
+              if (opts.onerror) opts.onerror(err);
+              if (!graceful) throw err;
             }
           }
 
@@ -1455,13 +1455,13 @@
 
       logger("Export complete!");
       return result;
-    } catch (e) {
+    } catch (err) {
       try {
-        await outputStream.abort(e).catch(() => {});
-      } catch (e) {}
-      logger(`Error: ${e.message}`);
-      if (opts.onerror) opts.onerror(e);
-      if (!graceful) throw e;
+        await outputStream.abort(err).catch(() => {});
+      } catch (_) {}
+      logger(`Error: ${err.message}`);
+      if (opts.onerror) opts.onerror(err);
+      if (!graceful) throw err;
     }
   }
 
@@ -1519,11 +1519,13 @@
     async function tryGraceful(fn, context) {
       try {
         return await fn();
-      } catch (e) {
-        if (opts.onerror) opts.onerror(e);
-        logger(`Error: ${context} - ${e.message}`);
-        if (!graceful) throw e;
-        return null;
+      } catch (err) {
+        if (opts.onerror) opts.onerror(err);
+        if (graceful) {
+          logger(`Error: ${context} - ${err.message}`);
+          return null;
+        }
+        throw err;
       }
     }
 
@@ -1619,8 +1621,8 @@
               controller.enqueue(value);
             }
             controller.close();
-          } catch (e) {
-            controller.error(e);
+          } catch (err) {
+            controller.error(err);
           }
         },
       });
@@ -1729,15 +1731,15 @@
               }
             }
           }
-        } catch (e) {
+        } catch (err) {
           try {
             await writer.abort();
           } catch (_) {}
-          throw e;
+          throw err;
         } finally {
           try {
             await writer.close();
-          } catch (e) {}
+          } catch (err) {}
         }
       }
 
@@ -1754,7 +1756,7 @@
             create: true,
           });
         }
-      } catch (e) {}
+      } catch (err) {}
 
       const processedDbSchemas = new Set();
 
@@ -2048,16 +2050,16 @@
                 }
 
                 await tryGraceful(async () => {
-                  await new Promise((r) => {
+                  await new Promise((resolve, reject) => {
                     const q = indexedDB.deleteDatabase(schema.name);
-                    q.onsuccess = r;
-                    q.onerror = r;
+                    q.onsuccess = resolve;
+                    q.onerror = () => reject(q.error);
                     q.onblocked = () =>
-                      rej(
+                      reject(
                         new Error(`Database ${schema.name} deletion blocked.`),
                       );
                   });
-                  await new Promise((res, rej) => {
+                  await new Promise((resolve, reject) => {
                     const req = indexedDB.open(schema.name, schema.version);
                     req.onupgradeneeded = (e) => {
                       const db = e.target.result;
@@ -2078,11 +2080,11 @@
                     };
                     req.onsuccess = (e) => {
                       e.target.result.close();
-                      res();
+                      resolve();
                     };
-                    req.onerror = rej;
+                    req.onerror = reject;
                     req.onblocked = () =>
-                      rej(
+                      reject(
                         new Error(`Database ${schema.name} opening blocked.`),
                       );
                   });
@@ -2147,10 +2149,11 @@
                   for (let i = 0; i < keys.length; i++) {
                     st.put(values[i], st.keyPath ? undefined : keys[i]);
                   }
-                  await new Promise((res, rej) => {
-                    tx.oncomplete = res;
-                    tx.onerror = () => rej(tx.error);
-                    tx.onabort = () => rej(new Error("Transaction aborted."));
+                  await new Promise((resolve, reject) => {
+                    tx.oncomplete = resolve;
+                    tx.onerror = () => reject(tx.error);
+                    tx.onabort = () =>
+                      reject(new Error("Transaction aborted."));
                   });
                 }, `IDB ${dbName}/${storeName}`);
               }
@@ -2244,21 +2247,21 @@
       if (!aborted) {
         logger("Import complete!");
       }
-    } catch (e) {
+    } catch (err) {
       Object.values(dbCache).forEach((d) => {
         try {
           d.close();
-        } catch (e) {}
+        } catch (err) {}
       });
 
-      logger(`Error: ${e.message}`);
-      if (opts.onerror) opts.onerror(e);
-      if (!graceful) throw e;
+      logger(`Error: ${err.message}`);
+      if (opts.onerror) opts.onerror(err);
+      if (!graceful) throw err;
     } finally {
       if (rootOpfs) {
         try {
           await rootOpfs.removeEntry(TEMP_BLOB_DIR, { recursive: true });
-        } catch (e) {}
+        } catch (err) {}
       }
     }
   }
@@ -2353,10 +2356,10 @@
           }
         }
         await tar.close();
-      } catch (e) {
+      } catch (err) {
         try {
           await writable.abort(e);
-        } catch (e) {}
+        } catch (_) {}
       }
     })();
 
@@ -2385,15 +2388,14 @@
           pathPrefix: opts.pathPrefix,
         });
         return await runImport(stream);
-      } catch (e) {
-        if (e.name === "AbortError") {
+      } catch (err) {
+        if (err.name === "AbortError") {
           logger("User cancelled the directory picker.");
           return;
         }
-        logger("Directory Picker failed, falling back to legacy input.");
         LittleExport.warn(
           "Directory Picker failed, falling back to legacy input.",
-          e,
+          err,
         );
       }
     }
@@ -2418,8 +2420,8 @@
           });
           await runImport(stream);
           resolve();
-        } catch (e) {
-          reject(e);
+        } catch (err) {
+          reject(err);
         } finally {
           document.body.removeChild(input);
         }
@@ -2441,7 +2443,7 @@
         opfs: true,
         idb: true,
         localStorage: true,
-        session: true,
+        sessionStorage: true,
         cookies: true,
         cache: true,
       };
@@ -2453,24 +2455,24 @@
         for await (const name of root.keys()) {
           await root.removeEntry(name, { recursive: true });
         }
-      } catch (e) {
-        LittleExport.warn("Failed to clear OPFS:", e);
+      } catch (err) {
+        LittleExport.warn("Failed to clear OPFS:", err);
       }
     }
 
     if (types.localStorage) {
       try {
         localStorage.clear();
-      } catch (e) {
-        LittleExport.warn("Failed to clear localStorage:", e);
+      } catch (err) {
+        LittleExport.warn("Failed to clear localStorage:", err);
       }
     }
 
     if (types.sessionStorage) {
       try {
         sessionStorage.clear();
-      } catch (e) {
-        LittleExport.warn("Failed to clear sessionStorage:", e);
+      } catch (err) {
+        LittleExport.warn("Failed to clear sessionStorage:", err);
       }
     }
 
@@ -2493,8 +2495,8 @@
             document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; domain=.${baseDomain}; path=/`; // clear base domain
           }
         }
-      } catch (e) {
-        LittleExport.warn("Failed to clear cookies:", e);
+      } catch (err) {
+        LittleExport.warn("Failed to clear cookies:", err);
       }
     }
 
@@ -2502,8 +2504,8 @@
       try {
         const keys = await caches.keys();
         for (const k of keys) await caches.delete(k);
-      } catch (e) {
-        LittleExport.warn("Failed to clear cache:", e);
+      } catch (err) {
+        LittleExport.warn("Failed to clear cache:", err);
       }
     }
 
@@ -2524,8 +2526,8 @@
             });
           }),
         );
-      } catch (e) {
-        LittleExport.warn("Failed to clear IndexedDB:", e);
+      } catch (err) {
+        LittleExport.warn("Failed to clear IndexedDB:", err);
       }
     }
   }

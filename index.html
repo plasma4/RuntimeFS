@@ -130,7 +130,7 @@
                 if (typeof logProgress === "function") logProgress("", true);
                 const syncInfo = document.getElementById("syncInfo");
                 if (syncInfo) syncInfo.textContent = "";
-            } catch (e) { }
+            } catch (err) { }
         };
 
         window.onerror = (message, source, lineno, colno, error) => {
@@ -138,7 +138,7 @@
         };
 
         window.onunhandledrejection = (e) => {
-            if (reason instanceof Error && reason.name === "NotSupportedError") {
+            if (e.reason instanceof Error && e.reason.name === "NotSupportedError") {
                 console.warn("Caught and ignored a FileSystemObserver NotSupportedError. This is expected in some browsers.");
                 return;
             }

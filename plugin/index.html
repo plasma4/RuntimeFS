@@ -192,9 +192,9 @@
 
                 log("Success! Reload the page to see changes.")
                 alert("Patch applied. Please reload the page.")
-            } catch (e) {
-                log(`Error: ${e.message}`)
-                console.error(e)
+            } catch (err) {
+                log(`Error: ${err.message}`)
+                console.error(err)
             }
         }
 
@@ -229,9 +229,9 @@
 
                     if (count === 0) log("No RuntimeFS service worker found!")
                 })
-            } catch (e) {
-                log(`Error deleting cache: ${e.message}`)
-                console.error(e)
+            } catch (err) {
+                log(`Error deleting cache: ${err.message}`)
+                console.error(err)
             }
         }
     </script>
